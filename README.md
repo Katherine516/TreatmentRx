@@ -194,6 +194,29 @@ at 0 the 78-parameter stage-specific fit destabilises at the sample sizes the
 bootstrap resamples to. 0.25 is the best worst-case parameter error at n=88, 120
 and 250 alike.
 
+### Which estimator, when policy value cannot decide?
+
+`stability` reports that held-out policy value cannot separate the three. That is
+honest but leaves the choice unjustified, so there is a second axis: bend the
+treatment-free surface past what their linear basis can represent, leaving the
+blips untouched, and see which survives.
+
+```bash
+PYTHONPATH=src python3 -m treatmentrx.cli misspecification
+```
+
+| Estimator | Nuisance model right | Worst case | Degradation |
+| --- | --- | --- | --- |
+| dWOLS-Shared | **0.170** | 0.619 | 3.64× |
+| Stage-Specific Q-learning | 0.285 | 0.626 | 2.19× |
+| Q-Shared + Penalized | 0.578 | 0.943 | **1.63×** |
+
+They trade off in exactly the direction their designs predict — dWOLS is doubly
+robust and most accurate when the assumptions hold; the shared-blip fit is the
+most stable when they do not. No estimator wins on both axes, which is the
+justification for averaging them rather than picking one. Until now that was an
+assertion.
+
 ### Is the estimator ranking real?
 
 ```bash

@@ -35,6 +35,14 @@ from treatmentrx.estimation import linalg
 Z_QUANTILE = {0.10: 1.6449, 0.05: 1.9600, 0.01: 2.5758}
 DEFAULT_ALPHA = 0.05
 
+# How much wider an honest interval is than the sandwich's, measured rather than
+# assumed: `cli coverage` puts the sandwich at 0.88 of the estimator's actual
+# spread, so a correct interval is about 1/0.88 = 1.14x wider, and the bootstrap
+# runs a little more conservative still at ~1.20. A separation verdict that flips
+# anywhere inside that range is not a verdict, so the band is set at the
+# conservative end.
+SANDWICH_INFLATION = 1.25
+
 
 @dataclass(frozen=True)
 class ContrastTest:
@@ -55,6 +63,30 @@ class ContrastTest:
         return self.lower > 0.0
 
     @property
+    def exact(self) -> bool:
+        """Is this interval already the honest one, needing no inflation check?"""
+        return not self.caveat or self.caveat.startswith("m-out-of-n")
+
+    def survives_inflation(self, factor: float = SANDWICH_INFLATION) -> bool:
+        """Would the verdict hold if the interval were `factor` times wider?"""
+        half_width = (self.upper - self.lower) / 2.0
+        return abs(self.difference) > half_width * factor
+
+    @property
+    def robustly_distinguishable(self) -> bool:
+        """Separation that does not depend on which interval method was used.
+
+        The sandwich is measurably too narrow, and it is what drives the
+        equipoise decision — a clinical output. Rather than pay for a bootstrap
+        on every patient, a verdict is only accepted when it survives the
+        interval being as wide as the honest one would be. Near the boundary,
+        where the two methods disagree, the system declines to claim separation.
+        """
+        if not self.distinguishable:
+            return False
+        return self.exact or self.survives_inflation()
+
+    @property
     def z(self) -> float:
         if self.standard_error <= 0.0:
             return 0.0
@@ -68,6 +100,7 @@ class ContrastTest:
             "standard_error": round(self.standard_error, 4),
             "interval": [round(self.lower, 4), round(self.upper, 4)],
             "distinguishable": self.distinguishable,
+            "robustly_distinguishable": self.robustly_distinguishable,
             "alpha": self.alpha,
             "caveat": self.caveat,
         }

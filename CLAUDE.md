@@ -8,13 +8,14 @@ test fixture, not evidence.
 ## Commands
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests    # full suite, ~26s
+PYTHONPATH=src python3 -m unittest discover -s tests    # full suite, ~29s
 PYTHONPATH=src python3 -m treatmentrx.cli demo          # one patient end to end
 PYTHONPATH=src python3 -m treatmentrx.cli evaluate      # estimator scorecard
 PYTHONPATH=src python3 -m treatmentrx.cli stability     # k-fold + seed sweep (~15s)
 PYTHONPATH=src python3 -m treatmentrx.cli inference     # sandwich vs bootstrap (~35s)
 PYTHONPATH=src python3 -m treatmentrx.cli audit         # layer-by-layer evaluation (~2s)
 PYTHONPATH=src python3 -m treatmentrx.cli coverage      # do the 95% intervals cover? (~60s)
+PYTHONPATH=src python3 -m treatmentrx.cli misspecification  # estimator robustness (~15s)
 ```
 
 ## Hard constraints
@@ -113,6 +114,16 @@ produced a real clinical divergence, and the notes below are the scar tissue.
 15. **Every advanced arm keeps a monotherapy composite.** Listing biologics only
     in MTX combination turns one methotrexate contraindication into a blocked
     recommendation for a patient who had a viable option.
+16. **A separation that depends on the interval method is not a separation.**
+    The sandwich is measurably too narrow and it drives equipoise, a clinical
+    output. `ContrastTest.robustly_distinguishable` accepts a verdict only if it
+    survives the interval widening by `SANDWICH_INFLATION`; a bootstrap interval
+    is already honest and is exempt. Read that property, never `distinguishable`,
+    when deciding.
+17. **Weighting constants are measured, not chosen.** `DEFAULT_BLIP_RIDGE`,
+    `USE_VISIT_INTENSITY` and `SANDWICH_INFLATION` each carry the numbers that
+    set them in a comment beside them. Changing one means re-running the command
+    that produced those numbers, not re-deciding by feel.
 
 ## What is real vs. still a placeholder
 
@@ -154,10 +165,20 @@ blip is every stage. It measures ~20% wider here. Once attached, `contrast()`
 prefers it automatically.
 
 Measured and stated rather than assumed: IPCW is a ~5% correction on this
-generating process, because the outcome model is correctly specified and
-conditions on the covariates that drive dropout. `estimation/censoring.py` says
-so in its docstring. Do not quietly re-tune the simulation to make it look
-larger.
+generating process, and inverse-intensity weighting is slightly *negative*
+(0.284 against 0.274 of total blip error), because the outcome model is correctly
+specified and conditions on the covariates that drive both dropout and visit
+frequency. Both are implemented and validated; intensity weighting is off by
+default for that reason. Do not quietly re-tune the simulation to make either
+look larger.
+
+`generate_ra_cohort(..., curvature=)` bends the treatment-free surface beyond
+what the estimators' linear basis can represent, leaving the blips — and so the
+estimand — untouched. It is 0 by default; every other result in the repo assumes
+the correctly specified cohort. `cli misspecification` uses it to show the
+estimators trading off as designed: dWOLS is the most accurate when the nuisance
+model is right and degrades the most, the shared-blip fit the reverse. That
+trade-off is the justification for averaging them rather than picking one.
 
 When you touch one of these, either make it real or keep the docstring honest
 about what it is not. The value of this codebase is that a reader can tell the

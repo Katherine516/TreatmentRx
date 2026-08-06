@@ -23,6 +23,9 @@ def main(argv: list[str] | None = None) -> None:
     )
     bootstrap.add_argument("--replicates", type=int, default=200)
     subparsers.add_parser("audit", help="Layer-by-layer evaluation of the whole agent")
+    subparsers.add_parser(
+        "misspecification", help="Which estimator survives the nuisance model being wrong"
+    )
     cover = subparsers.add_parser("coverage", help="Do the confidence intervals actually cover?")
     cover.add_argument("--replications", type=int, default=100)
     cover.add_argument("--bootstrap", action="store_true", help="also run the (slow) bootstrap arm")
@@ -32,6 +35,12 @@ def main(argv: list[str] | None = None) -> None:
         from treatmentrx.feedback.audit import full_audit
 
         print(json.dumps(full_audit(), indent=2, default=str))
+        return
+
+    if args.command == "misspecification":
+        from treatmentrx.feedback.misspecification import misspecification_report
+
+        print(json.dumps(misspecification_report(), indent=2, sort_keys=True))
         return
 
     if args.command == "coverage":

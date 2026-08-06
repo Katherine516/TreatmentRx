@@ -72,6 +72,19 @@ _DAS28_MEAN = 5.5
 _DAS28_SD = 1.5
 _OUTCOME_NOISE_SD = 0.05
 
+# Curvature in the treatment-free response to disease activity. Zero by default,
+# which makes the estimators' linear basis correctly specified — and that is
+# precisely why inverse-probability weighting is nearly a no-op on the default
+# cohort: selection on a covariate the outcome model already conditions on
+# correctly does not bias it.
+#
+# Turning this on misspecifies the *nuisance* function while leaving the blips
+# linear and unchanged, so the estimand stays exactly the same and the only thing
+# that varies is whether the outcome model can represent the surface it is fit
+# on. That is the regime where re-balancing the covariate distribution by
+# weighting earns its keep, and `cli misspecification` measures how much.
+DEFAULT_CURVATURE = 0.0
+
 DEFAULT_STAGES = 3
 
 # --- Dropout ---------------------------------------------------------------
@@ -164,15 +177,21 @@ def true_blip(arm: str, features: dict[str, float]) -> float:
     return sum(p * b for p, b in zip(psi, blip_basis(features)))
 
 
-def treatment_free_value(features: dict[str, float]) -> float:
+def treatment_free_value(features: dict[str, float], curvature: float = DEFAULT_CURVATURE) -> float:
     """f(X): expected outcome under the reference arm.
 
     Depends on the same confounders that drive assignment, plus ALT — which is
     how a stage-1 hepatotoxic choice is punished at stage 2.
+
+    `curvature` adds a quadratic term in disease activity that the estimators'
+    linear basis cannot represent. It changes only this nuisance function; the
+    blips stay linear, so the estimand is untouched.
     """
+    severity = das28_std(features["das28"])
     return (
         0.50
-        - 0.11 * das28_std(features["das28"])
+        - 0.11 * severity
+        + curvature * severity * severity
         + 0.09 * features["anti_ccp"]
         - 0.06 * features["prior_tnf"]
         - 0.0012 * (features["crp"] - 30.0)
@@ -245,6 +264,7 @@ def generate_ra_cohort(
     seed: int = 7,
     stages: int = DEFAULT_STAGES,
     dropout: bool = True,
+    curvature: float = DEFAULT_CURVATURE,
 ) -> list[CohortTrajectory]:
     """Generate `n` confounded multi-stage trajectories under the behaviour policy.
 
@@ -267,7 +287,9 @@ def generate_ra_cohort(
         for stage in range(1, stages + 1):
             arm, propensity = _sample_arm(features, rng)
             outcome = clamp(
-                treatment_free_value(features) + true_blip(arm, features) + rng.gauss(0.0, _OUTCOME_NOISE_SD),
+                treatment_free_value(features, curvature)
+                + true_blip(arm, features)
+                + rng.gauss(0.0, _OUTCOME_NOISE_SD),
                 0.0,
                 1.0,
             )

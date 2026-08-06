@@ -68,6 +68,18 @@ STAGE_SPECIFIC_METHOD = "Stage-Specific Q-learning"
 # sample sizes the bootstrap resamples to. 0.25 is the best worst-case parameter
 # error at n=88, n=120 and n=250 alike.
 DEFAULT_BLIP_RIDGE = 0.25
+
+# Inverse-intensity weighting is implemented and validated (the fitted model
+# recovers the generator's -22 days per SD of disease activity as -19, attenuated
+# by the 28-day floor), but it is off because it does not help *here*: measured
+# across five seeds it raises total blip error from 0.274 to 0.284, and under a
+# misspecified treatment-free surface it still does not rescue anything. The
+# reason is the same one that makes IPCW nearly a no-op — visit frequency depends
+# on disease activity, and the outcome model already conditions on disease
+# activity, so re-weighting adds variance without removing bias. Turn it on for a
+# process where observation frequency depends on something the outcome model does
+# not see.
+USE_VISIT_INTENSITY = False
 _NUISANCE_RIDGE = 1e-6
 _MAX_ITERATIONS = 25
 _TOLERANCE = 1e-9
@@ -89,6 +101,7 @@ class QLearningModel:
         arms: tuple[str, ...] = TREATMENT_ARMS,
         backward_induction: bool = True,
         use_ipcw: bool = True,
+        use_visit_intensity: bool = USE_VISIT_INTENSITY,
         compute_covariance: bool = True,
         treat_censored_as_terminal: bool = False,
     ) -> None:
@@ -98,6 +111,7 @@ class QLearningModel:
         self.blip_ridge = blip_ridge
         self.backward_induction = backward_induction
         self.use_ipcw = use_ipcw
+        self.use_visit_intensity = use_visit_intensity
         self.compute_covariance = compute_covariance
         # Only ever True as an explicit comparator — see `_fit` and
         # `tests/test_censoring.py`. It reproduces a defect, not an option.
@@ -115,6 +129,7 @@ class QLearningModel:
         )
         self.iterations = 0
         self.censoring = None
+        self.visit_intensity = None
         self.bootstrap = None
         self._beta: list[float] = [0.0] * self.n_features
         self._covariance: list[list[float]] = []
@@ -154,6 +169,7 @@ class QLearningModel:
 
     def _fit(self, cohort: list[CohortTrajectory]) -> None:
         censoring = self._censoring_model(cohort)
+        intensity = self._intensity_model(cohort)
         rows: list[list[tuple[int, float]]] = []
         stage_of_row: list[int] = []
         cluster_of_row: list[int] = []
@@ -180,11 +196,16 @@ class QLearningModel:
                 cluster_of_row.append(cluster)
                 observed.append(stage.outcome)
                 next_features.append(dict(following.features) if following else None)
-                weights.append(
+                # Two distinct selections, so two weights. Censoring decides
+                # whether the patient is seen again; intensity decides how often.
+                weight = (
                     censoring.row_weight(trajectory, position, needs_next=not terminal)
                     if censoring
                     else 1.0
                 )
+                if intensity is not None:
+                    weight *= intensity.weight(stage.features)
+                weights.append(weight)
 
         if not rows:
             raise ValueError("No usable rows: every trajectory was censored before a decision")
@@ -265,6 +286,21 @@ class QLearningModel:
         return base + max(
             sum(beta[index] * value for index, value in pairs) for pairs in per_arm
         )
+
+    def _intensity_model(self, cohort: list[CohortTrajectory]):
+        """Fit the observation-frequency model that supplies the second weight.
+
+        Sicker patients come back sooner and so contribute more rows; without
+        this the fit is pulled toward whatever brings people into clinic.
+        """
+        if not self.use_visit_intensity:
+            self.visit_intensity = None
+            return None
+        from treatmentrx.estimation.visit_intensity import VisitIntensityModel
+
+        model = VisitIntensityModel(cohort)
+        self.visit_intensity = model if model.fitted else None
+        return self.visit_intensity
 
     def _censoring_model(self, cohort: list[CohortTrajectory]):
         """Fit the dropout model that supplies the row weights.
@@ -441,6 +477,7 @@ class QLearningModel:
             arms=self.arms,
             backward_induction=self.backward_induction,
             use_ipcw=self.use_ipcw,
+            use_visit_intensity=self.use_visit_intensity,
             compute_covariance=False,
         )
         if replica.n_features != self.n_features:

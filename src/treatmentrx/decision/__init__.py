@@ -116,7 +116,20 @@ class DecisionLayer:
         # data can resolve a difference that size at all. A gap that clears the
         # clinical bar but sits inside its own confidence interval is equipoise,
         # not a recommendation.
-        if contrast is not None and not contrast.distinguishable:
+        if contrast is not None and not contrast.robustly_distinguishable:
+            if contrast.distinguishable:
+                # The interval excludes zero, but only because the sandwich is
+                # narrower than it should be. Measured, not hypothetical.
+                return (
+                    RecommendationStatus.EQUIPOISE,
+                    (
+                        f"{contrast.arm} scores {contrast.difference:+.3f} over "
+                        f"{contrast.comparator} and the reported interval "
+                        f"[{contrast.lower:+.3f}, {contrast.upper:+.3f}] excludes zero, but the "
+                        "separation does not survive the interval being widened to the width "
+                        "coverage says it should have. Treated as equipoise."
+                    ),
+                )
             return (
                 RecommendationStatus.EQUIPOISE,
                 (
