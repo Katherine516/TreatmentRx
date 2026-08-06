@@ -36,8 +36,11 @@ import math
 from treatmentrx.estimation import linalg
 from treatmentrx.estimation.inference import (
     DEFAULT_ALPHA,
+    DEFAULT_BOOTSTRAP_ALPHA,
+    DEFAULT_REPLICATES,
     ContrastTest,
     contrast_test,
+    m_out_of_n_bootstrap,
     sandwich_covariance,
 )
 from treatmentrx.estimation.basis import (
@@ -79,12 +82,20 @@ class QLearningModel:
         blip_ridge: float = DEFAULT_BLIP_RIDGE,
         arms: tuple[str, ...] = TREATMENT_ARMS,
         backward_induction: bool = True,
+        use_ipcw: bool = True,
+        compute_covariance: bool = True,
+        treat_censored_as_terminal: bool = False,
     ) -> None:
         if not cohort:
             raise ValueError("Cannot fit a Q-learning model on an empty cohort")
         self.share_blip = share_blip
         self.blip_ridge = blip_ridge
         self.backward_induction = backward_induction
+        self.use_ipcw = use_ipcw
+        self.compute_covariance = compute_covariance
+        # Only ever True as an explicit comparator — see `_fit` and
+        # `tests/test_censoring.py`. It reproduces a defect, not an option.
+        self.treat_censored_as_terminal = treat_censored_as_terminal
         self.arms = arms
         self.blip_arms = tuple(arm for arm in arms if arm != REFERENCE_ARM)
         self.n_stages = max(len(trajectory.stages) for trajectory in cohort)
@@ -97,6 +108,8 @@ class QLearningModel:
             self._blip_span * (1 if share_blip else self.n_stages)
         )
         self.iterations = 0
+        self.censoring = None
+        self.bootstrap = None
         self._beta: list[float] = [0.0] * self.n_features
         self._covariance: list[list[float]] = []
         self._fit(cohort)
@@ -134,30 +147,63 @@ class QLearningModel:
         return penalties
 
     def _fit(self, cohort: list[CohortTrajectory]) -> None:
+        censoring = self._censoring_model(cohort)
         rows: list[list[tuple[int, float]]] = []
         stage_of_row: list[int] = []
         cluster_of_row: list[int] = []
         observed: list[float] = []
         next_features: list[dict[str, float] | None] = []
+        weights: list[float] = []
 
         for cluster, trajectory in enumerate(cohort):
             stages = trajectory.stages
             for position, stage in enumerate(stages):
+                terminal = position == self.n_stages - 1
+                following = stages[position + 1] if position + 1 < len(stages) else None
+                # A censored patient's last observed stage is *not* a terminal
+                # decision — their future is unobserved, not absent. Using the
+                # observed outcome alone as the target would tell the model that
+                # continuing is worth nothing after a dropout. Those rows are
+                # dropped and the patients who did return carry their weight.
+                if not terminal and following is None:
+                    if not self.treat_censored_as_terminal:
+                        continue
+                    # The defect: count the row as a terminal decision anyway.
                 rows.append(self._row(position, stage.features, stage.arm))
                 stage_of_row.append(position)
                 cluster_of_row.append(cluster)
                 observed.append(stage.outcome)
-                following = stages[position + 1] if position + 1 < len(stages) else None
                 next_features.append(dict(following.features) if following else None)
+                weights.append(
+                    censoring.row_weight(trajectory, position, needs_next=not terminal)
+                    if censoring
+                    else 1.0
+                )
 
-        weights = [1.0] * len(rows)
+        if not rows:
+            raise ValueError("No usable rows: every trajectory was censored before a decision")
+
         penalties = self._penalties()
         targets = list(observed)
 
+        # X'WX does not change across the fixed point — only the pseudo-outcomes
+        # do. Factor it once and each iteration is a cheap X'Wy plus a multiply,
+        # which is what makes the bootstrap's hundreds of refits affordable.
+        normal_matrix = linalg.sparse_normal_matrix(rows, weights, self.n_features, penalties)
+        normal_inverse = linalg.inverse(normal_matrix)
+
+        # The covariate bases of the *next* stage never change across the fixed
+        # point either; only the coefficients they multiply do. Precomputing
+        # them turns each pseudo-outcome update into arithmetic.
+        futures = [
+            None
+            if features is None
+            else self._future_terms(features, min(position + 1, self.n_stages - 1))
+            for features, position in zip(next_features, stage_of_row)
+        ]
+
         for iteration in range(1, _MAX_ITERATIONS + 1):
-            beta = linalg.sparse_weighted_least_squares(
-                rows, targets, weights, self.n_features, penalties
-            )
+            beta = linalg.solve_precomputed(normal_inverse, rows, targets, weights, self.n_features)
             shift = max(abs(a - b) for a, b in zip(beta, self._beta))
             self._beta = beta
             self.iterations = iteration
@@ -165,10 +211,8 @@ class QLearningModel:
                 break
             # Recompute pseudo-outcomes under the updated Q-function.
             updated = [
-                value
-                if features is None
-                else value + self._optimal_value(features, min(position + 1, self.n_stages - 1))
-                for value, features, position in zip(observed, next_features, stage_of_row)
+                value if terms is None else value + self._optimal_value_from(terms, beta)
+                for value, terms in zip(observed, futures)
             ]
             converged = shift < _TOLERANCE and all(
                 abs(a - b) < _TOLERANCE for a, b in zip(updated, targets)
@@ -177,15 +221,68 @@ class QLearningModel:
             if converged:
                 break
 
-        self._covariance = self._sandwich(rows, targets, weights, cluster_of_row, penalties)
+        # Bootstrap replicates only need the point estimate; the covariance is
+        # the expensive part and nothing asks a replicate for its own interval.
+        if self.compute_covariance:
+            self._covariance = self._sandwich(
+                rows, targets, weights, cluster_of_row, normal_matrix
+            )
 
-    def _sandwich(self, rows, targets, weights, clusters, penalties) -> list[list[float]]:
+    def _future_terms(self, features: dict[str, float], stage_index: int):
+        """Column/value pairs for `max_a Q(features, a)` at a fixed stage.
+
+        Returns the treatment-free pairs once, plus one list of blip pairs per
+        arm — everything the optimal-value calculation needs that does not
+        depend on the current coefficients.
+        """
+        offset = stage_index * self._n_free
+        free = [
+            (offset + i, value)
+            for i, value in enumerate(treatment_free_basis(features))
+            if value != 0.0
+        ]
+        basis = blip_basis(features)
+        per_arm = []
+        for arm in self.arms:
+            columns = self._blip_columns(stage_index, arm)
+            if columns is None:
+                per_arm.append(())
+            else:
+                per_arm.append(
+                    tuple((column, value) for column, value in zip(columns, basis) if value != 0.0)
+                )
+        return free, per_arm
+
+    def _optimal_value_from(self, terms, beta: list[float]) -> float:
+        free, per_arm = terms
+        base = sum(beta[index] * value for index, value in free)
+        return base + max(
+            sum(beta[index] * value for index, value in pairs) for pairs in per_arm
+        )
+
+    def _censoring_model(self, cohort: list[CohortTrajectory]):
+        """Fit the dropout model that supplies the row weights.
+
+        Dropout is informative — patients leave because of toxicity and poor
+        response, both consequences of the arm they were given — so the patients
+        still under observation at the last stage are a healthier sample than the
+        ones who started. Without these weights the blips are biased toward
+        whatever the survivors experienced.
+        """
+        if not self.use_ipcw:
+            self.censoring = None
+            return None
+        from treatmentrx.estimation.censoring import CensoringModel
+
+        self.censoring = CensoringModel(cohort)
+        return self.censoring
+
+    def _sandwich(self, rows, targets, weights, clusters, normal_matrix) -> list[list[float]]:
         """Cluster-robust covariance of the fitted parameters, clustered by patient."""
         residuals = [
             target - sum(self._beta[index] * value for index, value in row)
             for row, target in zip(rows, targets)
         ]
-        normal_matrix = linalg.sparse_normal_matrix(rows, weights, self.n_features, penalties)
         return sandwich_covariance(
             rows, residuals, weights, clusters, normal_matrix, self.n_features
         )
@@ -275,23 +372,41 @@ class QLearningModel:
         standard error.
         """
         index = self._clamp_stage(stage_index)
-        loading = [0.0] * self.n_features
-        basis = blip_basis(features)
-        for sign, candidate in ((1.0, arm), (-1.0, comparator)):
-            columns = self._blip_columns(index, candidate)
-            if columns is None:
-                continue
-            for column, value in zip(columns, basis):
-                loading[column] += sign * value
+        if self.bootstrap is not None and not self._sandwich_is_exact(index):
+            return self.bootstrap_contrast(arm, comparator, features, index, alpha)
+        return self.sandwich_contrast(arm, comparator, features, index, alpha)
 
+    def _sandwich_is_exact(self, index: int) -> bool:
+        """Is the sandwich interval honest at this stage?
+
+        Only at a terminal stage *and* only when the blip is stage-specific.
+        With a shared blip there is no fully regular stage: the one parameter
+        vector is estimated jointly from every stage's rows, and the
+        earlier-stage rows carry pseudo-outcomes. Its terminal-stage interval
+        inherits that, so the sandwich understates it too.
+        """
+        return index == self.n_stages - 1 and not self.share_blip
+
+    def sandwich_contrast(
+        self,
+        arm: str,
+        comparator: str,
+        features: dict[str, float],
+        stage_index: int,
+        alpha: float = DEFAULT_ALPHA,
+    ) -> ContrastTest:
+        """Cluster-robust interval, treating the pseudo-outcomes as fixed."""
+        index = self._clamp_stage(stage_index)
+        loading = self._contrast_loading(arm, comparator, features, index)
         difference = self.blip(arm, features, index) - self.blip(comparator, features, index)
         horizon = self.remaining_stages(index)
         caveat = (
             ""
-            if index == self.n_stages - 1
+            if self._sandwich_is_exact(index)
             else (
-                "Non-terminal stage: the interval treats the pseudo-outcomes as fixed and "
-                "therefore understates uncertainty."
+                "The interval treats the pseudo-outcomes as fixed and therefore "
+                "understates uncertainty; run `treatmentrx inference` for a "
+                "resampled interval that does not."
             )
         )
         test = contrast_test(
@@ -308,6 +423,117 @@ class QLearningModel:
             alpha=test.alpha,
             caveat=test.caveat,
         )
+
+    # ------------------------------------------------------- bootstrap support
+
+    def refit(self, cohort: list[CohortTrajectory]) -> list[float]:
+        """Re-run the whole procedure on a resample and return the parameters."""
+        replica = QLearningModel(
+            cohort,
+            share_blip=self.share_blip,
+            blip_ridge=self.blip_ridge,
+            arms=self.arms,
+            backward_induction=self.backward_induction,
+            use_ipcw=self.use_ipcw,
+            compute_covariance=False,
+        )
+        if replica.n_features != self.n_features:
+            # A resample that lost a whole stage cannot be aligned with the fit.
+            raise ValueError("resample produced a different design")
+        return replica._beta
+
+    def non_regularity(self, cohort: list[CohortTrajectory], nu: float = 0.05) -> float:
+        """Proportion of patients whose next-stage optimal arm is ambiguous.
+
+        The non-smoothness that breaks the ordinary bootstrap is the `max` in the
+        pseudo-outcome: where two arms are tied, the argmax jumps. This measures
+        how much of the cohort sits at or near such a tie, using the
+        terminal-stage sandwich, which is valid there.
+        """
+        terminal = self.n_stages - 1
+        ambiguous = 0
+        total = 0
+        for trajectory in cohort:
+            features = trajectory.stages[-1].features
+            ordered = sorted(self.arms, key=lambda arm: self.raw_q(features, arm, terminal), reverse=True)
+            if len(ordered) < 2:
+                continue
+            total += 1
+            # Always the sandwich: this is a plug-in measure that *decides* the
+            # resample size, so it must not depend on a bootstrap that may
+            # already be attached, or a refit would not be reproducible.
+            if not self.sandwich_contrast(
+                ordered[0], ordered[1], features, terminal, alpha=nu
+            ).distinguishable:
+                ambiguous += 1
+        return ambiguous / total if total else 0.0
+
+    def fit_bootstrap(
+        self,
+        cohort: list[CohortTrajectory],
+        replicates: int = DEFAULT_REPLICATES,
+        alpha: float = DEFAULT_BOOTSTRAP_ALPHA,
+        seed: int = 17,
+    ):
+        """Run the m-out-of-n bootstrap and attach it. One refit per replicate."""
+        distribution = m_out_of_n_bootstrap(
+            self.refit,
+            cohort,
+            self._beta,
+            self.non_regularity(cohort),
+            replicates=replicates,
+            alpha=alpha,
+            seed=seed,
+        )
+        self.attach_bootstrap(distribution)
+        return distribution
+
+    def attach_bootstrap(self, distribution) -> None:
+        """Use these draws for non-terminal contrasts from now on."""
+        self.bootstrap = distribution
+
+    def bootstrap_contrast(
+        self,
+        arm: str,
+        comparator: str,
+        features: dict[str, float],
+        stage_index: int,
+        alpha: float = DEFAULT_ALPHA,
+    ) -> ContrastTest:
+        if self.bootstrap is None:
+            raise ValueError("No bootstrap draws attached; call attach_bootstrap first")
+        index = self._clamp_stage(stage_index)
+        loading = self._contrast_loading(arm, comparator, features, index)
+        horizon = self.remaining_stages(index)
+        difference = (self.blip(arm, features, index) - self.blip(comparator, features, index)) / horizon
+        lower, upper = self.bootstrap.interval(loading, alpha)
+        return ContrastTest(
+            arm=arm,
+            comparator=comparator,
+            difference=difference,
+            standard_error=self.bootstrap.standard_error(loading) / horizon,
+            lower=lower / horizon,
+            upper=upper / horizon,
+            alpha=alpha,
+            caveat=(
+                f"m-out-of-n bootstrap (m={self.bootstrap.m} of n={self.bootstrap.n}, "
+                f"non-regularity {self.bootstrap.non_regularity:.2f}); accounts for the "
+                "pseudo-outcome step."
+            ),
+        )
+
+    def _contrast_loading(
+        self, arm: str, comparator: str, features: dict[str, float], index: int
+    ) -> list[float]:
+        loading = [0.0] * self.n_features
+        basis = blip_basis(features)
+        for sign, candidate in ((1.0, arm), (-1.0, comparator)):
+            columns = self._blip_columns(index, candidate)
+            if columns is None:
+                continue
+            for column, value in zip(columns, basis):
+                loading[column] += sign * value
+        return loading
 
     def blip_standard_error(self, arm: str, features: dict[str, float], stage_index: int) -> float:
         """Standard error of a single arm's blip, on the per-remaining-visit scale."""

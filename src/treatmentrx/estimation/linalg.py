@@ -163,5 +163,29 @@ def quadratic_form(vector: list[float], matrix: list[list[float]]) -> float:
     )
 
 
+def solve_precomputed(
+    normal_inverse: list[list[float]],
+    rows: list[SparseRow],
+    targets: list[float],
+    weights: list[float],
+    n_features: int,
+) -> list[float]:
+    """beta = (X'WX)^-1 X'Wy, reusing an already-inverted normal matrix.
+
+    Iterative procedures that only change `y` between passes — Q-learning's
+    pseudo-outcome fixed point — would otherwise rebuild and re-solve the same
+    matrix every time.
+    """
+    xtwy = [0.0] * n_features
+    for row, y, w in zip(rows, targets, weights):
+        wy = w * y
+        for i, xi in row:
+            xtwy[i] += xi * wy
+    return [
+        sum(normal_inverse[i][j] * xtwy[j] for j in range(n_features) if xtwy[j] != 0.0)
+        for i in range(n_features)
+    ]
+
+
 def dot(vector_a: list[float], vector_b: list[float]) -> float:
     return sum(x * y for x, y in zip(vector_a, vector_b))

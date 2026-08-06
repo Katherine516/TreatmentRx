@@ -88,13 +88,33 @@ class ContrastTests(unittest.TestCase):
         self.assertAlmostEqual(contrast.difference, 0.0, places=9)
         self.assertFalse(contrast.distinguishable)
 
-    def test_non_terminal_intervals_carry_their_caveat(self):
-        model = training.fitted().q_shared
+    def test_only_a_regular_stage_reports_an_uncaveated_interval(self):
+        """The sandwich is exact at a stage-specific terminal block and nowhere else.
+
+        With a *shared* blip there is no fully regular stage: one parameter
+        vector is fit jointly from every stage's rows, and the earlier rows carry
+        pseudo-outcomes. Its terminal interval inherits that, so it is caveated
+        too — which the ordinary reading of "terminal stages are fine" misses.
+        """
         features = model_features(_demo_state().stages)
-        first = model.contrast("rituximab", "IL-6 inhibitor", features, 0)
-        terminal = model.contrast("rituximab", "IL-6 inhibitor", features, model.n_stages - 1)
-        self.assertIn("pseudo-outcomes", first.caveat)
-        self.assertEqual(terminal.caveat, "")
+        shared = training.fitted().q_shared
+        stage_specific = training.fitted().stage_specific
+        terminal = stage_specific.n_stages - 1
+
+        self.assertIn("pseudo-outcomes", shared.contrast("rituximab", "IL-6 inhibitor", features, 0).caveat)
+        self.assertIn(
+            "pseudo-outcomes",
+            shared.contrast("rituximab", "IL-6 inhibitor", features, terminal).caveat,
+            msg="a shared blip has no regular stage",
+        )
+        self.assertIn(
+            "pseudo-outcomes",
+            stage_specific.contrast("rituximab", "IL-6 inhibitor", features, 0).caveat,
+        )
+        self.assertEqual(
+            stage_specific.contrast("rituximab", "IL-6 inhibitor", features, terminal).caveat,
+            "",
+        )
 
     def test_an_indistinguishable_contrast_forces_equipoise(self):
         """A gap that clears the clinical bar but sits inside its own interval

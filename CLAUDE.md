@@ -8,10 +8,11 @@ test fixture, not evidence.
 ## Commands
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests    # full suite, ~7s
+PYTHONPATH=src python3 -m unittest discover -s tests    # full suite, ~18s
 PYTHONPATH=src python3 -m treatmentrx.cli demo          # one patient end to end
 PYTHONPATH=src python3 -m treatmentrx.cli evaluate      # estimator scorecard
-PYTHONPATH=src python3 -m treatmentrx.cli stability     # k-fold + seed sweep (~11s)
+PYTHONPATH=src python3 -m treatmentrx.cli stability     # k-fold + seed sweep (~15s)
+PYTHONPATH=src python3 -m treatmentrx.cli inference     # sandwich vs bootstrap (~35s)
 ```
 
 ## Hard constraints
@@ -38,7 +39,8 @@ treatmentrx/
   contracts.py   the six layer handoffs (PatientState, RegimeEstimate, Decision,
                  SafeDecision, Recommendation, FeedbackReceipt)
   arms.py        the canonical treatment-arm vocabulary
-  simulation/    the synthetic cohort with known blips
+  simulation/    the cohort with known blips, plus a FHIR exporter so
+                 simulated patients re-enter through Layer 1
   data/          Layer 1  → PatientState
   estimation/    Layer 2  → RegimeEstimate[]
   decision/      Layer 3  → Decision
@@ -86,23 +88,45 @@ produced a real clinical divergence, and the notes below are the scar tissue.
 10. **Equipoise needs both conditions.** The care goal sets the clinically
     meaningful difference; the contrast interval decides whether the data can
     resolve one that size. Neither alone is sufficient.
+11. **A censored patient's last visit is not a terminal decision.** Their future
+    is unobserved, not absent. Those rows are excluded from the earlier-stage
+    regressions and the patients who did return carry their weight
+    (`use_ipcw`). Counting them as terminal tells the model the future is
+    worthless for exactly the patients who left, and it corrupts every
+    non-terminal block; `treat_censored_as_terminal=True` reproduces it as a
+    comparator and nothing else should ever set it.
+12. **`non_regularity` always uses the sandwich.** It decides the bootstrap's
+    resample size, so reading it off an already-attached bootstrap makes a refit
+    depend on its own previous output and stop being reproducible.
 
 ## What is real vs. still a placeholder
 
-Real: the three Layer 4 estimators, the cohort and its known blips, held-out IPW
-policy evaluation, calibration, cluster-robust standard errors and contrast
-tests, cross-validated stability, blip attributions.
+Real: the three estimators, the cohort and its known blips, informative-dropout
+handling and IPCW, held-out IPW policy evaluation, calibration, cluster-robust
+standard errors, m-out-of-n bootstrap intervals, contrast tests, cross-validated
+stability, blip attributions.
 
 Still deliberately simple, and labelled as such in-module: `GRUBaselineEncoder`
 (a deterministic summariser, not a trained GRU), `CausalDAGRegistry` (hand-listed
 adjustment sets, no formal identifiability), `SemanticKnowledgeBase` (five
-hard-coded passages), the E-value in the sensitivity report, and the regime
-selector's BIC proxy.
+hard-coded passages), the E-value in the sensitivity report, the regime
+selector's BIC proxy, and `IPCWHandler`'s visit weights (heuristic — the cohort
+now generates severity-driven visit spacing, so there is ground truth to fit
+against that is not yet used).
 
-Known limitation, stated in `estimation/inference.py`: at non-terminal stages the
-sandwich treats pseudo-outcomes as fixed and understates uncertainty. DTR
-inference is non-regular there. Terminal-stage intervals are the honest ones, and
-non-terminal ones carry the caveat in their output.
+Inference has two paths and they are not interchangeable. The sandwich
+(`sandwich_contrast`) is the default: cheap, exact at a stage-specific terminal
+block, caveated everywhere else. The m-out-of-n bootstrap (`fit_bootstrap`,
+`treatmentrx.cli inference`) re-runs the whole procedure per replicate and is
+the honest answer wherever backward induction is involved — which with a shared
+blip is every stage. It measures ~20% wider here. Once attached, `contrast()`
+prefers it automatically.
+
+Measured and stated rather than assumed: IPCW is a ~5% correction on this
+generating process, because the outcome model is correctly specified and
+conditions on the covariates that drive dropout. `estimation/censoring.py` says
+so in its docstring. Do not quietly re-tune the simulation to make it look
+larger.
 
 When you touch one of these, either make it real or keep the docstring honest
 about what it is not. The value of this codebase is that a reader can tell the

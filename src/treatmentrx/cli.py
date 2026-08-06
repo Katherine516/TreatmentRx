@@ -18,7 +18,15 @@ def main(argv: list[str] | None = None) -> None:
     subparsers.add_parser("demo", help="Run a synthetic RA patient through all six layers")
     subparsers.add_parser("evaluate", help="Score every estimator on the held-out cohort")
     subparsers.add_parser("stability", help="Re-fit across seeds and folds to test the ranking")
+    bootstrap = subparsers.add_parser(
+        "inference", help="Compare sandwich and m-out-of-n bootstrap intervals"
+    )
+    bootstrap.add_argument("--replicates", type=int, default=200)
     args = parser.parse_args(argv)
+
+    if args.command == "inference":
+        print(json.dumps(_inference_report(args.replicates), indent=2, sort_keys=True))
+        return
 
     if args.command == "evaluate":
         print(json.dumps(_evaluation_report(), indent=2, sort_keys=True))
@@ -54,6 +62,54 @@ def _evaluation_report() -> dict[str, Any]:
             "oracle_rollout_value is the total-trajectory reward under the generating "
             "process and exists only in simulation. Run `stability` before reading the "
             "ordering of these estimators as a ranking."
+        ),
+    }
+
+
+def _inference_report(replicates: int) -> dict[str, Any]:
+    """How far the sandwich understates the interval at non-terminal stages.
+
+    The sandwich treats the pseudo-outcomes as fixed; the bootstrap re-runs the
+    whole procedure, so the ratio between them is the size of the understatement.
+    """
+    from treatmentrx.data import DataLayer
+    from treatmentrx.estimation.features import model_features
+
+    setup = training.enable_bootstrap_inference(replicates=replicates)
+    fit = training.fitted()
+    model = fit.q_shared
+    features = model_features(DataLayer().build_patient_state(sample_ra_bundle()).stages)
+
+    stages = []
+    for index in range(model.n_stages):
+        ordered = sorted(model.arms, key=lambda arm: model.raw_q(features, arm, index), reverse=True)
+        sandwich = model.sandwich_contrast(ordered[0], ordered[1], features, index)
+        booted = model.bootstrap_contrast(ordered[0], ordered[1], features, index)
+        stages.append(
+            {
+                "stage_index": index,
+                "terminal": index == model.n_stages - 1,
+                "arm": ordered[0],
+                "comparator": ordered[1],
+                "sandwich": sandwich.as_dict(),
+                "bootstrap": booted.as_dict(),
+                "se_ratio_bootstrap_over_sandwich": (
+                    round(booted.standard_error / sandwich.standard_error, 3)
+                    if sandwich.standard_error
+                    else None
+                ),
+            }
+        )
+
+    return {
+        "setup": setup,
+        "patient": "demo (seropositive, prior TNF failure)",
+        "stages": stages,
+        "note": (
+            "A ratio above 1 is the sandwich understating the interval. It is expected "
+            "at non-terminal stages, where the regression target is a pseudo-outcome "
+            "built from the fitted downstream model and the sandwich treats it as fixed "
+            "data. At the terminal stage the two should agree."
         ),
     }
 

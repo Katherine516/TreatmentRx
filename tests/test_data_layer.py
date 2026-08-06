@@ -10,8 +10,18 @@ from treatmentrx.data.encoders import GRUBaselineEncoder, HandcraftedFeatureEnco
 from treatmentrx.data.fhir import FHIRAdapter
 from treatmentrx.data.leakage import LeakageError, LeakageTestSuite, TemporalFirewall
 from treatmentrx.data.stages import IPCWHandler, StageHistoryBuilder, VisitAligner
+from treatmentrx.arms import TREATMENT_ARMS
 from treatmentrx.demo_data import sample_ra_bundle
-from treatmentrx.domain import CareGoal, Observation, PatientRecord, StageRecord
+from treatmentrx.domain import (
+    CareGoal,
+    Observation,
+    PatientRecord,
+    RecommendationStatus,
+    StageRecord,
+)
+from treatmentrx.orchestrator import TreatmentRxOrchestrator
+from treatmentrx.simulation.fhir_export import simulated_bundles
+from treatmentrx.simulation.ra_cohort import generate_ra_cohort
 
 
 def _patient():
@@ -146,6 +156,91 @@ class LeakageTests(unittest.TestCase):
         stages[0] = StageRecord(**(stages[0].__dict__ | {"features": leaked}))
         with self.assertRaises(LeakageError):
             TemporalFirewall().assert_clean(patient, stages)
+
+
+class SimulatedIngestionTests(unittest.TestCase):
+    """Layer 1 against patients whose truth is known by construction.
+
+    Until the cohort could be exported as bundles, every ingestion module was
+    tested on one hand-written demo patient. These push simulated trajectories —
+    whose stage count, visit intervals, arm sequence and terminal event were
+    *generated* — through the real DataLayer and check what comes back.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.trajectories = generate_ra_cohort(20, seed=991)
+        cls.bundles = simulated_bundles(20, seed=991)
+        layer = DataLayer()
+        cls.states = [layer.build_patient_state(bundle) for bundle in cls.bundles]
+
+    def test_every_simulated_patient_ingests(self):
+        self.assertEqual(len(self.states), 20)
+        self.assertTrue(all(state.stages for state in self.states))
+
+    def test_stage_count_matches_what_was_generated(self):
+        """Plus one: the open decision point the agent is being asked about."""
+        for trajectory, state in zip(self.trajectories, self.states):
+            self.assertEqual(
+                len(state.stages),
+                trajectory.n_observed + 1,
+                msg=f"patient {trajectory.patient_index}",
+            )
+
+    def test_recovered_intervals_match_the_generated_ones(self):
+        """The timing model has to reconstruct irregular spacing from dates."""
+        checked = 0
+        for trajectory, state in zip(self.trajectories, self.states):
+            for generated, recovered in zip(trajectory.stages[1:], state.stages[1:]):
+                if generated.interval_days is None or recovered.timing is None:
+                    continue
+                self.assertEqual(
+                    recovered.timing.time_since_last_treatment,
+                    generated.interval_days,
+                    msg=f"patient {trajectory.patient_index} stage {generated.stage}",
+                )
+                checked += 1
+        self.assertGreater(checked, 10, "no intervals were actually compared")
+
+    def test_switching_is_detected_where_the_arm_changed(self):
+        for trajectory, state in zip(self.trajectories, self.states):
+            arms = [stage.arm for stage in trajectory.stages]
+            if len(set(arms)) <= 1:
+                continue
+            self.assertTrue(
+                any(stage.switching is not None for stage in state.stages),
+                msg=f"patient {trajectory.patient_index} changed arm but no switching was captured",
+            )
+
+    def test_dropouts_carry_a_discontinuation_reason(self):
+        censored = [
+            (t, b) for t, b in zip(self.trajectories, self.bundles) if t.censored
+        ]
+        self.assertTrue(censored, "the seed produced no dropouts to check")
+        for trajectory, bundle in censored:
+            reasons = [
+                entry["resource"].get("discontinuationReason")
+                for entry in bundle["entry"]
+                if entry["resource"].get("resourceType") == "MedicationRequest"
+            ]
+            self.assertTrue(
+                any(reasons), msg=f"patient {trajectory.patient_index} left with no reason recorded"
+            )
+
+    def test_the_whole_pipeline_runs_on_every_simulated_patient(self):
+        """One demo patient exercises one path; twenty exercise the branches."""
+        recommendations = [TreatmentRxOrchestrator().run(bundle) for bundle in self.bundles]
+        self.assertEqual(len(recommendations), 20)
+        statuses = {recommendation.status for recommendation in recommendations}
+        self.assertGreater(len(statuses), 1, "every patient took the same path")
+        for recommendation in recommendations:
+            if recommendation.status is not RecommendationStatus.BLOCKED:
+                self.assertIn(recommendation.recommended_arm, TREATMENT_ARMS)
+
+    def test_no_simulated_patient_trips_the_leakage_guard(self):
+        """The exporter must not leak the future into the record it writes."""
+        for bundle in self.bundles:
+            DataLayer().build_patient_state(bundle)  # raises LeakageError if it did
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ from treatmentrx.feedback.offline_evaluation import evaluate_policy
 from treatmentrx.domain import RegimeAssignment, RegimeType
 from treatmentrx.simulation.ra_cohort import (
     HEPATOTOXIC_ARMS,
+    HIGH_BURDEN_ARMS,
     REFERENCE_ARM,
     TREATMENT_ARMS,
     TRUE_BLIPS,
@@ -32,10 +33,15 @@ from treatmentrx.simulation.ra_cohort import (
     true_blip,
 )
 
-# Arms whose blip is not distorted at stage 1 by a delayed cost — the ones a
-# stage-shared blip is entitled to recover exactly.
+# Every arm now carries some delayed component — hepatotoxic arms cost ALT at
+# the next visit, high-burden arms are abandoned unless they work — so only the
+# *terminal*-stage blip is the single-visit quantity `TRUE_BLIPS` describes.
+_ACTIVE_ARMS = tuple(arm for arm in TREATMENT_ARMS if arm != REFERENCE_ARM)
+# Arms with neither a toxicity cost nor a retention effect.
 _CLEAN_ARMS = tuple(
-    arm for arm in TREATMENT_ARMS if arm != REFERENCE_ARM and arm not in HEPATOTOXIC_ARMS
+    arm
+    for arm in _ACTIVE_ARMS
+    if arm not in HEPATOTOXIC_ARMS and arm not in HIGH_BURDEN_ARMS
 )
 
 _ASSIGNMENT = RegimeAssignment(
@@ -88,7 +94,22 @@ class BlipRecoveryTests(unittest.TestCase):
                     estimated[name], truth, delta=0.03, msg=f"{arm}:{name}"
                 )
 
-    def test_shared_q_learning_recovers_undistorted_blips(self):
+    def test_terminal_stage_blips_are_recovered_for_every_arm(self):
+        """The terminal stage is where the blip is a single-visit effect.
+
+        Earlier stages legitimately differ — they carry the delayed consequences
+        of the choice — so this is the stage `TRUE_BLIPS` can be checked against.
+        """
+        model = QLearningModel(generate_ra_cohort(400, seed=7), share_blip=False)
+        terminal = model.n_stages - 1
+        for arm in _ACTIVE_ARMS:
+            estimated = model.blip_parameters(arm, terminal)
+            for name, truth in zip(estimated, TRUE_BLIPS[arm]):
+                self.assertAlmostEqual(
+                    estimated[name], truth, delta=0.04, msg=f"{arm}:{name}"
+                )
+
+    def test_shared_blip_recovers_arms_without_delayed_effects(self):
         model = QLearningModel(generate_ra_cohort(400, seed=7), share_blip=True)
         for arm in _CLEAN_ARMS:
             estimated = model.blip_parameters(arm)
@@ -127,6 +148,21 @@ class BlipRecoveryTests(unittest.TestCase):
             first = model.blip_parameters(arm, 0)["intercept"]
             terminal = model.blip_parameters(arm, model.n_stages - 1)["intercept"]
             self.assertLess(first, terminal - 0.01, msg=arm)
+
+    def test_retention_benefit_raises_the_value_of_earlier_decisions(self):
+        """A burdensome arm that works keeps the patient in care.
+
+        Those retained visits are extra accrued benefit that only a
+        multi-stage estimator can see, so the earlier-stage blip for a
+        high-burden arm sits *above* its single-visit effect — the mirror image
+        of the delayed toxicity cost.
+        """
+        model = QLearningModel(generate_ra_cohort(400, seed=7), share_blip=False)
+        terminal_index = model.n_stages - 1
+        for arm in sorted(HIGH_BURDEN_ARMS):
+            first = model.blip_parameters(arm, 0)["intercept"]
+            terminal = model.blip_parameters(arm, terminal_index)["intercept"]
+            self.assertGreater(first, terminal + 0.005, msg=arm)
 
 
 class PolicyValueTests(unittest.TestCase):

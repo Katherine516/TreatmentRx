@@ -89,6 +89,34 @@ def reset() -> None:
     _FITTED = None
 
 
+def enable_bootstrap_inference(
+    replicates: int = 200,
+    alpha: float = 0.5,
+    seed: int = 17,
+) -> dict[str, object]:
+    """Attach m-out-of-n bootstrap draws to the Q-learning models.
+
+    Off by default: it costs one full refit per replicate, and the sandwich is
+    exact at the terminal stage where most decisions are made. Turn it on when a
+    non-terminal interval has to be defensible — after this, `contrast()` on a
+    non-terminal stage returns the bootstrap interval instead of the sandwich's
+    optimistic one.
+    """
+    fit = fitted()
+    report = {}
+    for name, model in ((Q_SHARED, fit.q_shared), (STAGE_SPECIFIC, fit.stage_specific)):
+        distribution = model.fit_bootstrap(
+            fit.train, replicates=replicates, alpha=alpha, seed=seed
+        )
+        report[name] = {
+            "n": distribution.n,
+            "m": distribution.m,
+            "non_regularity": round(distribution.non_regularity, 4),
+            "replicates": distribution.replicates,
+        }
+    return report
+
+
 def policy_value_for(method_name: str) -> float:
     """Held-out IPW policy value for an estimator, used as its `policy_value`."""
     score = fitted().scores.get(method_name)

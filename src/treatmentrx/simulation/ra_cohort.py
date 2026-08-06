@@ -72,7 +72,34 @@ _DAS28_MEAN = 5.5
 _DAS28_SD = 1.5
 _OUTCOME_NOISE_SD = 0.05
 
-DEFAULT_STAGES = 2
+DEFAULT_STAGES = 3
+
+# --- Dropout ---------------------------------------------------------------
+# Informative by construction: patients drop out when they are toxic or not
+# responding, both of which are consequences of the arm they were given. Naive
+# complete-case analysis is therefore biased, and only inverse-probability-of-
+# censoring weighting recovers the blip. That is the ground truth
+# `estimation/censoring.py` is validated against.
+_DROPOUT_INTERCEPT = -1.9
+_DROPOUT_ALT = 0.030  # per unit of ALT above the reference ceiling
+_DROPOUT_RESPONSE = -3.0  # good responders stay
+
+# Infusion therapies are burdensome, so patients abandon them unless they are
+# clearly working. That makes retention *differentially* response-dependent by
+# arm, which is what biases a blip contrast: among survivors on a high-burden
+# arm, outcomes are more positively selected than among survivors on an oral
+# one. Weighting by the estimated censoring probability is what removes it.
+HIGH_BURDEN_ARMS = frozenset({"IL-6 inhibitor", "rituximab"})
+_DROPOUT_BURDEN = 0.7  # baseline attrition on a burdensome arm
+_DROPOUT_BURDEN_RESPONSE = -5.0  # ...but only if it is not working
+
+# --- Visit timing ----------------------------------------------------------
+# Sicker patients are seen sooner, so observation intensity is confounded with
+# disease severity in exactly the way inverse-intensity weights exist to fix.
+_BASE_INTERVAL_DAYS = 120.0
+_INTERVAL_PER_SD = -22.0
+_INTERVAL_NOISE = 15.0
+_MIN_INTERVAL_DAYS = 28
 
 
 @dataclass(frozen=True)
@@ -80,20 +107,40 @@ class CohortStage:
     """One decision point: covariates, the arm taken, and what followed."""
 
     stage: int
+    day: int
     features: dict[str, float]
     arm: str
     propensity: float  # P(observed arm | features) under the behaviour policy
     outcome: float
+    # P(this patient is still under observation at this stage). Stage 1 is 1.0
+    # by construction; later stages carry the accumulated survival probability.
+    uncensored_probability: float = 1.0
+    interval_days: int | None = None  # days since the previous decision
+    event: str = "ongoing"
 
 
 @dataclass(frozen=True)
 class CohortTrajectory:
     patient_index: int
     stages: tuple[CohortStage, ...]
+    censored: bool = False
+    censoring_reason: str | None = None
 
     @property
     def total_reward(self) -> float:
         return sum(stage.outcome for stage in self.stages)
+
+    @property
+    def n_observed(self) -> int:
+        return len(self.stages)
+
+    @property
+    def terminal_event(self) -> str:
+        return self.stages[-1].event if self.stages else "ongoing"
+
+
+def _logistic(x: float) -> float:
+    return 1.0 / (1.0 + math.exp(-x))
 
 
 def das28_std(das28: float) -> float:
@@ -197,13 +244,26 @@ def generate_ra_cohort(
     n: int = 400,
     seed: int = 7,
     stages: int = DEFAULT_STAGES,
+    dropout: bool = True,
 ) -> list[CohortTrajectory]:
-    """Generate `n` confounded two-stage trajectories under the behaviour policy."""
+    """Generate `n` confounded multi-stage trajectories under the behaviour policy.
+
+    Trajectories end early when the patient drops out. Because dropout depends on
+    toxicity and response — both consequences of the arm given — the censoring is
+    informative, and the resulting cohort is what `estimation/censoring.py` is
+    validated against. Pass `dropout=False` for the complete-data comparison.
+    """
     rng = random.Random(seed)
     cohort: list[CohortTrajectory] = []
     for index in range(n):
         features = sample_baseline_features(rng)
         trajectory: list[CohortStage] = []
+        day = 0
+        interval: int | None = None
+        survival = 1.0
+        censored = False
+        reason: str | None = None
+
         for stage in range(1, stages + 1):
             arm, propensity = _sample_arm(features, rng)
             outcome = clamp(
@@ -211,18 +271,39 @@ def generate_ra_cohort(
                 0.0,
                 1.0,
             )
+            leaving = dropout and stage < stages and rng.random() < dropout_probability(features, outcome, arm)
+            if leaving:
+                reason = dropout_reason(features, outcome)
             trajectory.append(
                 CohortStage(
                     stage=stage,
+                    day=day,
                     features=dict(features),
                     arm=arm,
                     propensity=round(propensity, 6),
                     outcome=round(outcome, 4),
+                    uncensored_probability=round(survival, 6),
+                    interval_days=interval,
+                    event=reason or ("response" if outcome >= 0.7 else "ongoing"),
                 )
             )
+            if leaving:
+                censored = True
+                break
             if stage < stages:
+                survival *= 1.0 - dropout_probability(features, outcome, arm)
+                interval = visit_interval(features, rng)
+                day += interval
                 features = transition(features, arm, outcome, rng)
-        cohort.append(CohortTrajectory(patient_index=index, stages=tuple(trajectory)))
+
+        cohort.append(
+            CohortTrajectory(
+                patient_index=index,
+                stages=tuple(trajectory),
+                censored=censored,
+                censoring_reason=reason,
+            )
+        )
     return cohort
 
 
@@ -242,12 +323,18 @@ def rollout_value(
     n: int = 2000,
     seed: int = 101,
     stages: int = DEFAULT_STAGES,
+    dropout: bool = True,
 ) -> float:
     """Oracle policy value: expected total reward under the generating process.
 
     `policy(features, stage_index) -> arm`, with `stage_index` zero-based. Only
-    available in simulation — it is the yardstick the observational IPW
-    estimates in `layer11_feedback.offline_evaluation` are checked against.
+    available in simulation — it is the yardstick the observational IPW estimates
+    in `feedback/offline_evaluation.py` are checked against.
+
+    Dropout is simulated, so a policy that drives toxicity is penalised twice:
+    once through the delayed ALT cost, and again through the visits it loses. A
+    policy is worth what the patient actually accrues, not what they would have
+    accrued had they stayed.
     """
     rng = random.Random(seed)
     total = 0.0
@@ -261,9 +348,72 @@ def rollout_value(
                 1.0,
             )
             total += outcome
-            if stage_index < stages - 1:
-                features = transition(features, arm, outcome, rng)
+            if stage_index >= stages - 1:
+                break
+            if dropout and rng.random() < dropout_probability(features, outcome, arm):
+                break
+            features = transition(features, arm, outcome, rng)
     return round(total / n, 4)
+
+
+def rollout_retention(
+    policy,
+    n: int = 2000,
+    seed: int = 101,
+    stages: int = DEFAULT_STAGES,
+) -> float:
+    """Mean number of decision points a policy keeps the patient in care for."""
+    rng = random.Random(seed)
+    observed = 0
+    for _ in range(n):
+        features = sample_baseline_features(rng)
+        for stage_index in range(stages):
+            arm = policy(features, stage_index)
+            outcome = clamp(
+                treatment_free_value(features) + true_blip(arm, features) + rng.gauss(0.0, _OUTCOME_NOISE_SD),
+                0.0,
+                1.0,
+            )
+            observed += 1
+            if stage_index >= stages - 1:
+                break
+            if rng.random() < dropout_probability(features, outcome, arm):
+                break
+            features = transition(features, arm, outcome, rng)
+    return round(observed / n, 4)
+
+
+def dropout_probability(features: dict[str, float], outcome: float, arm: str = REFERENCE_ARM) -> float:
+    """P(patient leaves the study before the next decision point).
+
+    Depends on toxicity, on response, and — for burdensome infusion arms — on
+    response *more steeply*. All three are consequences of the arm given, so the
+    censoring is informative and differential, and complete-case analysis is
+    biased in a way that differs between arms.
+    """
+    burden = arm in HIGH_BURDEN_ARMS
+    logit = (
+        _DROPOUT_INTERCEPT
+        + _DROPOUT_ALT * max(features["alt"] - 40.0, 0.0)
+        + (_DROPOUT_RESPONSE + (_DROPOUT_BURDEN_RESPONSE if burden else 0.0)) * (outcome - 0.5)
+        + (_DROPOUT_BURDEN if burden else 0.0)
+    )
+    return _logistic(logit)
+
+
+def dropout_reason(features: dict[str, float], outcome: float) -> str:
+    """Which competing event ended the trajectory."""
+    if features["alt"] > 90.0:
+        return "serious_toxicity"
+    if outcome < 0.45:
+        return "progression"
+    return "dropout"
+
+
+def visit_interval(features: dict[str, float], rng: random.Random) -> int:
+    """Days until the next decision point — shorter for more active disease."""
+    mean = _BASE_INTERVAL_DAYS + _INTERVAL_PER_SD * das28_std(features["das28"])
+    return max(_MIN_INTERVAL_DAYS, int(round(rng.gauss(mean, _INTERVAL_NOISE))))
 
 
 def behaviour_policy(features: dict[str, float], stage_index: int) -> str:

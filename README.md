@@ -18,6 +18,10 @@ PYTHONPATH=src python3 -m treatmentrx.cli evaluate
 ```
 
 ```bash
+PYTHONPATH=src python3 -m treatmentrx.cli inference
+```
+
+```bash
 PYTHONPATH=src python3 -m unittest discover -s tests
 ```
 
@@ -47,6 +51,7 @@ FHIR bundle
 
 | Layer | Does | Key modules |
 | --- | --- | --- |
+| **0 Simulation** | Multi-stage cohort with known blips, confounded assignment, informative dropout and irregular visits — plus a FHIR exporter so simulated patients re-enter through Layer 1 | `simulation/` |
 | **1 Data** | FHIR ingestion, RA data contract, stage construction, irregular timing, switching/rescue capture, belief filtering over latent disease activity, competing risks, causal DAG identifiability, leakage guards | `data/` |
 | **2 Estimation** | Three treatment-regime estimators over one arm menu, one scale, one training split | `estimation/` |
 | **3 Decision** | Bayesian model averaging, four-type uncertainty, held-out calibration, competing-risk and belief adjustment, goal-conditioned thresholds, blip explainability, contrast testing | `decision/`, `estimation/inference.py` |
@@ -90,6 +95,25 @@ not the plumbing:
 - standard errors shrink with √n, and an arm compared against itself is never
   reported as distinguishable.
 
+### The generating process
+
+Three decision points per patient, six arms, and three mechanisms that make the
+estimation problem real rather than decorative:
+
+| Mechanism | What it breaks | What has to handle it |
+| --- | --- | --- |
+| Confounded assignment | Naive arm means | Propensity weighting (dWOLS) or outcome modelling (Q-learning) |
+| Delayed hepatotoxicity | Myopic policies | Backward induction |
+| Informative, arm-differential dropout | Complete-case analysis | Censored-row handling and IPCW |
+
+Dropout depends on toxicity and on response, and burdensome infusion arms are
+abandoned unless they are clearly working — so retention is *differentially*
+response-dependent by arm. Trajectories end early, visit intervals shorten with
+disease activity, and `simulation/fhir_export.py` renders any trajectory as an
+ingestible bundle, so Layer 1's timing, switching and competing-risk machinery is
+finally checked against patients whose truth is known by construction rather
+than against one hand-written demo.
+
 ### Uncertainty is a standard error, not a heuristic
 
 Confidence bands come from a cluster-robust (sandwich) covariance matrix,
@@ -98,8 +122,8 @@ decision-relevant quantity is the **contrast** between the top arm and the
 runner-up:
 
 ```text
-Separation: rituximab over IL-6 inhibitor is +0.087
-(SE 0.018, 95% CI [+0.051, +0.123]) — separable at this sample size.
+Separation: rituximab over IL-6 inhibitor is +0.083
+(SE 0.021, 95% CI [+0.041, +0.125]) — separable at this sample size.
 ```
 
 Equipoise now needs two independent conditions to fail. The care goal sets how
@@ -107,8 +131,35 @@ large a difference is worth acting on; the interval decides whether the data can
 resolve a difference that size at all. A gap that clears the clinical bar but
 sits inside its own confidence interval is equipoise, not a recommendation.
 
-At non-terminal stages the interval treats the pseudo-outcomes as fixed, which
-understates uncertainty; those intervals carry that caveat in the output.
+### Where the sandwich is not enough
+
+The sandwich treats the pseudo-outcomes as fixed data when they are themselves
+estimated, so it is optimistic wherever backward induction is involved — which
+with a *shared* blip is every stage, since one parameter vector is fit jointly
+from every stage's rows.
+
+The repair is an m-out-of-n bootstrap, which re-runs the entire procedure per
+replicate. The ordinary bootstrap is inconsistent here: the `max` in the
+pseudo-outcome is not smooth where two arms are tied, so the resample size
+adapts to the measured proportion of patients sitting near such a tie.
+
+```bash
+PYTHONPATH=src python3 -m treatmentrx.cli inference
+```
+
+```text
+Q-Shared + Penalized      n=280  m=191  non-regularity 0.20
+Stage-Specific Q-learning n=280  m=88   non-regularity 0.61
+
+rituximab vs IL-6 inhibitor, stage 0
+  sandwich  SE 0.0062  CI [0.0239, 0.0481]
+  bootstrap SE 0.0074  CI [0.0218, 0.0505]     ratio 1.20
+```
+
+The sandwich understates the interval by about 20% here. It stays the default —
+it is exact at a stage-specific terminal block, it costs nothing, and most
+decisions are terminal — but `training.enable_bootstrap_inference()` switches
+the contrast over when an interval has to be defensible.
 
 ### Is the estimator ranking real?
 
@@ -129,9 +180,10 @@ would manufacture a ranking the data does not support.
 
 ## What is real vs. still a placeholder
 
-**Real:** the three estimators, the synthetic cohort and its known blips, held-out
-IPW policy evaluation, calibration, sandwich standard errors and contrast tests,
-cross-validated stability, blip attributions.
+**Real:** the three estimators, the synthetic cohort and its known blips,
+informative-dropout handling and IPCW, held-out IPW policy evaluation,
+calibration, sandwich standard errors, m-out-of-n bootstrap intervals, contrast
+tests, cross-validated stability, blip attributions.
 
 **Deliberately simple, and labelled as such in-module:** `GRUBaselineEncoder` (a
 deterministic summariser, not a trained GRU), `CausalDAGRegistry` (hand-listed
@@ -143,16 +195,22 @@ The value of this codebase is that a reader can tell the difference.
 
 ## Next build steps
 
-1. **m-out-of-n bootstrap for non-terminal stages.** The sandwich treats
-   pseudo-outcomes as fixed. DTR inference is non-regular at the point where the
-   optimal arm changes, and the terminal-stage intervals are the only fully
-   honest ones today. `inference.bootstrap_contrast` is the hook.
-2. **A richer cohort.** Two stages and six arms is enough to validate the
-   estimators and no more. More stages, dropout, and irregular timing in the
-   generating process would exercise the Layer 1 machinery that currently has no
-   ground truth to be checked against.
-3. **Train the GRU baseline** and compare against the handcrafted encoder — worth
-   doing once the cohort has longitudinal structure to learn from.
+Done: penalized Q-learning with backward induction; held-out IPW policy value;
+sandwich standard errors and contrast-driven equipoise; cross-validated
+stability; m-out-of-n bootstrap for the non-regular stages; a multi-stage cohort
+with informative dropout and irregular visits, ingestible through Layer 1.
+
+Next, in order:
+
+1. **Estimate the visit-intensity weights.** Dropout is now modelled from the
+   data, but `IPCWHandler` still assigns visit weights heuristically. The cohort
+   generates severity-driven visit spacing, so the ground truth to fit against
+   exists — it just is not used yet.
+2. **A misspecified-outcome-model arm of the simulation.** IPCW is currently a
+   small correction because the outcome model is correctly specified. The case
+   where it earns its keep is the one not yet simulated.
+3. **Train the GRU baseline** and compare against the handcrafted encoder, now
+   that trajectories have three stages and irregular timing to learn from.
 4. **A versioned clinical knowledge base** keyed to `arms.py`, replacing the
    sample contraindication rules and the five hard-coded RAG passages.
 5. **FastAPI service and clinician dashboard**, once 1–4 make the numbers worth

@@ -135,30 +135,137 @@ def contrast_test(
     )
 
 
-def bootstrap_contrast(
+# --------------------------------------------------------------------------
+# m-out-of-n bootstrap for the non-regular, non-terminal stages
+# --------------------------------------------------------------------------
+
+# Tuning constant for the adaptive resample size. Larger values shrink the
+# resample harder as non-regularity rises. The literature chooses this by a
+# double bootstrap; this is a documented default, not a tuned one.
+DEFAULT_BOOTSTRAP_ALPHA = 0.5
+DEFAULT_REPLICATES = 200
+MIN_RESAMPLE = 25
+
+
+def adaptive_resample_size(n: int, non_regularity: float, alpha: float = DEFAULT_BOOTSTRAP_ALPHA) -> int:
+    """Resample size m for the m-out-of-n bootstrap.
+
+        m = n ** ((1 + alpha * (1 - p)) / (1 + alpha))
+
+    With p = 0 (no patient sits near a decision boundary) this returns n and the
+    procedure degenerates to the ordinary bootstrap, which is correct: the
+    estimator is regular there. As p rises toward 1 the resample shrinks, which
+    is what restores consistency — the ordinary bootstrap is *inconsistent* at a
+    non-smooth point, and taking m < n with m/n → 0 is the standard repair.
+    """
+    non_regularity = max(0.0, min(1.0, non_regularity))
+    exponent = (1.0 + alpha * (1.0 - non_regularity)) / (1.0 + alpha)
+    return max(MIN_RESAMPLE, min(n, int(round(n ** exponent))))
+
+
+def _quantile(sorted_values: list[float], q: float) -> float:
+    if not sorted_values:
+        return 0.0
+    position = q * (len(sorted_values) - 1)
+    low = int(math.floor(position))
+    high = min(low + 1, len(sorted_values) - 1)
+    weight = position - low
+    return sorted_values[low] * (1.0 - weight) + sorted_values[high] * weight
+
+
+@dataclass(frozen=True)
+class BootstrapDistribution:
+    """Parameter draws from an m-out-of-n resampling of whole trajectories.
+
+    Storing the draws rather than a single standard error is what makes this
+    affordable: the refits are paid once, and the interval for *any* linear
+    contrast afterwards is a dot product per draw.
+    """
+
+    draws: list[list[float]]
+    point: list[float]
+    n: int
+    m: int
+    non_regularity: float
+    alpha: float
+    replicates: int
+
+    @property
+    def scale(self) -> float:
+        """sqrt(m/n) — converts the resample's spread to the full sample's."""
+        return math.sqrt(self.m / self.n) if self.n else 1.0
+
+    def standard_error(self, loading: list[float]) -> float:
+        values = [_dot_sparse(loading, draw) for draw in self.draws]
+        if len(values) < 2:
+            return 0.0
+        mean = sum(values) / len(values)
+        variance = sum((value - mean) ** 2 for value in values) / (len(values) - 1)
+        return math.sqrt(variance) * self.scale
+
+    def interval(self, loading: list[float], alpha: float = DEFAULT_ALPHA) -> tuple[float, float]:
+        """Percentile interval from the centred, scaled bootstrap statistics.
+
+        Percentile rather than normal-approximation on purpose: non-regularity
+        produces an asymmetric sampling distribution, and capturing that
+        asymmetry is the whole reason for using a bootstrap here.
+        """
+        estimate = _dot_sparse(loading, self.point)
+        root_m = math.sqrt(self.m)
+        statistics = sorted(root_m * (_dot_sparse(loading, draw) - estimate) for draw in self.draws)
+        root_n = math.sqrt(self.n) if self.n else 1.0
+        upper_statistic = _quantile(statistics, 1.0 - alpha / 2.0)
+        lower_statistic = _quantile(statistics, alpha / 2.0)
+        return (estimate - upper_statistic / root_n, estimate - lower_statistic / root_n)
+
+
+def _dot_sparse(loading: list[float], values: list[float]) -> float:
+    return sum(l * v for l, v in zip(loading, values) if l != 0.0)
+
+
+def m_out_of_n_bootstrap(
     refit,
     cohort: list,
-    loading_fn,
-    replicates: int = 200,
+    point: list[float],
+    non_regularity: float,
+    replicates: int = DEFAULT_REPLICATES,
+    alpha: float = DEFAULT_BOOTSTRAP_ALPHA,
     seed: int = 17,
-) -> float:
-    """Nonparametric cluster bootstrap standard error for a contrast.
+) -> BootstrapDistribution:
+    """Resample m whole trajectories with replacement and re-run the full fit.
 
-    Resamples whole trajectories and re-runs the *entire* fitting procedure, so
-    unlike the sandwich it does account for the pseudo-outcome step. It costs one
-    full refit per replicate, which is why it is a validation tool rather than
-    something the inference path calls.
+    `refit(sample) -> list[float]` must repeat the *entire* estimation procedure,
+    pseudo-outcome construction included. That is what the sandwich cannot do and
+    why this exists: at a non-terminal stage the regression target is built from
+    the fitted downstream model, and treating it as fixed data understates the
+    uncertainty.
+
+    Clusters are trajectories, never rows — resampling visits independently would
+    break the within-patient correlation the whole design depends on.
     """
     import random
 
+    n = len(cohort)
+    m = adaptive_resample_size(n, non_regularity, alpha)
     rng = random.Random(seed)
-    values = []
+    draws = []
     for _ in range(replicates):
-        sample = [cohort[rng.randrange(len(cohort))] for _ in range(len(cohort))]
-        values.append(loading_fn(refit(sample)))
-    mean = sum(values) / len(values)
-    variance = sum((value - mean) ** 2 for value in values) / max(len(values) - 1, 1)
-    return math.sqrt(variance)
+        sample = [cohort[rng.randrange(n)] for _ in range(m)]
+        try:
+            draws.append(refit(sample))
+        except (ValueError, ZeroDivisionError):
+            # A resample can omit an arm entirely; skip it rather than let one
+            # degenerate draw define the interval.
+            continue
+    return BootstrapDistribution(
+        draws=draws,
+        point=list(point),
+        n=n,
+        m=m,
+        non_regularity=non_regularity,
+        alpha=alpha,
+        replicates=len(draws),
+    )
 
 
 __all__ = [

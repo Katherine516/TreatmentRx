@@ -66,8 +66,11 @@ class CausalDAGRegistry:
         if node == "baseline_disease_activity":
             return bool(observed_features & {"das28", "cdai", "sdai", "haq_di"})
         if node == "prior_biologic_exposure":
-            names = " ".join(medication.name.lower() for medication in patient.medications)
-            return any(token in names for token in ("tnf", "adalimumab", "etanercept", "tocilizumab", "jak"))
+            # The adjuster is *known* whenever a medication history exists —
+            # "no prior biologic" is a value of this variable, not a missing one.
+            # Requiring a biologic to appear blocked every csDMARD-only patient
+            # for having been treated conservatively.
+            return bool(patient.medications)
         if node == "steroid_use":
             return bool(patient.medications)
         return node in observed_features or node in patient.demographics
