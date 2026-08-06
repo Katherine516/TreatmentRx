@@ -1,18 +1,29 @@
+"""Layer 2 — `PatientState` to a set of `RegimeEstimate`s.
+
+Three estimators score the same arm menu on the same scale, fit once per process
+on the same training split (`training.py`). They are kept deliberately different
+in their failure modes: Q-learning is an outcome-model method, dWOLS is
+doubly-robust, and the stage-specific fit relaxes the shared-blip assumption.
+Averaging them is only informative because they can fail differently.
+
+This layer hands the estimators the patient's `StageRecord`s untouched, so the
+timing, belief, switching and competing-risk annotations from Layer 1 reach the
+covariate mapping intact.
+"""
+
 from __future__ import annotations
 
-from precisionrx_agent.layer1_ingestion.data_engineering import VariableSelector
-from precisionrx_agent.layer4_estimation.dwols import DWOLSSharedEstimator
-from precisionrx_agent.layer4_estimation.estimation import QSharedEstimator, StageSpecificQEstimator
-from precisionrx_agent.layer4_estimation.regime import AdaptiveRegimeSelector
-from precisionrx_agent.shared.models import RegimeAssignment, RegimeType, StageRecord
+from dataclasses import replace
+
 from treatmentrx.contracts import LayerDiagnostic, PatientState, RegimeEstimate
+from treatmentrx.domain import RegimeAssignment, RegimeType
+from treatmentrx.estimation.dwols import DWOLSSharedEstimator
+from treatmentrx.estimation.estimators import QSharedEstimator, StageSpecificQEstimator
+from treatmentrx.estimation.regime import AdaptiveRegimeSelector
 
 
 class EstimationLayer:
-    """Layer 2: run treatment-regime estimators over the PatientState contract."""
-
     def __init__(self) -> None:
-        self.variable_selector = VariableSelector()
         self.regime_selector = AdaptiveRegimeSelector()
         self.estimators = (
             QSharedEstimator(),
@@ -21,49 +32,31 @@ class EstimationLayer:
         )
 
     def estimate(self, state: PatientState) -> list[RegimeEstimate]:
-        stages = self._to_stage_records(state)
-        tailoring_variables = self.variable_selector.select(stages)
+        stages = state.stages
         assignment = self.regime_selector.select(stages) if stages else self._fallback_assignment()
-        estimates = []
-        for estimator in self.estimators:
-            result = estimator.fit_predict(stages, assignment, tailoring_variables)
-            estimates.append(
-                RegimeEstimate(
-                    estimator=result.method_name,
-                    q_values=result.q_values,
-                    recommended_arm=result.recommended_action,
-                    policy_value=result.policy_value,
-                    confidence_band=result.confidence_band,
-                    diagnostics=[
-                        LayerDiagnostic(
-                            name=f"estimator:{result.method_name}",
-                            passed=True,
-                            severity="info",
-                            message=f"{result.method_name} completed with policy value {result.policy_value:.3f}",
-                        )
-                    ],
-                    parameters=result.coefficients,
-                )
-            )
-        return estimates
-
-    def _to_stage_records(self, state: PatientState) -> list[StageRecord]:
+        menu = tuple(state.feasible_arms)
         return [
-            StageRecord(
-                patient_id=state.patient_hash,
-                disease=state.disease,
-                stage=stage.stage,
-                treatment=stage.treatment,
-                start_day=stage.start_day,
-                end_day=stage.end_day,
-                features=stage.features,
-                response=stage.response,
-                outcome=stage.outcome,
-                visit_weight=stage.visit_weight,
-                censoring_weight=stage.censoring_weight,
+            self._with_diagnostic(
+                estimator.fit_predict(stages, assignment, state.tailoring_variables, menu)
             )
-            for stage in state.stages
+            for estimator in self.estimators
         ]
+
+    def _with_diagnostic(self, estimate: RegimeEstimate) -> RegimeEstimate:
+        return replace(
+            estimate,
+            diagnostics=[
+                LayerDiagnostic(
+                    name=f"estimator:{estimate.estimator}",
+                    passed=True,
+                    severity="info",
+                    message=(
+                        f"{estimate.estimator} recommends {estimate.recommended_arm}; "
+                        f"held-out policy value {estimate.policy_value:.3f}"
+                    ),
+                )
+            ],
+        )
 
     def _fallback_assignment(self) -> RegimeAssignment:
         return RegimeAssignment(
@@ -72,3 +65,6 @@ class EstimationLayer:
             shared_bic=0.0,
             stage_specific_bic=0.0,
         )
+
+
+__all__ = ["EstimationLayer"]

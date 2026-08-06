@@ -3,17 +3,17 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "precisionrx-agent"
+name = "treatmentrx"
 version = "0.1.0"
-description = "Prototype healthcare AI agent for multi-stage treatment regimes"
+description = "Research-stage clinical decision-support agent for sequential treatment decisions"
 # 3.9 is what the project is developed and run against; the code stays
 # 3.9-compatible (deferred annotations, no `match`, no runtime PEP 604 unions).
 requires-python = ">=3.9"
-authors = [{ name = "PrecisionRx" }]
+authors = [{ name = "TreatmentRx" }]
 dependencies = []
 
 [project.scripts]
-precisionrx = "precisionrx_agent.cli:main"
+treatmentrx = "treatmentrx.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

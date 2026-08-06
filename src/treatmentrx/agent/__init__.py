@@ -1,122 +1,129 @@
+"""Layer 5 — context assembly, memory/RAG, and the three explanation agents.
+
+The division of labour is the point of this layer: it **renders** what Layers 3
+and 4 decided and never adds to it. The three agents may not choose an arm,
+invent a citation, soften a safety block, or make a causal claim beyond the
+DAG-generated path text.
+
+Memory reaches this layer and only this layer. `apply_memory` enforces, by
+assertion rather than convention, that nothing it adds can move a statistical
+quantity — memory shapes framing and retrieval, never a Q-value.
+"""
+
 from __future__ import annotations
 
-from precisionrx_agent.layer9_memory_rag.memory import EpisodicMemory, SemanticKnowledgeBase
-from treatmentrx.contracts import Citation, ContextBundle, Recommendation, RecommendationStatus, SafeDecision, VersionSet
+from treatmentrx.agent.memory import EpisodicMemory, SemanticKnowledgeBase, apply_memory
+from treatmentrx.agent.rationale import RationaleGenerator
+from treatmentrx.contracts import Citation, ContextBundle, Recommendation, SafeDecision, VersionSet
+from treatmentrx.domain import RecommendationStatus
 
 
 class AgentLayer:
-    """Layer 5: context assembly, RAG/memory, and schema-validated recommendation."""
-
     def __init__(self) -> None:
         self.memory = EpisodicMemory()
         self.knowledge_base = SemanticKnowledgeBase()
+        self.rationale = RationaleGenerator()
 
     def build_context(self, safe: SafeDecision) -> ContextBundle:
+        decision = safe.decision
         patient_hash = safe.provenance.get("patient_hash", "unknown")
-        arm = safe.decision.recommended_arm
-        evidence = [
-            Citation(source="RA knowledge base", text=passage, url=None)
-            for passage in self.knowledge_base.retrieve(f"{arm} rheumatoid arthritis", k=3)
-        ]
-        memory = {
-            "prior_context": self.memory.recent_summary(patient_hash),
-            "framing_hints": self.memory.preferences(patient_hash),
-            "influence": "narrative_and_retrieval_only",
-        }
-        return ContextBundle(
-            patient={
-                "patient_hash": patient_hash,
+
+        bundle = {
+            "patient_context": {
+                "patient_id": patient_hash,
+                "care_goal": safe.provenance.get("care_goal"),
                 "history_summary": safe.provenance.get("history_summary", ""),
+                "top_tailoring_vars": decision.selected.top_tailoring_variables,
             },
+            # Everything under this key is off-limits to memory and to the agents.
+            "statistical_output": {
+                "selected_method": decision.selected.estimator,
+                "regime_type": decision.selected.regime_type.value,
+                "recommended_arm": decision.recommended_arm,
+                "q_values": decision.q_values,
+                "policy_value": decision.selected.policy_value,
+                "confidence_band": list(decision.selected.confidence_band),
+                "safety_status": safe.status.value,
+            },
+        }
+        bundle = apply_memory(bundle, self.memory, self.knowledge_base)
+
+        return ContextBundle(
+            patient=bundle["patient_context"],
             decision={
-                "recommended_arm": arm,
-                "q_values": safe.decision.q_values,
-                "model_weights": safe.decision.model_weights,
-                "rationale": safe.decision.rationale,
+                "recommended_arm": decision.recommended_arm,
+                "q_values": decision.q_values,
+                "model_weights": decision.model_weights,
+                "rationale": decision.rationale,
+                "confidence_gap": decision.confidence_gap,
+                "goal_decision": decision.goal_decision,
+                "explanation": decision.explanation,
+                "uncertainty": decision.uncertainty,
             },
             safety={
                 "status": safe.status.value,
                 "flags": [flag.__dict__ for flag in safe.safety_flags],
                 "feasible_arms": safe.feasible_arms,
+                "feasible_actions": safe.feasible_actions,
             },
-            evidence=evidence,
-            memory=memory,
+            evidence=[
+                Citation(source=f"RA knowledge base {self.knowledge_base.version}", text=passage)
+                for passage in bundle["memory"]["evidence"]
+            ],
+            memory=bundle["memory"],
             versions=VersionSet(**safe.provenance.get("versions", {})),
         )
 
     def run_agents(self, context: ContextBundle, safe: SafeDecision) -> Recommendation:
-        safety_text = self._safety_agent(context, safe)
+        safety_text = self._safety_agent(safe)
         if safe.hard_block:
-            return self._blocked_recommendation(context, safe, safety_text)
+            return self._blocked(context, safe, safety_text)
 
         guideline_text = self._guideline_agent(context)
-        clinician_card = self._synthesis_agent(context, safe, safety_text, guideline_text)
-        patient_summary = (
-            f"The care team may consider {safe.decision.recommended_arm}. This recommendation should be reviewed "
-            "with your clinician, including expected benefits, safety monitoring, and your preferences."
-        )
         return Recommendation(
-            patient_hash=context.patient["patient_hash"],
+            patient_hash=context.patient["patient_id"],
             status=safe.status,
-            clinician_card=clinician_card,
-            patient_summary=patient_summary,
             recommended_arm=safe.decision.recommended_arm,
             q_values=safe.decision.q_values,
-            uncertainty=self._uncertainty_text(safe),
+            clinician_card=self.rationale.clinician_card(context, safe, safety_text, guideline_text),
+            patient_summary=self.rationale.patient_summary(context, safe),
+            uncertainty=self.rationale.uncertainty_text(safe.decision.uncertainty),
             evidence=context.evidence,
             safety_flags=safe.safety_flags,
+            explanation=safe.decision.explanation,
             provenance=safe.provenance | {"agent_layer": "treatmentrx.agent", "schema_validated": True},
         )
 
-    def _safety_agent(self, context: ContextBundle, safe: SafeDecision) -> str:
+    def _safety_agent(self, safe: SafeDecision) -> str:
+        """Formats safety findings verbatim. It has no authority to reword a block."""
         if not safe.safety_flags:
-            return "No hard safety block was identified."
-        flags = "; ".join(f"{flag.severity}: {flag.message}" for flag in safe.safety_flags)
-        return f"Safety review: {flags}"
+            return "No safety concern was identified by the safety layer."
+        return "Safety review: " + "; ".join(
+            f"{flag.severity}: {flag.message}" for flag in safe.safety_flags
+        )
 
     def _guideline_agent(self, context: ContextBundle) -> str:
         if not context.evidence:
             return "No retrieved guideline evidence was available for this arm."
         return " ".join(citation.text for citation in context.evidence)
 
-    def _synthesis_agent(self, context: ContextBundle, safe: SafeDecision, safety_text: str, guideline_text: str) -> str:
-        arm = safe.decision.recommended_arm
-        q_values = safe.decision.q_values
-        next_best = self._next_best(arm, q_values)
-        gap = q_values.get(arm, 0.0) - q_values.get(next_best, 0.0)
-        return (
-            f"Recommendation: {arm}.\n\n"
-            f"Model rationale: {safe.decision.rationale} The model-averaged Q-value gap versus {next_best} is {gap:.3f}. "
-            f"Model weights were {safe.decision.model_weights}.\n\n"
-            f"{safety_text}\n\n"
-            f"Evidence summary: {guideline_text}\n\n"
-            f"Uncertainty: {self._uncertainty_text(safe)}"
-        )
-
-    def _blocked_recommendation(self, context: ContextBundle, safe: SafeDecision, safety_text: str) -> Recommendation:
+    def _blocked(self, context: ContextBundle, safe: SafeDecision, safety_text: str) -> Recommendation:
         return Recommendation(
-            patient_hash=context.patient["patient_hash"],
+            patient_hash=context.patient["patient_id"],
             status=RecommendationStatus.BLOCKED,
-            clinician_card=f"Recommendation blocked. {safety_text}",
-            patient_summary="The care team needs to review a safety or data-quality issue before a treatment suggestion is shown.",
             recommended_arm=None,
             q_values=safe.decision.q_values,
-            uncertainty=self._uncertainty_text(safe),
+            clinician_card=f"Recommendation blocked pending clinical review. {safety_text}",
+            patient_summary=(
+                "The care team needs to review a safety or data-quality issue before a treatment "
+                "suggestion is shown."
+            ),
+            uncertainty=self.rationale.uncertainty_text(safe.decision.uncertainty),
             evidence=context.evidence,
             safety_flags=safe.safety_flags,
+            explanation=safe.decision.explanation,
             provenance=safe.provenance | {"agent_layer": "treatmentrx.agent", "schema_validated": True},
         )
 
-    def _next_best(self, arm: str, q_values: dict[str, float]) -> str:
-        for candidate, _ in sorted(q_values.items(), key=lambda item: item[1], reverse=True):
-            if candidate != arm:
-                return candidate
-        return "manual-review"
 
-    def _uncertainty_text(self, safe: SafeDecision) -> str:
-        unc = safe.decision.uncertainty
-        flags = ", ".join(unc.flags) if unc.flags else "none"
-        return (
-            f"aleatoric={unc.aleatoric:.3f}; epistemic={unc.epistemic:.3f}; "
-            f"model={unc.model:.4f}; ood={unc.ood:.3f}; calibrated={unc.calibrated}; flags={flags}"
-        )
+__all__ = ["AgentLayer", "EpisodicMemory", "SemanticKnowledgeBase"]

@@ -9,17 +9,17 @@ produced the data.
 
 import unittest
 
-from precisionrx_agent.demo_data import sample_ra_bundle
-from precisionrx_agent.layer1_ingestion.data_engineering import StageHistoryBuilder
-from precisionrx_agent.layer1_ingestion.fhir import FHIRAdapter
-from precisionrx_agent.layer4_estimation import training
-from precisionrx_agent.layer4_estimation.dwols import DWOLSModel, DWOLSSharedEstimator
-from precisionrx_agent.layer4_estimation.estimation import QSharedEstimator, StageSpecificQEstimator
-from precisionrx_agent.layer4_estimation.features import model_features, prior_tnf_exposure
-from precisionrx_agent.layer4_estimation.q_learning import QLearningModel, myopic_model
-from precisionrx_agent.layer11_feedback.offline_evaluation import evaluate_policy
-from precisionrx_agent.shared.models import RegimeAssignment, RegimeType
-from precisionrx_agent.simulation.ra_cohort import (
+from treatmentrx.demo_data import sample_ra_bundle
+from treatmentrx.data.stages import StageHistoryBuilder
+from treatmentrx.data.fhir import FHIRAdapter
+from treatmentrx.estimation import training
+from treatmentrx.estimation.dwols import DWOLSModel, DWOLSSharedEstimator
+from treatmentrx.estimation.estimators import QSharedEstimator, StageSpecificQEstimator
+from treatmentrx.estimation.features import model_features, prior_tnf_exposure
+from treatmentrx.estimation.q_learning import QLearningModel, myopic_model
+from treatmentrx.feedback.offline_evaluation import evaluate_policy
+from treatmentrx.domain import RegimeAssignment, RegimeType
+from treatmentrx.simulation.ra_cohort import (
     HEPATOTOXIC_ARMS,
     REFERENCE_ARM,
     TREATMENT_ARMS,
@@ -208,7 +208,7 @@ class EstimatorFacadeTests(unittest.TestCase):
         self.assertEqual(len(menus), 1, "estimators must score the same arm menu")
         for result in results:
             for arm, value in result.q_values.items():
-                self.assertTrue(0.0 <= value <= 1.0, msg=f"{result.method_name}:{arm}")
+                self.assertTrue(0.0 <= value <= 1.0, msg=f"{result.estimator}:{arm}")
 
     def test_policy_value_is_the_held_out_score_not_a_self_report(self):
         _, stages = _demo_stages()
@@ -218,8 +218,8 @@ class EstimatorFacadeTests(unittest.TestCase):
     def test_blip_parameters_are_exposed_for_audit(self):
         _, stages = _demo_stages()
         result = DWOLSSharedEstimator().fit_predict(stages, _ASSIGNMENT, ["das28"])
-        recommended = result.recommended_action
-        self.assertEqual(result.method_name, training.DWOLS_SHARED)
+        recommended = result.recommended_arm
+        self.assertEqual(result.estimator, training.DWOLS_SHARED)
         self.assertTrue(
             any(key.startswith(f"psi:{recommended}:") for key in result.coefficients),
             msg=f"no blip parameters reported for {recommended}: {sorted(result.coefficients)}",
@@ -239,25 +239,25 @@ class EstimatorFacadeTests(unittest.TestCase):
         self.assertEqual(features["prior_tnf"], 1.0)
         self.assertEqual(myopic_optimal_policy(features, 0), "rituximab")
         self.assertEqual(
-            QSharedEstimator().fit_predict(stages, _ASSIGNMENT, ["das28"]).recommended_action,
+            QSharedEstimator().fit_predict(stages, _ASSIGNMENT, ["das28"]).recommended_arm,
             "rituximab",
         )
 
     def test_blip_attributions_sum_to_the_estimated_advantage(self):
         """Explanations must decompose the model, not paraphrase it."""
-        from precisionrx_agent.layer4_estimation.explainability import ModelExplainer
+        from treatmentrx.estimation.explainability import ModelExplainer
 
         _, stages = _demo_stages()
         result = QSharedEstimator().fit_predict(stages, _ASSIGNMENT, ["das28"])
         attribution = ModelExplainer().explain(result, [result], stages).attributions[0]
-        self.assertEqual(attribution.action, result.recommended_action)
+        self.assertEqual(attribution.action, result.recommended_arm)
         self.assertAlmostEqual(
             sum(attribution.contributions.values()), attribution.total_advantage, places=3
         )
         model = training.fitted().q_shared
         self.assertAlmostEqual(
             attribution.total_advantage,
-            model.blip(result.recommended_action, model_features(stages), 0),
+            model.blip(result.recommended_arm, model_features(stages), 0),
             places=3,
         )
 

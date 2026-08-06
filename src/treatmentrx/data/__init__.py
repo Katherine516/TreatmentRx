@@ -1,112 +1,157 @@
+"""Layer 1 — FHIR bundle to `PatientState`.
+
+Everything the rest of the agent is allowed to condition on is built here, and
+nothing downstream may add a covariate that did not pass through this layer.
+The order matters clinically: switching is captured before competing risks (a
+switch is one of the competing events), and the leakage suite runs last, after
+every annotation exists, so it can see anything that leaked.
+"""
+
 from __future__ import annotations
 
-import hashlib
 from dataclasses import replace
 from typing import Any
 
-from precisionrx_agent.layer1_ingestion.belief import BeliefStateFilter
-from precisionrx_agent.layer1_ingestion.competing_risks import CompetingRiskBuilder
-from precisionrx_agent.layer1_ingestion.data_engineering import IPCWHandler, StageHistoryBuilder, VariableSelector, VisitAligner
-from precisionrx_agent.layer1_ingestion.fhir import FHIRAdapter
-from precisionrx_agent.layer1_ingestion.leakage import LeakageTestSuite
-from precisionrx_agent.layer1_ingestion.ra_data_contract import RADataContract
-from precisionrx_agent.layer1_ingestion.switching import SwitchingCapture
-from precisionrx_agent.layer1_ingestion.timing import TimingModel
-from precisionrx_agent.layer2_encoder.baseline import GRUBaselineEncoder, HandcraftedFeatureEncoder
-from precisionrx_agent.layer3_causal_dag.dag import CausalDAGRegistry
-from precisionrx_agent.shared.models import StageRecord
-from treatmentrx.contracts import LayerDiagnostic, PatientStage, PatientState, VersionSet
+from treatmentrx.contracts import LayerDiagnostic, PatientState, VersionSet
+from treatmentrx.data.belief import BeliefStateFilter
+from treatmentrx.data.competing_risks import CompetingRiskBuilder
+from treatmentrx.data.contract import RADataContract
+from treatmentrx.data.dag import CausalDAGRegistry
+from treatmentrx.data.encoders import GRUBaselineEncoder, HandcraftedFeatureEncoder
+from treatmentrx.data.fhir import FHIRAdapter
+from treatmentrx.data.leakage import LeakageError, LeakageTestSuite
+from treatmentrx.data.stages import IPCWHandler, StageHistoryBuilder, VariableSelector, VisitAligner
+from treatmentrx.data.switching import SwitchingCapture
+from treatmentrx.data.timing import TimingModel
+from treatmentrx.domain import CareGoal, PatientRecord, StageRecord
+
+ALT_TOXICITY_THRESHOLD = 120.0
+REMISSION_BELIEF = 0.35
+REMISSION_OUTCOME = 0.7
 
 
 class DataLayer:
-    """Layer 1: FHIR-like input to the typed PatientState contract."""
+    """Builds the patient state, and refuses to build one that leaks."""
 
     def __init__(self) -> None:
         self.fhir = FHIRAdapter()
         self.contract = RADataContract()
         self.stage_builder = StageHistoryBuilder()
+        self.visit_aligner = VisitAligner()
+        self.ipcw = IPCWHandler()
+        self.variable_selector = VariableSelector()
         self.timing = TimingModel()
         self.switching = SwitchingCapture()
         self.belief = BeliefStateFilter()
-        self.competing_risks = CompetingRiskBuilder()
-        self.visit_aligner = VisitAligner()
-        self.ipcw = IPCWHandler()
-        self.variables = VariableSelector()
-        self.handcrafted = HandcraftedFeatureEncoder()
+        self.competing_risk = CompetingRiskBuilder()
+        self.leakage = LeakageTestSuite()
+        self.handcrafted_encoder = HandcraftedFeatureEncoder()
         self.encoder = GRUBaselineEncoder()
         self.dag = CausalDAGRegistry()
-        self.leakage = LeakageTestSuite()
 
-    def build_patient_state(self, bundle: dict[str, Any], versions: VersionSet | None = None) -> PatientState:
+    def build_patient_state(
+        self,
+        request: dict[str, Any] | PatientRecord,
+        versions: VersionSet | None = None,
+    ) -> PatientState:
         versions = versions or VersionSet()
-        patient = self.fhir.parse_bundle(bundle)
-        data_report = self.contract.validate(patient)
+        patient = request if isinstance(request, PatientRecord) else self.fhir.parse_bundle(request)
+
+        contract_report = self.contract.validate(patient)
         stages = self.stage_builder.build(patient)
+        stages = self.visit_aligner.apply(stages, patient.encounters)
+        stages = self.ipcw.apply(stages)
         stages = self.timing.apply(stages, patient.encounters)
         stages = self.switching.apply(stages, patient)
         stages = self.belief.apply(stages)
-        stages = self.competing_risks.apply(stages)
-        stages = self.visit_aligner.apply(stages, patient.encounters)
-        stages = self.ipcw.apply(stages)
+        stages = self.competing_risk.apply(stages)
 
-        latest = stages[-1]
-        dag_result = self.dag.validate(patient, treatment=latest.treatment)
+        # Non-negotiable: a temporal-firewall violation raises out of the whole
+        # pipeline. It is never downgraded to a diagnostic the caller can ignore.
         leakage_report = self.leakage.run(patient, stages)
-        encoded = self.encoder.encode(stages)
-        handcrafted = self.handcrafted.encode(stages)
-        feature_names = [f"z_{idx}" for idx in range(len(encoded.vector))]
-        features = encoded.vector
+        if not leakage_report.temporal_firewall_passed:
+            raise LeakageError("; ".join(leakage_report.violations))
 
-        diagnostics = [
-            LayerDiagnostic("data_contract", data_report.passed, "error" if not data_report.passed else "info",
-                            "RA data contract passed" if data_report.passed else "RA data contract failed"),
-            LayerDiagnostic("causal_dag", dag_result.identified, "error" if not dag_result.identified else "info",
-                            dag_result.blocked_reason or dag_result.causal_path_text),
-            LayerDiagnostic("leakage", leakage_report.passed, "error" if not leakage_report.passed else "info",
-                            "Temporal leakage suite passed" if leakage_report.passed else "; ".join(leakage_report.violations)),
-            LayerDiagnostic("encoder", len(encoded.vector) == 256, "info", encoded.encoder_name),
-            LayerDiagnostic("handcrafted_baseline", len(handcrafted.vector) > 0, "info", handcrafted.encoder_name),
-        ]
-        diagnostics.extend(
-            LayerDiagnostic(f"data_contract:{issue.field}", issue.severity != "error", issue.severity, issue.message)
-            for issue in data_report.issues
-        )
+        care_goal = self.infer_care_goal(stages)
+        stages = [replace(stage, care_goal=care_goal) for stage in stages]
+
+        dag_result = self.dag.validate(patient, treatment=stages[-1].treatment)
+        encoded = self.encoder.encode(stages)
+        handcrafted = self.handcrafted_encoder.encode(stages)
 
         return PatientState(
-            patient_hash=self._hash(patient.patient_id),
+            patient_hash=self.fhir.patient_hash(patient.patient_id),
             disease=patient.disease,
-            stage=latest.stage,
-            features=features,
-            feature_names=feature_names,
+            stage=stages[-1].stage,
+            care_goal=care_goal,
+            features=handcrafted.vector,
+            feature_names=sorted(handcrafted.feature_map),
             adjustment_set=dag_result.adjustment_set,
             feasible_arms=sorted(self.contract.treatment_arms),
             history_summary=self._history_summary(stages),
             allergies=patient.allergies,
-            stages=[self._contract_stage(stage) for stage in stages],
-            diagnostics=diagnostics,
+            stages=stages,
+            diagnostics=self._diagnostics(contract_report, dag_result, leakage_report),
             versions=replace(versions, dag=dag_result.version),
+            data_contract=contract_report,
+            dag_validation=dag_result,
+            encoded_state=encoded,
+            tailoring_variables=self.variable_selector.select(stages),
+            competing_risk_incidence=self.competing_risk.cumulative_incidence(stages),
             raw_patient=patient,
         )
 
-    def _contract_stage(self, stage: StageRecord) -> PatientStage:
-        return PatientStage(
-            stage=stage.stage,
-            treatment=stage.treatment,
-            start_day=stage.start_day,
-            end_day=stage.end_day,
-            features=stage.features,
-            outcome=stage.outcome,
-            response=stage.response,
-            visit_weight=stage.visit_weight,
-            censoring_weight=stage.censoring_weight,
+    def infer_care_goal(self, stages: list[StageRecord]) -> CareGoal:
+        """Read the treatment phase off the trajectory.
+
+        Toxicity control wins over everything: a patient with a failing liver is
+        not in an induction conversation regardless of disease activity.
+        """
+        latest = stages[-1]
+        alt = latest.features.get("alt")
+        if isinstance(alt, (int, float)) and not isinstance(alt, bool) and float(alt) > ALT_TOXICITY_THRESHOLD:
+            return CareGoal.TOXICITY_CONTROL
+        if latest.belief is not None and latest.belief.activity <= REMISSION_BELIEF:
+            return CareGoal.MAINTENANCE
+        if latest.outcome >= REMISSION_OUTCOME:
+            return CareGoal.MAINTENANCE
+        return CareGoal.INDUCTION
+
+    def _diagnostics(self, contract_report, dag_result, leakage_report) -> list[LayerDiagnostic]:
+        diagnostics = [
+            LayerDiagnostic(
+                name=f"data_contract:{issue.field}",
+                passed=False,
+                severity="error" if issue.severity == "error" else "warning",
+                message=issue.message,
+            )
+            for issue in contract_report.issues
+        ]
+        diagnostics.append(
+            LayerDiagnostic(
+                name="causal_identifiability",
+                passed=dag_result.identified,
+                severity="error" if not dag_result.identified else "info",
+                message=dag_result.blocked_reason
+                or f"{dag_result.dag_name} {dag_result.version} identifies the effect.",
+            )
         )
+        diagnostics.append(
+            LayerDiagnostic(
+                name="leakage_suite",
+                passed=leakage_report.passed,
+                severity="warning" if not leakage_report.passed else "info",
+                message="; ".join(leakage_report.violations) or "No leakage detected.",
+            )
+        )
+        return diagnostics
 
     def _history_summary(self, stages: list[StageRecord]) -> str:
         parts = []
         for stage in stages:
             duration = "ongoing" if stage.end_day is None else f"{max(stage.end_day - stage.start_day, 0)}d"
-            parts.append(f"stage {stage.stage}: {stage.treatment} {duration} -> {stage.response or 'unknown'}")
+            parts.append(f"{stage.treatment} {duration} -> {stage.response or 'response unknown'}")
         return "; ".join(parts)
 
-    def _hash(self, patient_id: str) -> str:
-        return hashlib.sha256(patient_id.encode("utf-8")).hexdigest()[:16]
+
+__all__ = ["DataLayer", "LeakageError"]

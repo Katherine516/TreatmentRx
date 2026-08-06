@@ -1,131 +1,114 @@
+"""Layer 4 — the code-enforced gate between the statistical engine and language.
+
+Everything here is application code. An LLM layer may *render* a block; it may
+never lift one, and no prompt reaches this module. The gate runs before any
+narrative is generated, so a blocked recommendation never has an explanation
+written for it in the first place.
+
+Two levels of filtering, and both matter:
+
+* **Composite actions** — feasibility is decided over `{drug, dose, route,
+  timing, combination}` tuples, not arm labels, so "methotrexate 25mg PO" and
+  "tocilizumab + MTX" can be judged on the combination and the dose rather than
+  on the name of the arm they belong to.
+* **Arms** — an arm survives only if at least one of its composite options does.
+
+If the recommended arm is removed, the decision is **not** silently rewritten to
+the runner-up. That behaviour previously turned an arm-naming mismatch into what
+looked like a clinical judgement. The patient goes to review with the reason
+stated instead.
+"""
+
 from __future__ import annotations
 
-from treatmentrx.contracts import Decision, PatientState, RecommendationStatus, SafeDecision, SafetyFlag
+from treatmentrx.contracts import Decision, PatientState, SafeDecision
+from treatmentrx.domain import RecommendationStatus, SafetyFlag
+from treatmentrx.estimation.actions import CompositeActionSpace
+from treatmentrx.safety.feasible_set import FeasibleSet
+from treatmentrx.safety.rules import SafetyRules
 
 
 class SafetyLayer:
-    """Layer 4: code-enforced feasible-set and safety filter."""
+    def __init__(self) -> None:
+        self.action_space = CompositeActionSpace()
+        self.feasible_set = FeasibleSet()
+        self.rules = SafetyRules()
 
     def apply(self, decision: Decision, state: PatientState) -> SafeDecision:
-        feasible, removed, flags = self._build_feasible_set(state)
-        flags.extend(self._diagnostic_flags(state))
+        candidates = self.action_space.candidates(list(decision.q_values), state.stages)
+        feasibility = self.feasible_set.filter(candidates, state.stages, state.allergies)
 
-        status = decision.status
-        final_decision = decision
-        provenance = {
-            "safety_layer": "treatmentrx.safety",
-            "patient_hash": state.patient_hash,
-            "history_summary": state.history_summary,
-            "original_recommended_arm": decision.recommended_arm,
-            "feasible_set_size": len(feasible),
-            "removed_arms": removed,
-            "versions": state.versions.__dict__,
+        surviving = {
+            arm
+            for arm, options in candidates.items()
+            if any(option in feasibility.feasible for option in options)
         }
+        feasible_arms = [arm for arm in decision.q_values if arm in surviving]
+        removed_arms = self._removed_arms(candidates, surviving, feasibility)
 
+        flags = self.rules.evaluate(state, decision)
+        flags.extend(
+            SafetyFlag("arm_removed", "warn", reason, arm) for arm, reason in removed_arms.items()
+        )
+
+        status, extra = self._status(decision, feasible_arms)
+        flags.extend(extra)
         if any(flag.severity == "block" for flag in flags):
             status = RecommendationStatus.BLOCKED
-        elif not feasible:
-            flags.append(SafetyFlag("empty_feasible_set", "block", "No safe treatment arm remains after filtering."))
-            status = RecommendationStatus.BLOCKED
-        elif decision.recommended_arm not in feasible:
-            replacement = self._best_feasible(decision, feasible)
-            if replacement is None:
-                flags.append(
+
+        return SafeDecision(
+            decision=decision,
+            feasible_arms=feasible_arms,
+            feasible_actions=[action.label for action in feasibility.feasible],
+            removed_arms=removed_arms,
+            safety_flags=flags,
+            status=status,
+            provenance={
+                "safety_layer": "treatmentrx.safety",
+                "patient_hash": state.patient_hash,
+                "history_summary": state.history_summary,
+                "care_goal": state.care_goal.value,
+                "recommended_arm": decision.recommended_arm,
+                "feasible_set_size": len(feasibility.feasible),
+                "removed_arms": removed_arms,
+                "removed_actions": feasibility.removed,
+                "versions": state.versions.__dict__,
+            },
+        )
+
+    def _removed_arms(self, candidates, surviving, feasibility) -> dict[str, str]:
+        reasons = dict(feasibility.removed)
+        removed: dict[str, str] = {}
+        for arm, options in candidates.items():
+            if arm in surviving:
+                continue
+            removed[arm] = "; ".join(
+                sorted({reasons[option.label] for option in options if option.label in reasons})
+            ) or f"no feasible {arm} option remains"
+        return removed
+
+    def _status(self, decision: Decision, feasible_arms: list[str]):
+        if not feasible_arms:
+            return (
+                RecommendationStatus.BLOCKED,
+                [SafetyFlag("empty_feasible_set", "block", "No safe treatment arm remains after filtering.")],
+            )
+        if decision.recommended_arm not in feasible_arms:
+            return (
+                RecommendationStatus.BLOCKED,
+                [
                     SafetyFlag(
                         "recommended_arm_infeasible",
                         "block",
-                        f"{decision.recommended_arm} is infeasible and no scored feasible alternative exists.",
+                        (
+                            f"{decision.recommended_arm} scored highest but is not feasible for this patient. "
+                            "Routed to clinical review rather than substituting the next-best arm."
+                        ),
                         decision.recommended_arm,
                     )
-                )
-                status = RecommendationStatus.BLOCKED
-            else:
-                flags.append(
-                    SafetyFlag(
-                        "feasible_set_rewrite",
-                        "warn",
-                        f"Safety layer replaced {decision.recommended_arm} with {replacement}.",
-                        decision.recommended_arm,
-                    )
-                )
-                final_decision = Decision(
-                    recommended_arm=replacement,
-                    q_values=decision.q_values,
-                    model_weights=decision.model_weights,
-                    uncertainty=decision.uncertainty,
-                    status=RecommendationStatus.REVIEW,
-                    rationale=decision.rationale + " Safety layer selected the best feasible scored alternative.",
-                    estimates=decision.estimates,
-                )
-                status = RecommendationStatus.REVIEW
+                ],
+            )
+        return decision.status, []
 
-        return SafeDecision(
-            decision=final_decision,
-            feasible_arms=feasible,
-            removed_arms=removed,
-            safety_flags=flags,
-            status=status,
-            provenance=provenance | {"final_recommended_arm": final_decision.recommended_arm},
-        )
 
-    def _build_feasible_set(self, state: PatientState) -> tuple[list[str], dict[str, str], list[SafetyFlag]]:
-        latest = state.stages[-1].features if state.stages else {}
-        alt = self._feature(latest, "alt", 25.0)
-        egfr = self._feature(latest, "egfr", 90.0)
-        pregnant = bool(latest.get("pregnant", False) or latest.get("pregnancy", False))
-        allergies = [allergy.lower() for allergy in state.allergies]
-        feasible: list[str] = []
-        removed: dict[str, str] = {}
-        flags: list[SafetyFlag] = []
-
-        for arm in state.feasible_arms:
-            reason = self._unsafe_reason(arm, alt, egfr, pregnant, allergies)
-            if reason:
-                removed[arm] = reason
-                flags.append(SafetyFlag("arm_removed", "warn", reason, arm))
-            else:
-                feasible.append(arm)
-        return feasible, removed, flags
-
-    def _diagnostic_flags(self, state: PatientState) -> list[SafetyFlag]:
-        return [
-            SafetyFlag("diagnostic_failed", "block", diagnostic.message)
-            for diagnostic in state.diagnostics
-            if diagnostic.severity == "error" and not diagnostic.passed
-        ]
-
-    def _unsafe_reason(
-        self,
-        arm: str,
-        alt: float,
-        egfr: float,
-        pregnant: bool,
-        allergies: list[str],
-    ) -> str | None:
-        lower = arm.lower()
-        for allergy in allergies:
-            if allergy and allergy in lower:
-                return f"{arm} removed due to allergy conflict: {allergy}"
-        if "jak" in lower:
-            if pregnant:
-                return "JAK inhibitor removed due to pregnancy flag."
-            if alt > 120:
-                return "JAK inhibitor removed due to ALT > 120."
-            if egfr < 30:
-                return "JAK inhibitor removed due to eGFR < 30."
-        if "csdmard" in lower or "methotrexate" in lower:
-            if pregnant:
-                return "Methotrexate/csDMARD optimization removed due to pregnancy flag."
-            if egfr < 30:
-                return "Methotrexate/csDMARD optimization removed due to eGFR < 30."
-        return None
-
-    def _best_feasible(self, decision: Decision, feasible: list[str]) -> str | None:
-        candidates = {arm: value for arm, value in decision.q_values.items() if arm in feasible}
-        if not candidates:
-            return None
-        return max(candidates, key=candidates.get)
-
-    def _feature(self, features: dict[str, object], key: str, default: float) -> float:
-        value = features.get(key, default)
-        return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else default
+__all__ = ["SafetyLayer"]
