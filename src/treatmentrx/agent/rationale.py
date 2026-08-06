@@ -43,6 +43,7 @@ class RationaleGenerator:
                 f"{decision.goal_decision.threshold:.2f} bar for this care goal."
             ),
             f"Tailoring drivers: {drivers}.",
+            self._separation(decision),
             self._why_not(decision),
             self._attribution(decision),
             safety_text,
@@ -72,6 +73,24 @@ class RationaleGenerator:
             f"aleatoric={uncertainty.aleatoric:.3f}; epistemic={uncertainty.epistemic:.3f}; "
             f"model={uncertainty.model:.4f}; ood={uncertainty.ood:.3f}; "
             f"calibrated={uncertainty.calibrated}; flags={flags}"
+        )
+
+    def _separation(self, decision) -> str:
+        """State whether the data can actually resolve the top two arms."""
+        contrast = decision.contrast
+        if contrast is None:
+            return ""
+        confidence = int((1 - contrast.alpha) * 100)
+        verdict = (
+            "separable at this sample size"
+            if contrast.distinguishable
+            else "NOT separable — the interval includes zero"
+        )
+        caveat = f" {contrast.caveat}" if contrast.caveat else ""
+        return (
+            f"Separation: {contrast.arm} over {contrast.comparator} is "
+            f"{contrast.difference:+.3f} (SE {contrast.standard_error:.3f}, {confidence}% CI "
+            f"[{contrast.lower:+.3f}, {contrast.upper:+.3f}]) — {verdict}.{caveat}"
         )
 
     def _why_not(self, decision) -> str:

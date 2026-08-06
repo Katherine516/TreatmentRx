@@ -23,8 +23,12 @@ from treatmentrx.estimation.q_learning import (
 from treatmentrx.simulation.ra_cohort import TREATMENT_ARMS
 from treatmentrx.contracts import RegimeEstimate
 from treatmentrx.domain import RegimeAssignment, RegimeType, StageRecord
+from treatmentrx.estimation.inference import DEFAULT_ALPHA, ContrastTest
 
 DEFAULT_TREATMENT_MENU = TREATMENT_ARMS
+
+# Two-sided 95% normal quantile for the reported confidence bands.
+Z_95 = 1.96
 
 
 class _QLearningEstimator:
@@ -49,7 +53,9 @@ class _QLearningEstimator:
         q_values = model.q_values(features, index, treatment_menu)
         recommended = max(q_values, key=q_values.get)
         best = q_values[recommended]
-        half_width = self._half_width(model, stages)
+        # A real interval: the standard error of the recommended arm's blip,
+        # from the cluster-robust covariance of the fit.
+        half_width = Z_95 * model.blip_standard_error(recommended, features, index)
         return RegimeEstimate(
             estimator=self.method_name,
             regime_type=self.regime_type,
@@ -64,16 +70,17 @@ class _QLearningEstimator:
             top_tailoring_variables=_format_tailoring_vars(stages[-1], tailoring_variables),
         )
 
-    def _half_width(self, model: QLearningModel, stages: list[StageRecord]) -> float:
-        """Width shrinks with training support and widens with a short history.
-
-        A crude interval, and labelled as such: a proper sandwich/bootstrap
-        interval for the blip parameters is the next thing this deserves.
-        """
-        support = model.n_train * model.n_stages
-        base = 1.6 / max(support, 1) ** 0.5
-        history_penalty = 0.02 * max(3 - len(stages), 0)
-        return round(min(max(base + history_penalty, 0.04), 0.25), 3)
+    def contrast(
+        self,
+        stages: list[StageRecord],
+        arm: str,
+        comparator: str,
+        alpha: float = DEFAULT_ALPHA,
+    ) -> ContrastTest:
+        model = self.model()
+        return model.contrast(
+            arm, comparator, model_features(stages), stage_index(stages, model.n_stages), alpha
+        )
 
 
 class QSharedEstimator(_QLearningEstimator):

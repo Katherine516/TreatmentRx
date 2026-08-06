@@ -21,6 +21,8 @@ from treatmentrx.estimation import training
 from treatmentrx.estimation.belief_aware import BeliefAwareAdjuster
 from treatmentrx.estimation.competing_risk_outcomes import CompetingRiskEndpoint
 from treatmentrx.estimation.explainability import ModelExplainer
+from treatmentrx.estimation.dwols import DWOLSSharedEstimator
+from treatmentrx.estimation.estimators import QSharedEstimator, StageSpecificQEstimator
 from treatmentrx.estimation.goal_conditioned import GoalConditionedThresholds
 
 OOD_REVIEW_THRESHOLD = 0.75
@@ -34,6 +36,7 @@ class DecisionLayer:
         self.goal_thresholds = GoalConditionedThresholds()
         self.uncertainty = UncertaintyDecomposer()
         self.explainer = ModelExplainer()
+        self.estimators = (QSharedEstimator(), DWOLSSharedEstimator(), StageSpecificQEstimator())
 
     def decide(self, state: PatientState, estimates: list[RegimeEstimate]) -> Decision:
         if not estimates:
@@ -44,12 +47,13 @@ class DecisionLayer:
         selected = self.belief_adjuster.adjust(selected, state.stages)
 
         goal_decision = self.goal_thresholds.decide(selected, state.care_goal)
+        contrast = self._contrast(state, selected)
         uncertainty = self.uncertainty.decompose(
             state.stages, selected, estimates, state.encoded_state, training.holdout_calibration()
         )
         explanation = self.explainer.explain(selected, estimates, state.stages)
 
-        status, rationale = self._status(state, uncertainty, goal_decision)
+        status, rationale = self._status(state, uncertainty, goal_decision, contrast)
         return Decision(
             recommended_arm=selected.recommended_arm,
             q_values=selected.q_values,
@@ -66,9 +70,32 @@ class DecisionLayer:
             goal_decision=goal_decision,
             explanation=explanation,
             confidence_gap=goal_decision.observed_gap,
+            contrast=contrast,
         )
 
-    def _status(self, state, uncertainty: Uncertainty, goal_decision):
+    def _contrast(self, state: PatientState, selected: RegimeEstimate):
+        """Test the recommended arm against the runner-up.
+
+        Each estimator that supports inference is asked, and the *widest*
+        interval wins. If any of them cannot separate the two arms, the system
+        does not claim separation — the conservative direction for a decision a
+        clinician will act on.
+        """
+        ordered = sorted(selected.q_values, key=selected.q_values.get, reverse=True)
+        if len(ordered) < 2:
+            return None
+        arm, comparator = ordered[0], ordered[1]
+        tests = []
+        for estimator in self.estimators:
+            try:
+                tests.append(estimator.contrast(state.stages, arm, comparator))
+            except (KeyError, ValueError):
+                continue
+        if not tests:
+            return None
+        return max(tests, key=lambda test: test.standard_error)
+
+    def _status(self, state, uncertainty: Uncertainty, goal_decision, contrast):
         if not state.diagnostics_passed:
             return (
                 RecommendationStatus.BLOCKED,
@@ -78,6 +105,21 @@ class DecisionLayer:
             return (
                 RecommendationStatus.REVIEW,
                 "Patient is outside the current training support; manual review is required.",
+            )
+        # Two independent conditions, and both must hold. The care goal sets how
+        # large a difference is worth acting on; the interval decides whether the
+        # data can resolve a difference that size at all. A gap that clears the
+        # clinical bar but sits inside its own confidence interval is equipoise,
+        # not a recommendation.
+        if contrast is not None and not contrast.distinguishable:
+            return (
+                RecommendationStatus.EQUIPOISE,
+                (
+                    f"{contrast.arm} scores {contrast.difference:+.3f} over {contrast.comparator}, "
+                    f"but the {int((1 - contrast.alpha) * 100)}% interval "
+                    f"[{contrast.lower:+.3f}, {contrast.upper:+.3f}] includes zero: the data cannot "
+                    "separate these arms for this patient."
+                ),
             )
         if not goal_decision.act:
             return RecommendationStatus.EQUIPOISE, goal_decision.rationale

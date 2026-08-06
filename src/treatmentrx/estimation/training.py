@@ -6,7 +6,7 @@ things the prototype previously lacked:
 
 * Estimators cannot silently be fit on different data, so their blip estimates
   and their model-averaging weights are comparable.
-* `MethodResult.policy_value` becomes a real, measured quantity — the held-out
+* `RegimeEstimate.policy_value` becomes a real, measured quantity — the held-out
   IPW policy value of that estimator's greedy policy — instead of a rescaling of
   the estimator's own score. Bayesian model averaging then weights estimators by
   out-of-sample policy performance rather than by self-report.

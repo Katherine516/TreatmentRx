@@ -31,7 +31,15 @@ the regime selector is choosing between.
 
 from __future__ import annotations
 
+import math
+
 from treatmentrx.estimation import linalg
+from treatmentrx.estimation.inference import (
+    DEFAULT_ALPHA,
+    ContrastTest,
+    contrast_test,
+    sandwich_covariance,
+)
 from treatmentrx.estimation.basis import (
     BLIP_BASIS,
     TREATMENT_FREE_BASIS,
@@ -90,6 +98,7 @@ class QLearningModel:
         )
         self.iterations = 0
         self._beta: list[float] = [0.0] * self.n_features
+        self._covariance: list[list[float]] = []
         self._fit(cohort)
 
     # ---------------------------------------------------------------- fitting
@@ -127,14 +136,16 @@ class QLearningModel:
     def _fit(self, cohort: list[CohortTrajectory]) -> None:
         rows: list[list[tuple[int, float]]] = []
         stage_of_row: list[int] = []
+        cluster_of_row: list[int] = []
         observed: list[float] = []
         next_features: list[dict[str, float] | None] = []
 
-        for trajectory in cohort:
+        for cluster, trajectory in enumerate(cohort):
             stages = trajectory.stages
             for position, stage in enumerate(stages):
                 rows.append(self._row(position, stage.features, stage.arm))
                 stage_of_row.append(position)
+                cluster_of_row.append(cluster)
                 observed.append(stage.outcome)
                 following = stages[position + 1] if position + 1 < len(stages) else None
                 next_features.append(dict(following.features) if following else None)
@@ -165,6 +176,19 @@ class QLearningModel:
             targets = updated
             if converged:
                 break
+
+        self._covariance = self._sandwich(rows, targets, weights, cluster_of_row, penalties)
+
+    def _sandwich(self, rows, targets, weights, clusters, penalties) -> list[list[float]]:
+        """Cluster-robust covariance of the fitted parameters, clustered by patient."""
+        residuals = [
+            target - sum(self._beta[index] * value for index, value in row)
+            for row, target in zip(rows, targets)
+        ]
+        normal_matrix = linalg.sparse_normal_matrix(rows, weights, self.n_features, penalties)
+        return sandwich_covariance(
+            rows, residuals, weights, clusters, normal_matrix, self.n_features
+        )
 
     # ------------------------------------------------------------- prediction
 
@@ -234,6 +258,68 @@ class QLearningModel:
             return self.recommend(features, stage_index)
 
         return policy
+
+    def contrast(
+        self,
+        arm: str,
+        comparator: str,
+        features: dict[str, float],
+        stage_index: int,
+        alpha: float = DEFAULT_ALPHA,
+    ) -> ContrastTest:
+        """Is `arm` separable from `comparator` for this patient, and by how much?
+
+        The treatment-free term is common to both arms and cancels, so the
+        contrast is a difference of blips — which is exactly the quantity the
+        blip parameters were fit to estimate, and the one that carries a usable
+        standard error.
+        """
+        index = self._clamp_stage(stage_index)
+        loading = [0.0] * self.n_features
+        basis = blip_basis(features)
+        for sign, candidate in ((1.0, arm), (-1.0, comparator)):
+            columns = self._blip_columns(index, candidate)
+            if columns is None:
+                continue
+            for column, value in zip(columns, basis):
+                loading[column] += sign * value
+
+        difference = self.blip(arm, features, index) - self.blip(comparator, features, index)
+        horizon = self.remaining_stages(index)
+        caveat = (
+            ""
+            if index == self.n_stages - 1
+            else (
+                "Non-terminal stage: the interval treats the pseudo-outcomes as fixed and "
+                "therefore understates uncertainty."
+            )
+        )
+        test = contrast_test(
+            self._covariance, loading, difference, arm, comparator, alpha=alpha, caveat=caveat
+        )
+        # Report on the same per-remaining-visit scale as `q_values`.
+        return ContrastTest(
+            arm=test.arm,
+            comparator=test.comparator,
+            difference=test.difference / horizon,
+            standard_error=test.standard_error / horizon,
+            lower=test.lower / horizon,
+            upper=test.upper / horizon,
+            alpha=test.alpha,
+            caveat=test.caveat,
+        )
+
+    def blip_standard_error(self, arm: str, features: dict[str, float], stage_index: int) -> float:
+        """Standard error of a single arm's blip, on the per-remaining-visit scale."""
+        index = self._clamp_stage(stage_index)
+        columns = self._blip_columns(index, arm)
+        if columns is None:
+            return 0.0
+        loading = [0.0] * self.n_features
+        for column, value in zip(columns, blip_basis(features)):
+            loading[column] = value
+        variance = max(linalg.quadratic_form(loading, self._covariance), 0.0)
+        return math.sqrt(variance) / self.remaining_stages(index)
 
     def blip_parameters(self, arm: str, stage_index: int = 0) -> dict[str, float]:
         columns = self._blip_columns(self._clamp_stage(stage_index), arm)

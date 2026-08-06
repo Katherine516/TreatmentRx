@@ -143,6 +143,7 @@ class Decision:
     goal_decision: GoalDecision
     explanation: ExplanationBundle
     confidence_gap: float
+    contrast: Any = None  # ContrastTest for the top arm vs the runner-up
 
 
 @dataclass(frozen=True)

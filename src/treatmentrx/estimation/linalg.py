@@ -59,6 +59,28 @@ def weighted_least_squares(
 SparseRow = list  # list[tuple[int, float]] — (column index, value) pairs
 
 
+def sparse_normal_matrix(
+    rows: list[SparseRow],
+    weights: list[float],
+    n_features: int,
+    ridge: list[float] | float = 1e-6,
+) -> list[list[float]]:
+    """Accumulate X'WX (+ ridge) from sparse design rows."""
+    penalties = [float(ridge)] * n_features if isinstance(ridge, (int, float)) else list(ridge)
+    if len(penalties) != n_features:
+        raise ValueError("ridge vector must have one entry per feature")
+    xtwx = [[0.0 for _ in range(n_features)] for _ in range(n_features)]
+    for row, w in zip(rows, weights):
+        for i, xi in row:
+            wxi = w * xi
+            target_row = xtwx[i]
+            for j, xj in row:
+                target_row[j] += wxi * xj
+    for i in range(n_features):
+        xtwx[i][i] += penalties[i]
+    return xtwx
+
+
 def sparse_weighted_least_squares(
     rows: list[SparseRow],
     targets: list[float],
@@ -92,6 +114,53 @@ def sparse_weighted_least_squares(
     for i in range(n_features):
         xtwx[i][i] += penalties[i]
     return solve(xtwx, xtwy)
+
+
+def inverse(matrix: list[list[float]]) -> list[list[float]]:
+    """Invert by Gauss-Jordan elimination on the augmented [A | I].
+
+    Solving against each unit vector separately would be O(n^4); eliminating
+    once with all n right-hand sides carried along is O(n^3). Only used on the
+    p x p normal-equations matrix, which the sandwich variance formula needs
+    explicitly.
+    """
+    n = len(matrix)
+    a = [list(row) + [1.0 if i == j else 0.0 for j in range(n)] for i, row in enumerate(matrix)]
+
+    for col in range(n):
+        pivot = max(range(col, n), key=lambda r: abs(a[r][col]))
+        if abs(a[pivot][col]) < 1e-12:
+            a[pivot][col] += 1e-9  # ridge nudge for near-singular columns
+        a[col], a[pivot] = a[pivot], a[col]
+
+        pivot_value = a[col][col]
+        pivot_row = a[col]
+        for c in range(col, 2 * n):
+            pivot_row[c] /= pivot_value
+        for r in range(n):
+            if r == col:
+                continue
+            factor = a[r][col]
+            if factor == 0.0:
+                continue
+            row = a[r]
+            for c in range(col, 2 * n):
+                row[c] -= factor * pivot_row[c]
+
+    return [row[n:] for row in a]
+
+
+def matmul(a: list[list[float]], b: list[list[float]]) -> list[list[float]]:
+    n, k, m = len(a), len(b), len(b[0])
+    return [[sum(a[i][t] * b[t][j] for t in range(k)) for j in range(m)] for i in range(n)]
+
+
+def quadratic_form(vector: list[float], matrix: list[list[float]]) -> float:
+    """v' M v — the variance of a linear combination v of the parameters."""
+    return sum(
+        vector[i] * sum(matrix[i][j] * vector[j] for j in range(len(vector)))
+        for i in range(len(vector))
+    )
 
 
 def dot(vector_a: list[float], vector_b: list[float]) -> float:

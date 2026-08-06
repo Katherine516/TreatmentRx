@@ -113,6 +113,7 @@ class TreatmentRxOrchestrator:
             "model_weights": decision.model_weights,
             "confidence_band": list(decision.selected.confidence_band),
             "confidence_gap": decision.confidence_gap,
+            "contrast": decision.contrast.as_dict() if decision.contrast else None,
             "goal_action": decision.goal_decision.act,
             "tailoring_variables": decision.selected.top_tailoring_variables,
             "data_contract_passed": state.data_contract.passed,
