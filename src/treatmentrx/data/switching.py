@@ -8,6 +8,7 @@ as-treated estimands (consumed in Layer 6).
 
 from __future__ import annotations
 
+from treatmentrx.arms import normalize_arm
 from treatmentrx.domain import PatientRecord, StageRecord, SwitchingRecord
 
 
@@ -30,6 +31,17 @@ class SwitchingCapture:
                 reason = medication.discontinuation_reason
                 if reason:
                     switched = True
+
+            # The definitional signal, and the one that was missing: the arm
+            # changed. Detection used to rely entirely on a free-text
+            # discontinuation reason or the word "inadequate" in the response, so
+            # a patient moved from methotrexate to a TNF inhibitor with a good
+            # response and no reason recorded was not counted as having switched
+            # at all — roughly half of them in the simulated cohort.
+            previous = stages[index - 1] if index > 0 else None
+            if previous is not None and normalize_arm(previous.treatment) != normalize_arm(stage.treatment):
+                switched = True
+                reason = reason or f"changed from {normalize_arm(previous.treatment)}"
 
             # An early discontinuation before the next planned decision is a switch.
             if (

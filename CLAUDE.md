@@ -8,11 +8,13 @@ test fixture, not evidence.
 ## Commands
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests    # full suite, ~16s
+PYTHONPATH=src python3 -m unittest discover -s tests    # full suite, ~26s
 PYTHONPATH=src python3 -m treatmentrx.cli demo          # one patient end to end
 PYTHONPATH=src python3 -m treatmentrx.cli evaluate      # estimator scorecard
 PYTHONPATH=src python3 -m treatmentrx.cli stability     # k-fold + seed sweep (~15s)
 PYTHONPATH=src python3 -m treatmentrx.cli inference     # sandwich vs bootstrap (~35s)
+PYTHONPATH=src python3 -m treatmentrx.cli audit         # layer-by-layer evaluation (~2s)
+PYTHONPATH=src python3 -m treatmentrx.cli coverage      # do the 95% intervals cover? (~60s)
 ```
 
 ## Hard constraints
@@ -126,6 +128,22 @@ hard-coded passages), the E-value in the sensitivity report, the regime
 selector's BIC proxy, and `IPCWHandler`'s visit weights (heuristic — the cohort
 now generates severity-driven visit spacing, so there is ground truth to fit
 against that is not yet used).
+
+**Measured coverage of the nominal 95% interval** (`cli coverage`, 120
+replications, known truth 0.088):
+
+| interval | coverage | SE/actual spread | bias |
+| --- | --- | --- | --- |
+| sandwich, stage-specific | 88% | 0.88 | -0.008 |
+| sandwich, shared blip | 79% | 0.86 | +0.019 |
+| m-out-of-n bootstrap | 93% | 1.27 | -0.003 |
+
+Only the bootstrap reaches nominal. Read `se_to_sd_ratio` rather than the
+coverage tally when replications are few — it is a quotient of two means, not a
+proportion of a few dozen Bernoulli draws, and it barely moves. The shared blip's
+extra loss is bias, not width: it targets a stage-averaged estimand on purpose,
+so it is *supposed* to miss the single-visit truth, and the 79% is the price of
+parameter sharing rather than a defect.
 
 Inference has two paths and they are not interchangeable. The sandwich
 (`sandwich_contrast`) is the default: cheap, exact at a stage-specific terminal

@@ -22,7 +22,21 @@ def main(argv: list[str] | None = None) -> None:
         "inference", help="Compare sandwich and m-out-of-n bootstrap intervals"
     )
     bootstrap.add_argument("--replicates", type=int, default=200)
+    subparsers.add_parser("audit", help="Layer-by-layer evaluation of the whole agent")
+    cover = subparsers.add_parser("coverage", help="Do the confidence intervals actually cover?")
+    cover.add_argument("--replications", type=int, default=100)
+    cover.add_argument("--bootstrap", action="store_true", help="also run the (slow) bootstrap arm")
     args = parser.parse_args(argv)
+
+    if args.command == "audit":
+        from treatmentrx.feedback.audit import full_audit
+
+        print(json.dumps(full_audit(), indent=2, default=str))
+        return
+
+    if args.command == "coverage":
+        print(json.dumps(_coverage_report(args.replications, args.bootstrap), indent=2))
+        return
 
     if args.command == "inference":
         print(json.dumps(_inference_report(args.replicates), indent=2, sort_keys=True))
@@ -111,6 +125,30 @@ def _inference_report(replicates: int) -> dict[str, Any]:
             "built from the fitted downstream model and the sandwich treats it as fixed "
             "data. At the terminal stage the two should agree."
         ),
+    }
+
+
+def _coverage_report(replications: int, include_bootstrap: bool) -> dict[str, Any]:
+    """Empirical coverage of the nominal 95% intervals.
+
+    The one number that validates everything else the system says about
+    uncertainty. A standard error can shrink correctly with sqrt(n), be reported
+    on the right scale, and still systematically miss.
+    """
+    from treatmentrx.feedback import coverage
+
+    results = [
+        coverage.sandwich_coverage(replications=replications, share_blip=False),
+        coverage.sandwich_coverage(replications=replications, share_blip=True),
+    ]
+    if include_bootstrap:
+        results.append(coverage.bootstrap_coverage())
+    return {
+        "reference_patient": coverage.REFERENCE_FEATURES,
+        "contrast": f"{coverage.REFERENCE_ARM} vs {coverage.REFERENCE_COMPARATOR}",
+        "truth": round(coverage.reference_truth(), 4),
+        "results": [result.as_dict() for result in results],
+        "verdict": coverage.verdict(results),
     }
 
 

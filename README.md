@@ -22,6 +22,10 @@ PYTHONPATH=src python3 -m treatmentrx.cli inference
 ```
 
 ```bash
+PYTHONPATH=src python3 -m treatmentrx.cli audit
+```
+
+```bash
 PYTHONPATH=src python3 -m unittest discover -s tests
 ```
 
@@ -160,6 +164,35 @@ The sandwich understates the interval by about 20% here. It stays the default �
 it is exact at a stage-specific terminal block, it costs nothing, and most
 decisions are terminal — but `training.enable_bootstrap_inference()` switches
 the contrast over when an interval has to be defensible.
+
+### Do the intervals actually cover?
+
+Everything above about uncertainty rests on one claim nothing was testing: that a
+nominal 95% interval contains the truth 95% of the time. A standard error can
+shrink correctly with sqrt(n), be reported on the right scale, and still miss.
+
+```bash
+PYTHONPATH=src python3 -m treatmentrx.cli coverage --bootstrap
+```
+
+| interval | coverage | reported SE / actual spread | bias |
+| --- | --- | --- | --- |
+| sandwich, stage-specific | 88% | 0.88 | −0.008 |
+| sandwich, shared blip | 79% | 0.86 | **+0.019** |
+| m-out-of-n bootstrap | **93%** | 1.27 | −0.003 |
+
+Only the bootstrap reaches nominal. The sandwich reports about 88% of the
+estimator's actual spread — an independent confirmation of the ~1.2 ratio the
+bootstrap comparison found by a completely different route. The shared blip loses
+a further nine points to *bias*, not width: it targets a stage-averaged estimand
+by design, so missing the single-visit truth is the price of parameter sharing,
+not a defect.
+
+This study also set `DEFAULT_BLIP_RIDGE`. At 1.0 the penalty cost 0.014 of bias
+on an effect of 0.088 and three points of coverage while buying 6% of variance;
+at 0 the 78-parameter stage-specific fit destabilises at the sample sizes the
+bootstrap resamples to. 0.25 is the best worst-case parameter error at n=88, 120
+and 250 alike.
 
 ### Is the estimator ranking real?
 
