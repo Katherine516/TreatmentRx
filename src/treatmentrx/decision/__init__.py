@@ -49,7 +49,12 @@ class DecisionLayer:
         goal_decision = self.goal_thresholds.decide(selected, state.care_goal)
         contrast = self._contrast(state, selected)
         uncertainty = self.uncertainty.decompose(
-            state.stages, selected, estimates, state.encoded_state, training.holdout_calibration()
+            state.stages,
+            selected,
+            estimates,
+            state.encoded_state,
+            training.holdout_calibration(),
+            contrast,
         )
         explanation = self.explainer.explain(selected, estimates, state.stages)
 

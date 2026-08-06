@@ -1,44 +1,62 @@
-"""v5.1 #3 (L6) — Switching-aware estimand choice.
+"""ITT, per-protocol and as-treated, reported side by side.
 
-ITT, per-protocol, and as-treated answer different clinical questions. The plan
-reports all three side by side rather than silently picking one.
+They answer different clinical questions and routinely disagree, so the system
+reports all three rather than silently picking the flattering one.
+
+All three are **model-level** quantities measured on held-out patients where the
+deviations are observed. An earlier build computed them by scaling the model's
+policy value by the current patient's adherence fraction, which is neither the
+effect of the regime nor the effect on that patient — it is a population number
+multiplied by an individual one. The patient's own deviation profile is still
+reported, as context alongside the estimands rather than mixed into them.
 """
 
 from __future__ import annotations
 
-from treatmentrx.contracts import RegimeEstimate
 from treatmentrx.domain import EstimandResult, StageRecord
+
+_NOTES = {
+    "ITT": "Effect of the regime as assigned, deviations included.",
+    "per_protocol": (
+        "Restricted to decision points with no switch away from the previous arm. "
+        "Informative only if switching is not outcome-driven — on this cohort it is, "
+        "so read it as an upper bound, not an effect."
+    ),
+    "as_treated": "Value realised under whatever treatment was actually given.",
+}
 
 
 class EstimandReporter:
-    def report(self, stages: list[StageRecord], selected: RegimeEstimate) -> list[EstimandResult]:
-        n = float(len(stages))
-        adherent = [s for s in stages if (s.switching is None or (not s.switching.switched and s.switching.adherence >= 0.8))]
-        switched = [s for s in stages if s.switching and s.switching.switched]
+    def report(self, stages: list[StageRecord], selected=None) -> list[EstimandResult]:
+        """Model-level estimands from the held-out cohort.
 
-        itt = EstimandResult(
-            estimand="ITT",
-            policy_value=selected.policy_value,
-            n_effective=n,
-            note="Effect of the regime as assigned, ignoring deviations.",
-        )
+        `stages` is the patient's own history; it does not enter the estimand
+        values and is used only to describe their deviation profile.
+        """
+        from treatmentrx.estimation import training
 
-        pp_fraction = (len(adherent) / n) if n else 1.0
-        per_protocol = EstimandResult(
-            estimand="per_protocol",
-            policy_value=round(selected.policy_value * (0.5 + 0.5 * pp_fraction), 3),
-            n_effective=float(len(adherent)),
-            note=(
-                f"Among adherers ({len(adherent)}/{int(n)} stages), selection-corrected; "
-                "informative only if non-adherence is not outcome-driven."
-            ),
-        )
+        values = training.holdout_estimands()
+        deviations = self.deviation_profile(stages)
+        return [
+            EstimandResult(
+                estimand=name,
+                policy_value=value,
+                n_effective=n_effective,
+                note=f"{_NOTES[name]} Patient profile: {deviations}.",
+            )
+            for name, (value, n_effective) in values.items()
+        ]
 
-        switch_penalty = 1.0 - 0.1 * len(switched)
-        as_treated = EstimandResult(
-            estimand="as_treated",
-            policy_value=round(max(selected.policy_value * switch_penalty, 0.0), 3),
-            n_effective=n,
-            note=f"Effect of realized treatment ({len(switched)} switch event(s) on trajectory).",
+    def deviation_profile(self, stages: list[StageRecord]) -> str:
+        """How far this patient's own trajectory departed from its assignments."""
+        switched = sum(1 for stage in stages if stage.switching and stage.switching.switched)
+        adherent = sum(
+            1
+            for stage in stages
+            if stage.switching is None
+            or (not stage.switching.switched and stage.switching.adherence >= 0.8)
         )
-        return [itt, per_protocol, as_treated]
+        return f"{adherent}/{len(stages)} adherent stages, {switched} switch event(s)"
+
+
+__all__ = ["EstimandReporter"]

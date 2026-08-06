@@ -156,10 +156,17 @@ def matmul(a: list[list[float]], b: list[list[float]]) -> list[list[float]]:
 
 
 def quadratic_form(vector: list[float], matrix: list[list[float]]) -> float:
-    """v' M v — the variance of a linear combination v of the parameters."""
+    """v' M v — the variance of a linear combination v of the parameters.
+
+    Restricted to the non-zero support of `v`. Every caller here is asking about
+    a contrast between two arms, which touches two blip blocks and leaves the
+    rest of the parameter vector at zero — 8 non-zeros out of 78 for the
+    stage-specific fit. Walking the full matrix would be ~95x the work for the
+    same number.
+    """
+    support = [(i, value) for i, value in enumerate(vector) if value != 0.0]
     return sum(
-        vector[i] * sum(matrix[i][j] * vector[j] for j in range(len(vector)))
-        for i in range(len(vector))
+        vi * sum(matrix[i][j] * vj for j, vj in support) for i, vi in support
     )
 
 

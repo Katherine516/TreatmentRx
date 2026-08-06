@@ -200,6 +200,11 @@ sandwich standard errors and contrast-driven equipoise; cross-validated
 stability; m-out-of-n bootstrap for the non-regular stages; a multi-stage cohort
 with informative dropout and irregular visits, ingestible through Layer 1.
 
+Performance, measured on the demo patient: a cold process pays 0.74s to fit the
+three estimators; each subsequent recommendation costs ~2.2ms. The oracle rollout
+benchmark is simulation-only and computed on request, so it stays off the path of
+a process that just serves a patient.
+
 Next, in order:
 
 1. **Estimate the visit-intensity weights.** Dropout is now modelled from the

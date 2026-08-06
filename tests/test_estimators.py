@@ -170,7 +170,13 @@ class PolicyValueTests(unittest.TestCase):
         behaviour = rollout_value(behaviour_policy, n=3000, seed=202)
         for name, score in training.fitted().scores.items():
             self.assertGreater(score.ipw_policy_value, score.behaviour_value, msg=name)
-            self.assertGreater(score.oracle_rollout_value, behaviour, msg=name)
+            # The oracle benchmark is simulation-only and computed on request, so
+            # it stays off the cold path of a process that just serves a patient.
+            self.assertGreater(training.oracle_rollout_value(name), behaviour, msg=name)
+
+    def test_the_oracle_benchmark_is_not_paid_for_at_fit_time(self):
+        for name, score in training.fitted().scores.items():
+            self.assertIsNone(score.oracle_rollout_value, msg=name)
 
     def test_backward_induction_beats_a_myopic_fit(self):
         train = training.fitted().train

@@ -6,6 +6,16 @@ from treatmentrx.contracts import RegimeEstimate
 from treatmentrx.domain import CalibrationReport, EncodedState, StageRecord, Uncertainty
 
 
+# An estimate whose parameter uncertainty alone spans this much of the response
+# scale is fragile regardless of how large the gap looks.
+EPISTEMIC_FLAG = 0.05
+ALEATORIC_FLAG = 0.18
+# Fewer than this many decision points is a thin trajectory to condition on.
+SHORT_HISTORY_STAGES = 3
+# No contrast available (a single-arm menu): claim nothing about precision.
+UNKNOWN_EPISTEMIC = 1.0
+
+
 class UncertaintyDecomposer:
     """The four uncertainty types, kept separate because they have different fixes.
 
@@ -22,9 +32,10 @@ class UncertaintyDecomposer:
         candidates: list[RegimeEstimate],
         encoded_state: EncodedState | None = None,
         calibration: CalibrationReport | None = None,
+        contrast=None,
     ) -> Uncertainty:
         aleatoric = self._aleatoric(stages)
-        epistemic = self._epistemic(stages)
+        epistemic = self._epistemic(contrast)
         model = float(selected.coefficients.get("model_disagreement_variance", self._model_variance(candidates)))
         ood = self._ood_score(encoded_state, stages)
         # Calibration is a model-level property measured on held-out patients;
@@ -32,10 +43,12 @@ class UncertaintyDecomposer:
         calibrated = calibration.passed if calibration is not None else False
 
         flags: list[str] = []
-        if aleatoric >= 0.18:
+        if aleatoric >= ALEATORIC_FLAG:
             flags.append("high_aleatoric")
-        if epistemic >= 0.2:
+        if epistemic >= EPISTEMIC_FLAG:
             flags.append("high_epistemic")
+        if len(stages) < SHORT_HISTORY_STAGES:
+            flags.append("limited_history")
         if model >= 0.0025:
             flags.append("model_disagreement")
         if ood >= 0.75:
@@ -59,9 +72,18 @@ class UncertaintyDecomposer:
         variance = sum((stage.outcome - mean) ** 2 for stage in stages) / len(stages)
         return min(math.sqrt(variance), 1.0)
 
-    def _epistemic(self, stages: list[StageRecord]) -> float:
-        effective_n = sum(1 / max(stage.censoring_weight * stage.visit_weight, 0.1) for stage in stages)
-        return min(1 / math.sqrt(max(effective_n, 1)), 1.0)
+    def _epistemic(self, contrast) -> float:
+        """Parameter uncertainty: the standard error of the decision.
+
+        This used to be `1/sqrt(visits this patient has had)`, which measures
+        how short the patient's history is, not how well the model's parameters
+        are determined — the two are unrelated, and the estimators now carry a
+        real cluster-robust standard error for exactly this quantity. Short
+        histories are still reported, under `limited_history`, where they belong.
+        """
+        if contrast is None:
+            return UNKNOWN_EPISTEMIC
+        return min(contrast.standard_error, 1.0)
 
     def _model_variance(self, candidates: list[RegimeEstimate]) -> float:
         if not candidates:

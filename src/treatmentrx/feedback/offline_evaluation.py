@@ -77,6 +77,61 @@ def _holdout_rows(cohort: list[CohortTrajectory]):
             yield position, stage
 
 
+def _hajek(weights: list[float], outcomes: list[float]) -> tuple[float, float]:
+    """Self-normalised IPW value and its effective sample size."""
+    if not weights:
+        return 0.0, 0.0
+    total = sum(weights)
+    value = sum(w * y for w, y in zip(weights, outcomes)) / total
+    ess = (total ** 2) / sum(w * w for w in weights)
+    return value, ess
+
+
+def estimand_values(policy, holdout: list[CohortTrajectory]) -> dict[str, tuple[float, float]]:
+    """ITT, per-protocol and as-treated, each computed on held-out data.
+
+    These are *model-level* quantities and have to be measured on a population
+    where the deviations are actually observed. Scaling a policy value by one
+    patient's adherence fraction produces a number that is neither the effect of
+    the regime nor the effect on that patient.
+
+    * **ITT** — value of the learned policy as assigned, over every held-out
+      decision point, deviations included.
+    * **Per-protocol** — the same, restricted to decision points where the
+      clinician did not switch away from the previous arm. Informative only if
+      switching is not itself outcome-driven, which here it is: the number is
+      reported so that assumption is visible, not because it is safe.
+    * **As-treated** — the value actually realised under whatever was given.
+    """
+    itt_weights: list[float] = []
+    itt_outcomes: list[float] = []
+    protocol_weights: list[float] = []
+    protocol_outcomes: list[float] = []
+    realised: list[float] = []
+
+    for trajectory in holdout:
+        for position, stage in enumerate(trajectory.stages):
+            realised.append(stage.outcome)
+            if policy(stage.features, position) != stage.arm:
+                continue
+            weight = 1.0 / max(stage.propensity, _PROPENSITY_FLOOR)
+            itt_weights.append(weight)
+            itt_outcomes.append(stage.outcome)
+            switched = position > 0 and trajectory.stages[position - 1].arm != stage.arm
+            if not switched:
+                protocol_weights.append(weight)
+                protocol_outcomes.append(stage.outcome)
+
+    itt_value, itt_ess = _hajek(itt_weights, itt_outcomes)
+    protocol_value, protocol_ess = _hajek(protocol_weights, protocol_outcomes)
+    as_treated = sum(realised) / len(realised) if realised else 0.0
+    return {
+        "ITT": (round(itt_value, 4), round(itt_ess, 2)),
+        "per_protocol": (round(protocol_value, 4), round(protocol_ess, 2)),
+        "as_treated": (round(as_treated, 4), float(len(realised))),
+    }
+
+
 def evaluate_policy(
     estimator: str,
     policy,

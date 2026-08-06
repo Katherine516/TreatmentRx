@@ -27,7 +27,7 @@ from treatmentrx.estimation.q_learning import (
     STAGE_SPECIFIC_METHOD,
     QLearningModel,
 )
-from treatmentrx.feedback.offline_evaluation import PolicyScore, evaluate_policy
+from treatmentrx.feedback.offline_evaluation import PolicyScore, estimand_values, evaluate_policy
 from treatmentrx.domain import CalibrationReport
 from treatmentrx.simulation.ra_cohort import (
     CohortTrajectory,
@@ -64,6 +64,8 @@ class FittedEstimators:
 
 
 _FITTED: FittedEstimators | None = None
+_ORACLE_CACHE: dict[str, float | None] = {}
+_ESTIMAND_CACHE: dict[str, tuple[float, float]] | None = None
 
 
 def training_cohort() -> list[CohortTrajectory]:
@@ -80,13 +82,15 @@ def fitted() -> FittedEstimators:
 
 
 def reset() -> None:
-    """Drop the cached fit, forcing a refit on the next call.
+    """Drop the cached fit and rollouts, forcing a refit on the next call.
 
     Needed only after changing a training constant (cohort size, seed, holdout
     fraction) inside a live process; the models are otherwise immutable.
     """
-    global _FITTED
+    global _FITTED, _ESTIMAND_CACHE
     _FITTED = None
+    _ESTIMAND_CACHE = None
+    _ORACLE_CACHE.clear()
 
 
 def enable_bootstrap_inference(
@@ -131,13 +135,55 @@ def holdout_calibration() -> CalibrationReport:
     return fitted().calibration
 
 
-def scorecard() -> list[dict[str, object]]:
-    """Ordered, serialisable comparison of every fitted estimator."""
-    scores = fitted().scores.values()
-    return [
-        score.as_dict()
-        for score in sorted(scores, key=lambda score: score.ipw_policy_value, reverse=True)
-    ]
+def holdout_estimands() -> dict[str, tuple[float, float]]:
+    """ITT / per-protocol / as-treated for the best-scoring estimator's policy.
+
+    Model-level and measured on held-out patients, cached because the estimands
+    describe the policy rather than the patient in front of you.
+    """
+    global _ESTIMAND_CACHE
+    if _ESTIMAND_CACHE is None:
+        fit = fitted()
+        best = max(fit.scores.values(), key=lambda score: score.ipw_policy_value)
+        model = {
+            Q_SHARED: fit.q_shared,
+            STAGE_SPECIFIC: fit.stage_specific,
+            DWOLS_SHARED: fit.dwols,
+        }[best.estimator]
+        _ESTIMAND_CACHE = estimand_values(model.greedy_policy(), fit.holdout)
+    return _ESTIMAND_CACHE
+
+
+def scorecard(include_oracle: bool = False) -> list[dict[str, object]]:
+    """Ordered, serialisable comparison of every fitted estimator.
+
+    `include_oracle` runs the simulation-only rollout benchmark, which costs a
+    few hundred milliseconds of Monte Carlo per estimator. The audit event does
+    not ask for it; `treatmentrx.cli evaluate` does.
+    """
+    scores = sorted(fitted().scores.values(), key=lambda score: score.ipw_policy_value, reverse=True)
+    if not include_oracle:
+        return [score.as_dict() for score in scores]
+    return [score.as_dict() | {"oracle_rollout_value": oracle_rollout_value(score.estimator)} for score in scores]
+
+
+def oracle_rollout_value(method_name: str) -> float | None:
+    """Expected reward of an estimator's policy under the generating process.
+
+    Cached per estimator: only available in simulation, and only used to check
+    that the observational IPW estimate is not disagreeing with a known answer.
+    """
+    if method_name in _ORACLE_CACHE:
+        return _ORACLE_CACHE[method_name]
+    fit = fitted()
+    model = {
+        Q_SHARED: fit.q_shared,
+        STAGE_SPECIFIC: fit.stage_specific,
+        DWOLS_SHARED: fit.dwols,
+    }.get(method_name)
+    value = rollout_value(model.greedy_policy(), n=ROLLOUT_SAMPLES) if model else None
+    _ORACLE_CACHE[method_name] = value
+    return value
 
 
 def _fit_all() -> FittedEstimators:
@@ -148,27 +194,20 @@ def _fit_all() -> FittedEstimators:
     stage_specific = QLearningModel(train, share_blip=False)
     dwols = DWOLSModel(train)
 
+    # The oracle rollout is a simulation-only diagnostic: it needs the generating
+    # process, so it can never exist outside this prototype, and no recommendation
+    # depends on it. Computing it here would put ~0.5s of Monte Carlo on the cold
+    # start of every process that serves a single patient. `scorecard()` fills it
+    # in on demand instead.
     scores = {
         Q_SHARED: evaluate_policy(
-            Q_SHARED,
-            q_shared.greedy_policy(),
-            q_shared.predict_outcome,
-            holdout,
-            oracle_rollout_value=rollout_value(q_shared.greedy_policy(), n=ROLLOUT_SAMPLES),
+            Q_SHARED, q_shared.greedy_policy(), q_shared.predict_outcome, holdout
         ),
         STAGE_SPECIFIC: evaluate_policy(
-            STAGE_SPECIFIC,
-            stage_specific.greedy_policy(),
-            stage_specific.predict_outcome,
-            holdout,
-            oracle_rollout_value=rollout_value(stage_specific.greedy_policy(), n=ROLLOUT_SAMPLES),
+            STAGE_SPECIFIC, stage_specific.greedy_policy(), stage_specific.predict_outcome, holdout
         ),
         DWOLS_SHARED: evaluate_policy(
-            DWOLS_SHARED,
-            dwols.greedy_policy(),
-            dwols.predict_outcome,
-            holdout,
-            oracle_rollout_value=rollout_value(dwols.greedy_policy(), n=ROLLOUT_SAMPLES),
+            DWOLS_SHARED, dwols.greedy_policy(), dwols.predict_outcome, holdout
         ),
     }
 

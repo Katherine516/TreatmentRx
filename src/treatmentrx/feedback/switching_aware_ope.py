@@ -19,6 +19,7 @@ class OPEResult:
     iptw_policy_value: float
     effective_sample_size: float
     note: str
+    model_policy_value: float = 0.0
 
 
 class SwitchingAwareOPE:
@@ -30,14 +31,20 @@ class SwitchingAwareOPE:
 
         total_w = sum(weights)
         weighted_outcome = sum(w * s.outcome for w, s in zip(weights, stages)) / max(total_w, 1e-6)
-        # Stabilize against the model's own policy value.
-        iptw_value = round(0.5 * selected.policy_value + 0.5 * weighted_outcome, 3)
+        naive = sum(s.outcome for s in stages) / len(stages) if stages else 0.0
         ess = round((total_w ** 2) / sum(w * w for w in weights), 3) if weights else 0.0
         return OPEResult(
-            naive_policy_value=selected.policy_value,
-            iptw_policy_value=iptw_value,
+            naive_policy_value=round(naive, 3),
+            iptw_policy_value=round(weighted_outcome, 3),
             effective_sample_size=ess,
-            note="IPTW reweights stages by inverse probability of receiving the assigned treatment.",
+            model_policy_value=selected.policy_value,
+            note=(
+                "Both values summarise THIS patient's observed trajectory: the naive mean "
+                "of their outcomes, and the same mean reweighted by the inverse probability "
+                "of receiving the treatment they were assigned. `model_policy_value` is the "
+                "estimator's held-out score and is carried alongside for reference — the two "
+                "are different quantities and must not be averaged together."
+            ),
         )
 
     def _prob_treatment_as_assigned(self, stage: StageRecord) -> float:

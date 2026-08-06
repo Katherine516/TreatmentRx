@@ -8,7 +8,7 @@ test fixture, not evidence.
 ## Commands
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests    # full suite, ~18s
+PYTHONPATH=src python3 -m unittest discover -s tests    # full suite, ~16s
 PYTHONPATH=src python3 -m treatmentrx.cli demo          # one patient end to end
 PYTHONPATH=src python3 -m treatmentrx.cli evaluate      # estimator scorecard
 PYTHONPATH=src python3 -m treatmentrx.cli stability     # k-fold + seed sweep (~15s)
@@ -98,6 +98,19 @@ produced a real clinical divergence, and the notes below are the scar tissue.
 12. **`non_regularity` always uses the sandwich.** It decides the bootstrap's
     resample size, so reading it off an already-attached bootstrap makes a refit
     depend on its own previous output and stop being reproducible.
+13. **The data contract is a gate, not a report.** `DataLayer` raises
+    `DataContractError` on any error-severity issue before running anything that
+    assumes a usable record. Impossible values (`PLAUSIBLE_RANGES`) are errors:
+    a DAS28 of -5 is a corrupt record, and silently modelling it moves the
+    recommendation with nothing to show for it.
+14. **Model-level and patient-level quantities never mix.** Estimands and the
+    held-out policy value describe the *policy* and are measured on held-out
+    patients; `SwitchingAwareOPE` summarises *this patient's* trajectory. An
+    earlier build multiplied one by the other and averaged them together, which
+    produced a number that was neither.
+15. **Every advanced arm keeps a monotherapy composite.** Listing biologics only
+    in MTX combination turns one methotrexate contraindication into a blocked
+    recommendation for a patient who had a viable option.
 
 ## What is real vs. still a placeholder
 

@@ -15,7 +15,7 @@ from typing import Any
 from treatmentrx.contracts import LayerDiagnostic, PatientState, VersionSet
 from treatmentrx.data.belief import BeliefStateFilter
 from treatmentrx.data.competing_risks import CompetingRiskBuilder
-from treatmentrx.data.contract import RADataContract
+from treatmentrx.data.contract import DataContractError, RADataContract
 from treatmentrx.data.dag import CausalDAGRegistry
 from treatmentrx.data.encoders import GRUBaselineEncoder, HandcraftedFeatureEncoder
 from treatmentrx.data.fhir import FHIRAdapter
@@ -58,6 +58,14 @@ class DataLayer:
         patient = request if isinstance(request, PatientRecord) else self.fhir.parse_bundle(request)
 
         contract_report = self.contract.validate(patient)
+        # The contract runs first and its errors are fatal *here*, before any
+        # module that assumes a usable record. A patient with no treatment
+        # history or a non-RA diagnosis used to reach the stage builder and the
+        # DAG registry and crash there with an untyped ValueError, even though
+        # the contract had already identified exactly what was wrong.
+        if not contract_report.passed:
+            raise DataContractError(contract_report)
+
         stages = self.stage_builder.build(patient)
         stages = self.visit_aligner.apply(stages, patient.encounters)
         stages = self.ipcw.apply(stages)
@@ -154,4 +162,4 @@ class DataLayer:
         return "; ".join(parts)
 
 
-__all__ = ["DataLayer", "LeakageError"]
+__all__ = ["DataContractError", "DataLayer", "LeakageError"]

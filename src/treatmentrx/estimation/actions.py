@@ -12,6 +12,14 @@ from treatmentrx.domain import CompositeAction, StageRecord
 
 # Curated candidate composites per RA arm. The decision layer searches over
 # these, not over a raw product of every dimension.
+# Every advanced therapy carries a monotherapy option alongside its
+# MTX-combination form. Without one, a single methotrexate contraindication —
+# pregnancy, a failing liver — removes the entire arm rather than the one
+# composite that is actually unsafe, and the safety layer then blocks a patient
+# who had a viable option all along.
+#
+# The curation itself is a placeholder: a real build reads this from the
+# versioned clinical knowledge base, not from a literal here.
 ARM_CANDIDATES: dict[str, list[CompositeAction]] = {
     "continue-current": [CompositeAction(drug="continue-current", stop_continue="continue")],
     "methotrexate-optimization": [
@@ -20,7 +28,9 @@ ARM_CANDIDATES: dict[str, list[CompositeAction]] = {
     ],
     "TNF-inhibitor": [
         CompositeAction(drug="adalimumab", dose="40mg", route="SC", timing="q2wk", combination="MTX"),
+        CompositeAction(drug="adalimumab", dose="40mg", route="SC", timing="q2wk"),
         CompositeAction(drug="etanercept", dose="50mg", route="SC", timing="weekly", combination="MTX"),
+        CompositeAction(drug="etanercept", dose="50mg", route="SC", timing="weekly"),
     ],
     "IL-6 inhibitor": [
         CompositeAction(drug="tocilizumab", dose="8mg/kg", route="IV", timing="q4wk", combination="MTX"),
@@ -31,6 +41,7 @@ ARM_CANDIDATES: dict[str, list[CompositeAction]] = {
     ],
     "rituximab": [
         CompositeAction(drug="rituximab", dose="1000mg", route="IV", timing="x2 q2wk", combination="MTX"),
+        CompositeAction(drug="rituximab", dose="1000mg", route="IV", timing="x2 q2wk"),
     ],
 }
 

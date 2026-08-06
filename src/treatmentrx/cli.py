@@ -56,7 +56,7 @@ def _evaluation_report() -> dict[str, Any]:
             "clinician_behaviour": rollout_value(behaviour_policy),
             "myopic_oracle": rollout_value(myopic_optimal_policy),
         },
-        "estimators": training.scorecard(),
+        "estimators": training.scorecard(include_oracle=True),
         "note": (
             "ipw_policy_value is the observational (Hajek) estimate on held-out stages; "
             "oracle_rollout_value is the total-trajectory reward under the generating "
