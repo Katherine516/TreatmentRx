@@ -195,6 +195,43 @@ class DWOLSModel:
         fit = self.fits.get(arm)
         return fit.blip_standard_error(features) if fit else 0.0
 
+    # --------------------------------------------------- joint-bootstrap support
+    #
+    # dWOLS stores its parameters per arm, one small fit each. A joint resampling
+    # scheme needs them as one flat vector so a replicate can be recorded and a
+    # contrast recomputed from it later, the same way the Q-learning models are
+    # handled.
+
+    @property
+    def blip_arms(self) -> tuple[str, ...]:
+        return tuple(arm for arm in self.arms if arm != self.reference)
+
+    def flat_parameters(self) -> list[float]:
+        """Every non-reference arm's psi, concatenated in `blip_arms` order."""
+        return [value for arm in self.blip_arms for value in self.fits[arm].psi]
+
+    def contrast_loading(
+        self, arm: str, comparator: str, features: dict[str, float]
+    ) -> list[float]:
+        """Loading vector such that `dot(loading, flat_parameters()) == contrast`."""
+        width = len(BLIP_BASIS)
+        loading = [0.0] * (len(self.blip_arms) * width)
+        basis = blip_basis(features)
+        for sign, candidate in ((1.0, arm), (-1.0, comparator)):
+            if candidate not in self.blip_arms:
+                continue
+            start = self.blip_arms.index(candidate) * width
+            for offset, value in enumerate(basis):
+                loading[start + offset] += sign * value
+        return loading
+
+    def refit(self, cohort: list[CohortTrajectory]) -> list[float]:
+        """Re-run the whole fit on a resample and return the flat parameters."""
+        replica = DWOLSModel(cohort, arms=self.arms, reference=self.reference)
+        if len(replica.flat_parameters()) != len(self.flat_parameters()):
+            raise ValueError("resample produced a different design")
+        return replica.flat_parameters()
+
     def raw_q(self, features: dict[str, float], arm: str) -> float:
         return self.treatment_free_value(features) + self.blip(arm, features)
 

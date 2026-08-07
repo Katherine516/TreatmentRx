@@ -27,6 +27,7 @@ from treatmentrx.estimation.q_learning import (
     STAGE_SPECIFIC_METHOD,
     QLearningModel,
 )
+from treatmentrx.estimation.inference import joint_bootstrap
 from treatmentrx.feedback.offline_evaluation import PolicyScore, estimand_values, evaluate_policy
 from treatmentrx.domain import CalibrationReport
 from treatmentrx.simulation.ra_cohort import (
@@ -66,6 +67,7 @@ class FittedEstimators:
 _FITTED: FittedEstimators | None = None
 _ORACLE_CACHE: dict[str, float | None] = {}
 _ESTIMAND_CACHE: dict[str, tuple[float, float]] | None = None
+_JOINT_BOOTSTRAP = None
 
 
 def training_cohort() -> list[CohortTrajectory]:
@@ -87,9 +89,10 @@ def reset() -> None:
     Needed only after changing a training constant (cohort size, seed, holdout
     fraction) inside a live process; the models are otherwise immutable.
     """
-    global _FITTED, _ESTIMAND_CACHE
+    global _FITTED, _ESTIMAND_CACHE, _JOINT_BOOTSTRAP
     _FITTED = None
     _ESTIMAND_CACHE = None
+    _JOINT_BOOTSTRAP = None
     _ORACLE_CACHE.clear()
 
 
@@ -119,6 +122,54 @@ def enable_bootstrap_inference(
             "replicates": distribution.replicates,
         }
     return report
+
+
+def enable_joint_inference(
+    replicates: int = 120,
+    alpha: float = 0.5,
+    seed: int = 17,
+):
+    """Refit all three estimators on shared resamples and cache the draws.
+
+    The decision layer averages the estimators, so its standard error depends on
+    their covariance. Without this it has to fall back on the perfect-correlation
+    upper bound, which measures about 1.29x the averaged estimator's actual
+    spread — every interval a quarter wider than necessary. This measures the
+    covariance instead.
+
+    It costs one refit of each estimator per replicate, so it is opt-in. Once
+    enabled the draws are model-level: any patient's interval afterwards is a
+    handful of dot products.
+    """
+    global _JOINT_BOOTSTRAP
+    fit = fitted()
+
+    def refit_all(sample):
+        return {
+            Q_SHARED: fit.q_shared.refit(sample),
+            STAGE_SPECIFIC: fit.stage_specific.refit(sample),
+            DWOLS_SHARED: fit.dwols.refit(sample),
+        }
+
+    _JOINT_BOOTSTRAP = joint_bootstrap(
+        refit_all,
+        fit.train,
+        {
+            Q_SHARED: fit.q_shared.flat_parameters(),
+            STAGE_SPECIFIC: fit.stage_specific.flat_parameters(),
+            DWOLS_SHARED: fit.dwols.flat_parameters(),
+        },
+        fit.q_shared.non_regularity(fit.train),
+        replicates=replicates,
+        alpha=alpha,
+        seed=seed,
+    )
+    return _JOINT_BOOTSTRAP
+
+
+def joint_inference():
+    """The cached joint bootstrap, or None if it was never enabled."""
+    return _JOINT_BOOTSTRAP
 
 
 def policy_value_for(method_name: str) -> float:

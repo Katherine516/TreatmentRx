@@ -566,6 +566,16 @@ class QLearningModel:
             ),
         )
 
+    def flat_parameters(self) -> list[float]:
+        """The fitted parameter vector, for joint resampling schemes."""
+        return list(self._beta)
+
+    def contrast_loading(
+        self, arm: str, comparator: str, features: dict[str, float], stage_index: int
+    ) -> list[float]:
+        """Loading vector such that `dot(loading, flat_parameters()) == contrast`."""
+        return self._contrast_loading(arm, comparator, features, self._clamp_stage(stage_index))
+
     def _contrast_loading(
         self, arm: str, comparator: str, features: dict[str, float], index: int
     ) -> list[float]:

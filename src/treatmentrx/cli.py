@@ -29,6 +29,9 @@ def main(argv: list[str] | None = None) -> None:
     cover = subparsers.add_parser("coverage", help="Do the confidence intervals actually cover?")
     cover.add_argument("--replications", type=int, default=100)
     cover.add_argument("--bootstrap", action="store_true", help="also run the (slow) bootstrap arm")
+    cover.add_argument(
+        "--decision-rule", action="store_true", help="also measure the rule Layer 3 deploys"
+    )
     args = parser.parse_args(argv)
 
     if args.command == "audit":
@@ -44,7 +47,11 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     if args.command == "coverage":
-        print(json.dumps(_coverage_report(args.replications, args.bootstrap), indent=2))
+        print(
+            json.dumps(
+                _coverage_report(args.replications, args.bootstrap, args.decision_rule), indent=2
+            )
+        )
         return
 
     if args.command == "inference":
@@ -137,7 +144,9 @@ def _inference_report(replicates: int) -> dict[str, Any]:
     }
 
 
-def _coverage_report(replications: int, include_bootstrap: bool) -> dict[str, Any]:
+def _coverage_report(
+    replications: int, include_bootstrap: bool, include_decision_rule: bool = False
+) -> dict[str, Any]:
     """Empirical coverage of the nominal 95% intervals.
 
     The one number that validates everything else the system says about
@@ -152,6 +161,9 @@ def _coverage_report(replications: int, include_bootstrap: bool) -> dict[str, An
     ]
     if include_bootstrap:
         results.append(coverage.bootstrap_coverage())
+    if include_decision_rule:
+        results.append(coverage.decision_rule_coverage(replications=min(replications, 40)))
+        results.append(coverage.joint_rule_coverage())
     return {
         "reference_patient": coverage.REFERENCE_FEATURES,
         "contrast": f"{coverage.REFERENCE_ARM} vs {coverage.REFERENCE_COMPARATOR}",

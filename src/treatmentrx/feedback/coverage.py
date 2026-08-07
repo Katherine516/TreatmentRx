@@ -239,6 +239,83 @@ def decision_rule_coverage(
     )
 
 
+def joint_rule_coverage(
+    replications: int = 20,
+    n: int = 200,
+    bootstrap_replicates: int = 20,
+    base_seed: int = 9_900,
+) -> CoverageResult:
+    """Coverage of the model-averaged interval once the covariance is measured.
+
+    The bound-based rule reaches nominal by erring wide (1.29x the actual
+    spread). Replacing the bound with a joint resampling of all three estimators
+    should keep coverage while narrowing the interval — which is only an
+    improvement if the coverage actually survives, so it is measured.
+    """
+    from treatmentrx.estimation.dwols import DWOLSModel
+    from treatmentrx.estimation.inference import joint_bootstrap
+
+    truth = reference_truth()
+    covered = 0
+    widths: list[float] = []
+    estimates: list[float] = []
+    errors: list[float] = []
+
+    for replication in range(replications):
+        cohort = generate_ra_cohort(n, seed=base_seed + replication)
+        shared = QLearningModel(cohort, share_blip=True)
+        stage_specific = QLearningModel(cohort, share_blip=False)
+        dwols = DWOLSModel(cohort)
+        terminal = stage_specific.n_stages - 1
+
+        names = ("shared", "stage_specific", "dwols")
+        point = {
+            "shared": shared.flat_parameters(),
+            "stage_specific": stage_specific.flat_parameters(),
+            "dwols": dwols.flat_parameters(),
+        }
+
+        def refit_all(sample):
+            return {
+                "shared": shared.refit(sample),
+                "stage_specific": stage_specific.refit(sample),
+                "dwols": dwols.refit(sample),
+            }
+
+        booted = joint_bootstrap(
+            refit_all,
+            cohort,
+            point,
+            shared.non_regularity(cohort),
+            replicates=bootstrap_replicates,
+            seed=base_seed + replication,
+        )
+        loadings = {
+            "shared": shared.contrast_loading(
+                REFERENCE_ARM, REFERENCE_COMPARATOR, REFERENCE_FEATURES, terminal
+            ),
+            "stage_specific": stage_specific.contrast_loading(
+                REFERENCE_ARM, REFERENCE_COMPARATOR, REFERENCE_FEATURES, terminal
+            ),
+            "dwols": dwols.contrast_loading(
+                REFERENCE_ARM, REFERENCE_COMPARATOR, REFERENCE_FEATURES
+            ),
+        }
+        contrast = booted.contrast(
+            loadings, {name: 1.0 for name in names}, REFERENCE_ARM, REFERENCE_COMPARATOR
+        )
+        if contrast.lower <= truth <= contrast.upper:
+            covered += 1
+        widths.append(contrast.upper - contrast.lower)
+        estimates.append(contrast.difference)
+        errors.append(contrast.standard_error)
+
+    return _result(
+        "decision rule (joint bootstrap)",
+        replications, covered, widths, estimates, errors, truth,
+    )
+
+
 def _averaged_contrast(tests: list):
     """The decision layer's rule: centre on the average, bound the variance above.
 

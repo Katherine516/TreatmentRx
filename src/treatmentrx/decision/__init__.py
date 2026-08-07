@@ -18,6 +18,7 @@ from treatmentrx.decision.bma import BayesianModelAverager
 from treatmentrx.decision.uncertainty import UncertaintyDecomposer
 from treatmentrx.domain import RecommendationStatus, Uncertainty
 from treatmentrx.estimation import training
+from treatmentrx.estimation.features import model_features, stage_index
 from treatmentrx.estimation.inference import DEFAULT_ALPHA, Z_QUANTILE, ContrastTest
 from treatmentrx.estimation.belief_aware import BeliefAwareAdjuster
 from treatmentrx.estimation.competing_risk_outcomes import CompetingRiskEndpoint
@@ -117,6 +118,12 @@ class DecisionLayer:
             weights = {name: 1.0 for name in tests}
             total = float(len(tests))
 
+        # If the estimators have been resampled together, their covariance is
+        # measured and the bound is unnecessary.
+        joint = self._joint_contrast(state, arm, comparator, weights)
+        if joint is not None:
+            return joint
+
         difference = sum(weights.get(n, 0.0) * t.difference for n, t in tests.items()) / total
         standard_error = sum(weights.get(n, 0.0) * t.standard_error for n, t in tests.items()) / total
         margin = Z_QUANTILE[DEFAULT_ALPHA] * standard_error
@@ -143,6 +150,34 @@ class DecisionLayer:
                 )
             ),
         )
+
+    def _joint_contrast(self, state: PatientState, arm: str, comparator: str, weights):
+        """Interval from the joint bootstrap, when one has been enabled.
+
+        Falls back to None — and so to the conservative bound — whenever the
+        draws are missing or the loadings cannot be built, because an interval
+        that silently degrades is worse than one that is visibly wide.
+        """
+        bootstrap = training.joint_inference()
+        if bootstrap is None:
+            return None
+        fit = training.fitted()
+        features = model_features(state.stages)
+        index = stage_index(state.stages, fit.q_shared.n_stages)
+        horizon = fit.q_shared.remaining_stages(index)
+        loadings = {
+            training.Q_SHARED: fit.q_shared.contrast_loading(arm, comparator, features, index),
+            training.STAGE_SPECIFIC: fit.stage_specific.contrast_loading(
+                arm, comparator, features, index
+            ),
+            training.DWOLS_SHARED: fit.dwols.contrast_loading(arm, comparator, features),
+        }
+        try:
+            return bootstrap.contrast(
+                loadings, weights, arm, comparator, scale_by=float(horizon)
+            )
+        except (ValueError, KeyError, IndexError):
+            return None
 
     def _status(self, state, uncertainty: Uncertainty, goal_decision, contrast):
         if not state.diagnostics_passed:

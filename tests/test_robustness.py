@@ -204,3 +204,84 @@ class ModelAveragedContrastTests(unittest.TestCase):
         result = decision_rule_coverage(replications=12, n=180)
         self.assertGreaterEqual(result.coverage, NOMINAL - 2 * result.monte_carlo_error)
         self.assertGreater(result.se_to_sd_ratio, 1.0)
+
+
+class JointBootstrapTests(unittest.TestCase):
+    """Measuring the estimators' covariance instead of bounding it.
+
+    The averaged interval has to account for how the three estimators co-vary.
+    Fitting them separately leaves that unmeasured, and the only defensible
+    fallback is the perfect-correlation upper bound — which runs about 1.29x the
+    averaged estimator's actual spread, so every interval is a quarter wider than
+    it needs to be.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from treatmentrx.estimation import training
+
+        cls.training = training
+        cls.cohort = generate_ra_cohort(150, seed=5)
+
+    def tearDown(self):
+        self.training.reset()
+
+    def test_loadings_reproduce_each_estimator_contrast(self):
+        """The flat-vector view has to be the same quantity, or the resampled
+        contrast is of something else entirely."""
+        from treatmentrx.estimation import linalg
+        from treatmentrx.estimation.dwols import DWOLSModel
+
+        features = self.cohort[0].stages[-1].features
+        dwols = DWOLSModel(self.cohort)
+        direct = dwols.blip("rituximab", features) - dwols.blip("IL-6 inhibitor", features)
+        loaded = linalg.dot(
+            dwols.contrast_loading("rituximab", "IL-6 inhibitor", features),
+            dwols.flat_parameters(),
+        )
+        self.assertAlmostEqual(direct, loaded, places=12)
+
+        model = QLearningModel(self.cohort, share_blip=False)
+        terminal = model.n_stages - 1
+        direct_q = model.blip("rituximab", features, terminal) - model.blip(
+            "IL-6 inhibitor", features, terminal
+        )
+        loaded_q = linalg.dot(
+            model.contrast_loading("rituximab", "IL-6 inhibitor", features, terminal),
+            model.flat_parameters(),
+        )
+        self.assertAlmostEqual(direct_q, loaded_q, places=12)
+
+    def test_every_estimator_is_refit_on_the_same_resample(self):
+        """Independent resamples would destroy the correlation being measured."""
+        bootstrap = self.training.enable_joint_inference(replicates=6)
+        self.assertGreater(bootstrap.replicates, 0)
+        for draw in bootstrap.draws:
+            self.assertEqual(
+                sorted(draw),
+                sorted([self.training.Q_SHARED, self.training.STAGE_SPECIFIC, self.training.DWOLS_SHARED]),
+            )
+
+    def test_the_measured_interval_is_narrower_than_the_bound(self):
+        """The whole point: the bound assumes perfect correlation and the truth
+        is high but not perfect, so measuring it recovers real width."""
+        orchestrator = TreatmentRxOrchestrator()
+        bound = orchestrator.run(sample_ra_bundle()).audit_event["contrast"]
+        self.training.enable_joint_inference(replicates=40)
+        measured = orchestrator.run(sample_ra_bundle()).audit_event["contrast"]
+
+        self.assertLess(measured["standard_error"], bound["standard_error"])
+        self.assertIn("joint m-out-of-n", measured["caveat"])
+        self.assertTrue(measured["conservative"])
+
+    def test_it_is_opt_in_and_the_fallback_is_the_bound(self):
+        """An interval that silently degrades is worse than one visibly wide."""
+        self.assertIsNone(self.training.joint_inference())
+        contrast = TreatmentRxOrchestrator().run(sample_ra_bundle()).audit_event["contrast"]
+        self.assertIn("weighted sum", contrast["caveat"])
+
+    def test_reset_clears_the_joint_draws(self):
+        self.training.enable_joint_inference(replicates=4)
+        self.assertIsNotNone(self.training.joint_inference())
+        self.training.reset()
+        self.assertIsNone(self.training.joint_inference())

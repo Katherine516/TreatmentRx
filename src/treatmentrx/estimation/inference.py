@@ -312,8 +312,126 @@ def m_out_of_n_bootstrap(
     )
 
 
+@dataclass(frozen=True)
+class JointBootstrap:
+    """Every estimator refit on the *same* resample, replicate by replicate.
+
+    The decision is made on a weighted average of the three estimators, so its
+    standard error depends on how they co-vary. Fitting them separately leaves
+    that covariance unmeasured, and the only defensible fallback is the
+    perfect-correlation upper bound — which measures 1.29x the averaged
+    estimator's actual spread, so every interval is about a quarter wider than it
+    needs to be and borderline decisions are pushed into equipoise for no
+    statistical reason.
+
+    Refitting all three on one resample recovers the joint distribution directly.
+    The averaged contrast is then evaluated per replicate and its spread read off,
+    with no assumption about correlation at all.
+    """
+
+    draws: list[dict[str, list[float]]]
+    point: dict[str, list[float]]
+    n: int
+    m: int
+    non_regularity: float
+
+    @property
+    def replicates(self) -> int:
+        return len(self.draws)
+
+    @property
+    def scale(self) -> float:
+        return math.sqrt(self.m / self.n) if self.n else 1.0
+
+    def _averaged(self, draw, loadings, weights) -> float:
+        total = sum(weights.get(name, 0.0) for name in loadings)
+        if total <= 0.0:
+            return 0.0
+        return (
+            sum(
+                weights.get(name, 0.0) * _dot_sparse(loading, draw[name])
+                for name, loading in loadings.items()
+                if name in draw
+            )
+            / total
+        )
+
+    def contrast(
+        self,
+        loadings: dict[str, list[float]],
+        weights: dict[str, float],
+        arm: str,
+        comparator: str,
+        alpha: float = DEFAULT_ALPHA,
+        scale_by: float = 1.0,
+    ) -> ContrastTest:
+        """Percentile interval for the model-averaged contrast."""
+        estimate = self._averaged(self.point, loadings, weights)
+        values = [self._averaged(draw, loadings, weights) for draw in self.draws]
+        if len(values) < 2:
+            raise ValueError("joint bootstrap needs at least two usable replicates")
+
+        mean = sum(values) / len(values)
+        variance = sum((value - mean) ** 2 for value in values) / (len(values) - 1)
+        standard_error = math.sqrt(variance) * self.scale
+
+        root_m, root_n = math.sqrt(self.m), math.sqrt(self.n) if self.n else 1.0
+        statistics = sorted(root_m * (value - estimate) for value in values)
+        lower = estimate - _quantile(statistics, 1.0 - alpha / 2.0) / root_n
+        upper = estimate - _quantile(statistics, alpha / 2.0) / root_n
+
+        return ContrastTest(
+            arm=arm,
+            comparator=comparator,
+            difference=estimate / scale_by,
+            standard_error=standard_error / scale_by,
+            lower=lower / scale_by,
+            upper=upper / scale_by,
+            alpha=alpha,
+            conservative=True,
+            caveat=(
+                f"joint m-out-of-n bootstrap over {len(loadings)} estimators "
+                f"(m={self.m} of n={self.n}, {self.replicates} replicates); the "
+                "components' covariance is measured rather than bounded."
+            ),
+        )
+
+
+def joint_bootstrap(
+    refit_all,
+    cohort: list,
+    point: dict[str, list[float]],
+    non_regularity: float,
+    replicates: int = DEFAULT_REPLICATES,
+    alpha: float = DEFAULT_BOOTSTRAP_ALPHA,
+    seed: int = 17,
+) -> JointBootstrap:
+    """Resample once per replicate and refit *every* estimator on that resample.
+
+    Sharing the resample is the whole point: fitting them on independent
+    resamples would destroy exactly the correlation this exists to measure.
+    """
+    import random
+
+    n = len(cohort)
+    m = adaptive_resample_size(n, non_regularity, alpha)
+    rng = random.Random(seed)
+    draws: list[dict[str, list[float]]] = []
+    for _ in range(replicates):
+        sample = [cohort[rng.randrange(n)] for _ in range(m)]
+        try:
+            draws.append(refit_all(sample))
+        except (ValueError, ZeroDivisionError):
+            continue
+    return JointBootstrap(
+        draws=draws, point=dict(point), n=n, m=m, non_regularity=non_regularity
+    )
+
+
 __all__ = [
     "ContrastTest",
+    "JointBootstrap",
+    "joint_bootstrap",
     "DEFAULT_ALPHA",
     "bootstrap_contrast",
     "contrast_test",

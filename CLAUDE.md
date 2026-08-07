@@ -8,7 +8,7 @@ test fixture, not evidence.
 ## Commands
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests    # full suite, ~35s
+PYTHONPATH=src python3 -m unittest discover -s tests    # full suite, ~49s
 PYTHONPATH=src python3 -m treatmentrx.cli demo          # one patient end to end
 PYTHONPATH=src python3 -m treatmentrx.cli evaluate      # estimator scorecard
 PYTHONPATH=src python3 -m treatmentrx.cli stability     # k-fold + seed sweep (~15s)
@@ -121,16 +121,24 @@ produced a real clinical divergence, and the notes below are the scar tissue.
     interval instead made the difference and the decision come from different
     models and added the selection's own variability: measured end to end that
     covered 78%, worse than any component. Averaging covers nominal.
-17. **`conservative=True` means the correction is already paid.** An interval so
+17. **Covariance is measured when it can be, bounded when it cannot.**
+    `training.enable_joint_inference()` refits all three estimators on the *same*
+    resamples, which is the only way to see how they co-vary; fitting them on
+    independent resamples would destroy exactly what is being measured. Without
+    it the decision layer falls back to the perfect-correlation upper bound,
+    which runs ~1.29x the averaged estimator's real spread. The fallback is
+    deliberate and visible — an interval that silently degrades is worse than one
+    that is visibly wide.
+18. **`conservative=True` means the correction is already paid.** An interval so
     marked is exempt from `SANDWICH_INFLATION`; widening it again charges twice
     and pushes borderline cases into equipoise for no statistical reason.
-18. **A separation that depends on the interval method is not a separation.**
+19. **A separation that depends on the interval method is not a separation.**
     The sandwich is measurably too narrow and it drives equipoise, a clinical
     output. `ContrastTest.robustly_distinguishable` accepts a verdict only if it
     survives the interval widening by `SANDWICH_INFLATION`; a bootstrap interval
     is already honest and is exempt. Read that property, never `distinguishable`,
     when deciding.
-19. **Weighting constants are measured, not chosen.** `DEFAULT_BLIP_RIDGE`,
+20. **Weighting constants are measured, not chosen.** `DEFAULT_BLIP_RIDGE`,
     `USE_VISIT_INTENSITY` and `SANDWICH_INFLATION` each carry the numbers that
     set them in a comment beside them. Changing one means re-running the command
     that produced those numbers, not re-deciding by feel.
@@ -158,6 +166,8 @@ replications, known truth 0.088):
 | sandwich, stage-specific | 88% | 0.88 | -0.008 |
 | sandwich, shared blip | 79% | 0.86 | +0.019 |
 | m-out-of-n bootstrap | 93% | 1.27 | -0.003 |
+| decision rule, correlation bound | 98% | 1.13 | +0.004 |
+| decision rule, joint bootstrap | 93% | 1.05 | +0.003 |
 
 Only the bootstrap reaches nominal. Read `se_to_sd_ratio` rather than the
 coverage tally when replications are few — it is a quotient of two means, not a
