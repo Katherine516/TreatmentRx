@@ -56,6 +56,11 @@ class ContrastTest:
     upper: float
     alpha: float
     caveat: str = ""
+    # True when the interval is already at least as wide as an honest one. Set
+    # explicitly rather than inferred from the caveat text, because whether an
+    # interval has already paid its correction is a property of how it was
+    # built, not of how it was described.
+    conservative: bool = False
 
     @property
     def distinguishable(self) -> bool:
@@ -64,8 +69,13 @@ class ContrastTest:
 
     @property
     def exact(self) -> bool:
-        """Is this interval already the honest one, needing no inflation check?"""
-        return not self.caveat or self.caveat.startswith("m-out-of-n")
+        """Is this interval already honest, needing no further widening?
+
+        Inflating an interval that has already accounted for the shortfall would
+        charge for the same correction twice and push borderline decisions into
+        equipoise for no statistical reason.
+        """
+        return self.conservative or not self.caveat or self.caveat.startswith("m-out-of-n")
 
     def survives_inflation(self, factor: float = SANDWICH_INFLATION) -> bool:
         """Would the verdict hold if the interval were `factor` times wider?"""
@@ -101,6 +111,7 @@ class ContrastTest:
             "interval": [round(self.lower, 4), round(self.upper, 4)],
             "distinguishable": self.distinguishable,
             "robustly_distinguishable": self.robustly_distinguishable,
+            "conservative": self.conservative,
             "alpha": self.alpha,
             "caveat": self.caveat,
         }

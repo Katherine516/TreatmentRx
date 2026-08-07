@@ -558,6 +558,7 @@ class QLearningModel:
             lower=lower / horizon,
             upper=upper / horizon,
             alpha=alpha,
+            conservative=True,
             caveat=(
                 f"m-out-of-n bootstrap (m={self.bootstrap.m} of n={self.bootstrap.n}, "
                 f"non-regularity {self.bootstrap.non_regularity:.2f}); accounts for the "

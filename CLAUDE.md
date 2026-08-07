@@ -8,7 +8,7 @@ test fixture, not evidence.
 ## Commands
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests    # full suite, ~29s
+PYTHONPATH=src python3 -m unittest discover -s tests    # full suite, ~35s
 PYTHONPATH=src python3 -m treatmentrx.cli demo          # one patient end to end
 PYTHONPATH=src python3 -m treatmentrx.cli evaluate      # estimator scorecard
 PYTHONPATH=src python3 -m treatmentrx.cli stability     # k-fold + seed sweep (~15s)
@@ -114,13 +114,23 @@ produced a real clinical divergence, and the notes below are the scar tissue.
 15. **Every advanced arm keeps a monotherapy composite.** Listing biologics only
     in MTX combination turns one methotrexate contraindication into a blocked
     recommendation for a patient who had a viable option.
-16. **A separation that depends on the interval method is not a separation.**
+16. **The interval describes the quantity the decision uses.** The decision is
+    made on the model-averaged Q-values, so `DecisionLayer._contrast` centres the
+    interval on the averaged contrast and bounds its variance by the weighted sum
+    of the component standard errors. Reporting the widest single estimator's
+    interval instead made the difference and the decision come from different
+    models and added the selection's own variability: measured end to end that
+    covered 78%, worse than any component. Averaging covers nominal.
+17. **`conservative=True` means the correction is already paid.** An interval so
+    marked is exempt from `SANDWICH_INFLATION`; widening it again charges twice
+    and pushes borderline cases into equipoise for no statistical reason.
+18. **A separation that depends on the interval method is not a separation.**
     The sandwich is measurably too narrow and it drives equipoise, a clinical
     output. `ContrastTest.robustly_distinguishable` accepts a verdict only if it
     survives the interval widening by `SANDWICH_INFLATION`; a bootstrap interval
     is already honest and is exempt. Read that property, never `distinguishable`,
     when deciding.
-17. **Weighting constants are measured, not chosen.** `DEFAULT_BLIP_RIDGE`,
+19. **Weighting constants are measured, not chosen.** `DEFAULT_BLIP_RIDGE`,
     `USE_VISIT_INTENSITY` and `SANDWICH_INFLATION` each carry the numbers that
     set them in a comment beside them. Changing one means re-running the command
     that produced those numbers, not re-deciding by feel.

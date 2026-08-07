@@ -133,20 +133,33 @@ class ContrastTests(unittest.TestCase):
         self.assertEqual(status, RecommendationStatus.EQUIPOISE)
         self.assertIn("includes zero", rationale)
 
-    def test_decision_layer_takes_the_widest_interval(self):
-        """If any estimator cannot separate the arms, the system does not claim
-        separation."""
+    def test_decision_layer_averages_rather_than_picking_one_estimator(self):
+        """The interval describes the averaged contrast the decision is made on.
+
+        Picking the single widest interval instead let the reported difference
+        come from one model while the decision came from the ensemble, and made
+        which model supplied it depend on the data.
+        """
         state = _demo_state()
         estimates = EstimationLayer().estimate(state)
         layer = DecisionLayer()
-        chosen = layer._contrast(state, layer.bma.aggregate(estimates))
-        ordered = sorted(chosen.arm for chosen in [chosen])
-        every = [
+        selected = layer.bma.aggregate(estimates)
+        weights = {
+            name.split(":", 1)[1]: value
+            for name, value in selected.coefficients.items()
+            if name.startswith("bma_weight:")
+        }
+        chosen = layer._contrast(state, selected, weights)
+        components = [
             estimator.contrast(state.stages, chosen.arm, chosen.comparator)
             for estimator in layer.estimators
         ]
-        self.assertEqual(chosen.standard_error, max(t.standard_error for t in every))
-        self.assertTrue(ordered)
+
+        # An average, so it sits inside the range of its components rather than
+        # equalling any one of them.
+        self.assertLessEqual(chosen.standard_error, max(c.standard_error for c in components))
+        self.assertGreaterEqual(chosen.standard_error, min(c.standard_error for c in components))
+        self.assertTrue(chosen.conservative)
 
 
 class StabilityTests(unittest.TestCase):

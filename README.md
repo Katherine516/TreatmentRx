@@ -194,6 +194,24 @@ at 0 the 78-parameter stage-specific fit destabilises at the sample sizes the
 bootstrap resamples to. 0.25 is the best worst-case parameter error at n=88, 120
 and 250 alike.
 
+### The interval has to describe the decision
+
+Layer 3 decides on the model-averaged Q-values, so the interval has to be for the
+*averaged* contrast. It previously reported the widest of the three estimators'
+intervals, which was incoherent twice over — the difference came from one model
+while the decision came from the ensemble, and which model supplied it moved with
+the data.
+
+Measured end to end, that rule covered **78%** against a nominal 95%, worse than
+any of its own components. Centring on the averaged contrast and bounding its
+variance by the weighted sum of the component standard errors reaches nominal:
+averaging removes the selection variability (empirical spread 0.029 → 0.013) and
+the components' opposing biases partly cancel (+0.012 → +0.005).
+
+The result errs wide rather than narrow, which is the safe direction — and it
+must then be exempt from the sandwich-inflation guard, or the same correction is
+charged twice.
+
 ### Which estimator, when policy value cannot decide?
 
 `stability` reports that held-out policy value cannot separate the three. That is

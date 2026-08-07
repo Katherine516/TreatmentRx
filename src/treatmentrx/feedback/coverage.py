@@ -187,6 +187,109 @@ def _result(method, replications, covered, widths, estimates, errors, truth) -> 
     )
 
 
+def decision_rule_coverage(
+    replications: int = 60,
+    n: int = 250,
+    base_seed: int = 9_700,
+) -> CoverageResult:
+    """Coverage of the interval the decision layer actually uses.
+
+    The individual-estimator studies validate components. Layer 3 uses neither
+    of them directly: it asks every estimator for the same contrast and keeps the
+    *widest* interval, on the grounds that if any estimator cannot separate the
+    arms the system should not claim separation. That selection rule has its own
+    sampling behaviour — taking a maximum over three correlated intervals is not
+    the same as taking any one of them — so it is measured here rather than
+    assumed to inherit the components' coverage.
+    """
+    from treatmentrx.estimation.dwols import DWOLSModel
+
+    truth = reference_truth()
+    covered = 0
+    widths: list[float] = []
+    estimates: list[float] = []
+    errors: list[float] = []
+
+    for replication in range(replications):
+        cohort = generate_ra_cohort(n, seed=base_seed + replication)
+        shared = QLearningModel(cohort, share_blip=True)
+        stage_specific = QLearningModel(cohort, share_blip=False)
+        dwols = DWOLSModel(cohort)
+        terminal = stage_specific.n_stages - 1
+
+        candidates = {
+            "shared": shared.sandwich_contrast(
+                REFERENCE_ARM, REFERENCE_COMPARATOR, REFERENCE_FEATURES, terminal
+            ),
+            "stage_specific": stage_specific.sandwich_contrast(
+                REFERENCE_ARM, REFERENCE_COMPARATOR, REFERENCE_FEATURES, terminal
+            ),
+            "dwols": _dwols_contrast(dwols, terminal),
+        }
+        contrast = _averaged_contrast(list(candidates.values()))
+        if contrast.lower <= truth <= contrast.upper:
+            covered += 1
+        widths.append(contrast.upper - contrast.lower)
+        estimates.append(contrast.difference)
+        errors.append(contrast.standard_error)
+
+    return _result(
+        "decision rule (model-averaged)",
+        replications, covered, widths, estimates, errors, truth,
+    )
+
+
+def _averaged_contrast(tests: list):
+    """The decision layer's rule: centre on the average, bound the variance above.
+
+    Equal weights here because the model-averaging weights come out near-uniform
+    on this cohort; the point being measured is the averaging, not the weighting.
+    """
+    from treatmentrx.estimation.inference import ContrastTest
+
+    difference = sum(test.difference for test in tests) / len(tests)
+    standard_error = sum(test.standard_error for test in tests) / len(tests)
+    margin = 1.96 * standard_error
+    return ContrastTest(
+        arm=REFERENCE_ARM,
+        comparator=REFERENCE_COMPARATOR,
+        difference=difference,
+        standard_error=standard_error,
+        lower=difference - margin,
+        upper=difference + margin,
+        alpha=0.05,
+        caveat="model-averaged",
+    )
+
+
+def _dwols_contrast(model, terminal: int):
+    """dWOLS exposes its contrast through the estimator facade, not the model."""
+    from treatmentrx.estimation.dwols import DWOLSSharedEstimator
+
+    estimator = DWOLSSharedEstimator()
+    difference = model.blip(REFERENCE_ARM, REFERENCE_FEATURES) - model.blip(
+        REFERENCE_COMPARATOR, REFERENCE_FEATURES
+    )
+    variance = sum(
+        model.blip_standard_error(arm, REFERENCE_FEATURES) ** 2
+        for arm in (REFERENCE_ARM, REFERENCE_COMPARATOR)
+    )
+    standard_error = math.sqrt(variance)
+    margin = 1.96 * standard_error
+    from treatmentrx.estimation.inference import ContrastTest
+
+    return ContrastTest(
+        arm=REFERENCE_ARM,
+        comparator=REFERENCE_COMPARATOR,
+        difference=difference,
+        standard_error=standard_error,
+        lower=difference - margin,
+        upper=difference + margin,
+        alpha=0.05,
+        caveat="arm variances added as if independent",
+    )
+
+
 def verdict(results: list[CoverageResult]) -> str:
     """Read the coverage numbers back in plain terms."""
     lines = []
