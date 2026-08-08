@@ -60,53 +60,6 @@ class StageHistoryBuilder:
         return code.lower().replace(" ", "_").replace("-", "_")
 
 
-class VisitAligner:
-    """Adds a lightweight inverse-intensity-style visit weight."""
-
-    def apply(self, stages: list[StageRecord], encounter_days: list[int]) -> list[StageRecord]:
-        if not stages:
-            return []
-        if len(encounter_days) < 2:
-            return stages
-
-        gaps = [b - a for a, b in zip(encounter_days, encounter_days[1:]) if b > a]
-        mean_gap = sum(gaps) / len(gaps) if gaps else 90.0
-        weighted: list[StageRecord] = []
-        for stage in stages:
-            local_visits = [
-                day for day in encounter_days
-                if stage.start_day <= day <= (stage.end_day or max(encounter_days))
-            ]
-            local_rate = len(local_visits) / max((stage.end_day or max(encounter_days)) - stage.start_day + 1, 1)
-            expected_rate = 1 / max(mean_gap, 1)
-            weight = min(max(expected_rate / max(local_rate, 0.001), 0.25), 4.0)
-            weighted.append(self._replace(stage, visit_weight=round(weight, 4)))
-        return weighted
-
-    def _replace(self, stage: StageRecord, **updates: float) -> StageRecord:
-        values = stage.__dict__ | updates
-        return StageRecord(**values)
-
-
-class IPCWHandler:
-    """Simple censoring weight scaffold."""
-
-    def apply(self, stages: list[StageRecord]) -> list[StageRecord]:
-        if not stages:
-            return []
-        max_stage = max(stage.stage for stage in stages)
-        adjusted: list[StageRecord] = []
-        for stage in stages:
-            observed_fraction = stage.stage / max_stage
-            weight = min(1.0 / max(observed_fraction, 0.2), 5.0)
-            adjusted.append(self._replace(stage, censoring_weight=round(weight, 4)))
-        return adjusted
-
-    def _replace(self, stage: StageRecord, **updates: float) -> StageRecord:
-        values = stage.__dict__ | updates
-        return StageRecord(**values)
-
-
 class VariableSelector:
     """Identifies candidate tailoring variables from numeric feature variance."""
 

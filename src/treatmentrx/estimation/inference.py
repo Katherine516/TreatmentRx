@@ -149,7 +149,7 @@ def sandwich_covariance(
     # Small-cluster correction: without it the sandwich is anti-conservative.
     n_clusters = len(scores)
     scale = n_clusters / max(n_clusters - 1, 1)
-    covariance = linalg.matmul(linalg.matmul(bread, meat), bread)
+    covariance = linalg.sandwich_product(bread, meat)
     return [[value * scale for value in row] for row in covariance]
 
 

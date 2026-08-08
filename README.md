@@ -301,25 +301,31 @@ sandwich standard errors and contrast-driven equipoise; cross-validated
 stability; m-out-of-n bootstrap for the non-regular stages; a multi-stage cohort
 with informative dropout and irregular visits, ingestible through Layer 1.
 
-Performance, measured on the demo patient: a cold process pays 0.74s to fit the
-three estimators; each subsequent recommendation costs ~2.2ms. The oracle rollout
-benchmark is simulation-only and computed on request, so it stays off the path of
-a process that just serves a patient.
+Also done: the visit-intensity model is fitted from the data (and measurably
+does not help on this generating process, so it is off by default with the
+numbers recorded beside the flag); the misspecified-nuisance arm of the
+simulation; and the joint bootstrap that measures the estimators' covariance
+instead of bounding it.
+
+Performance, measured on the demo patient: a cold process pays **0.54s** to fit
+the three estimators; each subsequent recommendation costs **~1.7ms**. The oracle
+rollout benchmark is simulation-only and computed on request, so it stays off the
+path of a process that just serves a patient.
 
 Next, in order:
 
-1. **Estimate the visit-intensity weights.** Dropout is now modelled from the
-   data, but `IPCWHandler` still assigns visit weights heuristically. The cohort
-   generates severity-driven visit spacing, so the ground truth to fit against
-   exists — it just is not used yet.
-2. **A misspecified-outcome-model arm of the simulation.** IPCW is currently a
-   small correction because the outcome model is correctly specified. The case
-   where it earns its keep is the one not yet simulated.
-3. **Train the GRU baseline** and compare against the handcrafted encoder, now
-   that trajectories have three stages and irregular timing to learn from.
-4. **A versioned clinical knowledge base** keyed to `arms.py`, replacing the
-   sample contraindication rules and the five hard-coded RAG passages.
-5. **FastAPI service and clinician dashboard**, once 1–4 make the numbers worth
+1. **Train the GRU baseline** and compare against the handcrafted encoder, now
+   that trajectories have three stages and irregular timing to learn from. Today
+   only the encoder's first 32 entries are read by anything; a trained encoder is
+   what would make the rest worth computing.
+2. **A versioned clinical knowledge base** keyed to `arms.py`, replacing the
+   sample contraindication rules and the five hard-coded RAG passages. The
+   composite action set is currently a literal in `estimation/actions.py`, and
+   its breadth is load-bearing for whether a contraindication blocks a patient.
+3. **A real identifiability check.** `CausalDAGRegistry` compares against a
+   hand-listed adjustment set; one wrong entry there silently blocks or unblocks
+   patients, as it did for every csDMARD-only record until recently.
+4. **FastAPI service and clinician dashboard**, once 1–3 make the numbers worth
    serving.
 
 ## Research proposal

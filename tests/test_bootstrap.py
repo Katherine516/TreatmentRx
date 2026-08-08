@@ -148,8 +148,9 @@ class TrainingIntegrationTests(unittest.TestCase):
             self.assertLessEqual(entry["m"], entry["n"], msg=name)
             self.assertTrue(0.0 <= entry["non_regularity"] <= 1.0, msg=name)
             self.assertGreater(entry["replicates"], 0, msg=name)
-        # Leave the shared cache as the rest of the suite expects it.
-        training.reset()
+        # Leave the shared cache as the rest of the suite expects it — detaching
+        # the draws is enough, and keeps the three fitted models.
+        training.disable_bootstrap_inference()
 
 
 if __name__ == "__main__":

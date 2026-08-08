@@ -20,7 +20,7 @@ from treatmentrx.data.dag import CausalDAGRegistry
 from treatmentrx.data.encoders import GRUBaselineEncoder, HandcraftedFeatureEncoder
 from treatmentrx.data.fhir import FHIRAdapter
 from treatmentrx.data.leakage import LeakageError, LeakageTestSuite
-from treatmentrx.data.stages import IPCWHandler, StageHistoryBuilder, VariableSelector, VisitAligner
+from treatmentrx.data.stages import StageHistoryBuilder, VariableSelector
 from treatmentrx.data.switching import SwitchingCapture
 from treatmentrx.data.timing import TimingModel
 from treatmentrx.domain import CareGoal, PatientRecord, StageRecord
@@ -37,8 +37,6 @@ class DataLayer:
         self.fhir = FHIRAdapter()
         self.contract = RADataContract()
         self.stage_builder = StageHistoryBuilder()
-        self.visit_aligner = VisitAligner()
-        self.ipcw = IPCWHandler()
         self.variable_selector = VariableSelector()
         self.timing = TimingModel()
         self.switching = SwitchingCapture()
@@ -67,8 +65,6 @@ class DataLayer:
             raise DataContractError(contract_report)
 
         stages = self.stage_builder.build(patient)
-        stages = self.visit_aligner.apply(stages, patient.encounters)
-        stages = self.ipcw.apply(stages)
         stages = self.timing.apply(stages, patient.encounters)
         stages = self.switching.apply(stages, patient)
         stages = self.belief.apply(stages)

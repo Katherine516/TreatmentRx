@@ -174,8 +174,6 @@ class StageRecord:
     features: dict[str, float | str | bool]
     response: str | None
     outcome: float
-    visit_weight: float = 1.0
-    censoring_weight: float = 1.0
     care_goal: CareGoal = CareGoal.INDUCTION
     timing: TimingFeatures | None = None
     belief: BeliefState | None = None

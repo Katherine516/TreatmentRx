@@ -138,7 +138,13 @@ produced a real clinical divergence, and the notes below are the scar tissue.
     survives the interval widening by `SANDWICH_INFLATION`; a bootstrap interval
     is already honest and is exempt. Read that property, never `distinguishable`,
     when deciding.
-20. **Weighting constants are measured, not chosen.** `DEFAULT_BLIP_RIDGE`,
+20. **`linalg` is hot and hand-optimised; keep it exact.** `matmul` accumulates
+    by row, `weighted_least_squares` skips structural zeros, `quadratic_form`
+    walks only the support of its vector, and `sandwich_product` computes the
+    half of A·B·A that symmetry does not give for free. `tests/test_linalg.py`
+    pins each against its textbook form — a rewrite that is subtly wrong would
+    otherwise shift every standard error in the system without failing anything.
+21. **Weighting constants are measured, not chosen.** `DEFAULT_BLIP_RIDGE`,
     `USE_VISIT_INTENSITY` and `SANDWICH_INFLATION` each carry the numbers that
     set them in a comment beside them. Changing one means re-running the command
     that produced those numbers, not re-deciding by feel.
@@ -151,12 +157,17 @@ standard errors, m-out-of-n bootstrap intervals, contrast tests, cross-validated
 stability, blip attributions.
 
 Still deliberately simple, and labelled as such in-module: `GRUBaselineEncoder`
-(a deterministic summariser, not a trained GRU), `CausalDAGRegistry` (hand-listed
-adjustment sets, no formal identifiability), `SemanticKnowledgeBase` (five
-hard-coded passages), the E-value in the sensitivity report, the regime
-selector's BIC proxy, and `IPCWHandler`'s visit weights (heuristic — the cohort
-now generates severity-driven visit spacing, so there is ground truth to fit
-against that is not yet used).
+(a deterministic summariser, not a trained GRU — and only its first 32 entries
+are read by anything, the tail holding the shape of the planned `z_t` interface),
+`CausalDAGRegistry` (hand-listed adjustment sets, no formal identifiability),
+`SemanticKnowledgeBase` (five hard-coded passages), the E-value in the
+sensitivity report, and the regime selector's BIC proxy.
+
+`StageRecord` no longer carries `visit_weight` or `censoring_weight`. They were
+Layer 1 heuristics that named a statistical role they did not have: nothing
+statistical read them, and the real weighting is fitted in Layer 2
+(`estimation/censoring.py`, `estimation/visit_intensity.py`). Do not reintroduce
+a weight on the domain object that no estimator consumes.
 
 **Measured coverage of the nominal 95% interval** (`cli coverage`, 120
 replications, known truth 0.088):

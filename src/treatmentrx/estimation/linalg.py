@@ -46,11 +46,17 @@ def weighted_least_squares(
     p = len(design[0])
     xtwx = [[0.0 for _ in range(p)] for _ in range(p)]
     xtwy = [0.0 for _ in range(p)]
+    # The dense designs here are half structural zeros — one-hot arm indicators
+    # and their interactions in the censoring model, the untaken arm's blip block
+    # in dWOLS — so walking every pair costs several times what the row contains.
     for row, y, w in zip(design, targets, weights):
-        for i in range(p):
-            xtwy[i] += w * row[i] * y
-            for j in range(p):
-                xtwx[i][j] += w * row[i] * row[j]
+        active = [(i, value) for i, value in enumerate(row) if value != 0.0]
+        for i, xi in active:
+            wxi = w * xi
+            xtwy[i] += wxi * y
+            target_row = xtwx[i]
+            for j, xj in active:
+                target_row[j] += wxi * xj
     for i in range(p):
         xtwx[i][i] += ridge
     return solve(xtwx, xtwy)
@@ -151,8 +157,52 @@ def inverse(matrix: list[list[float]]) -> list[list[float]]:
 
 
 def matmul(a: list[list[float]], b: list[list[float]]) -> list[list[float]]:
+    """Row-wise accumulation rather than a generator per output element.
+
+    The textbook `sum(a[i][t] * b[t][j] for t in range(k))` builds one generator
+    per entry of the product — n*m of them — and pays the iteration protocol on
+    every term. Accumulating a row at a time keeps the inner loop over a plain
+    list and skips zero multipliers outright, which matters because the sandwich
+    variance multiplies matrices whose blocks are structurally empty.
+    """
     n, k, m = len(a), len(b), len(b[0])
-    return [[sum(a[i][t] * b[t][j] for t in range(k)) for j in range(m)] for i in range(n)]
+    out = [[0.0] * m for _ in range(n)]
+    for i in range(n):
+        row_a, row_out = a[i], out[i]
+        for t in range(k):
+            scale = row_a[t]
+            if scale == 0.0:
+                continue
+            row_b = b[t]
+            for j in range(m):
+                row_out[j] += scale * row_b[j]
+    return out
+
+
+def sandwich_product(
+    bread: list[list[float]], meat: list[list[float]]
+) -> list[list[float]]:
+    """A B A for symmetric A and B, which is itself symmetric.
+
+    Only the upper triangle of the second multiply is computed and then
+    mirrored, because the result cannot be anything else. Three halves of a cubic
+    instead of two whole ones.
+    """
+    n = len(bread)
+    left = matmul(bread, meat)
+    out = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        row_left, row_out = left[i], out[i]
+        for j in range(i, n):
+            column = bread[j]  # symmetric, so the row is the column
+            total = 0.0
+            for t in range(n):
+                scale = row_left[t]
+                if scale != 0.0:
+                    total += scale * column[t]
+            row_out[j] = total
+            out[j][i] = total
+    return out
 
 
 def quadratic_form(vector: list[float], matrix: list[list[float]]) -> float:

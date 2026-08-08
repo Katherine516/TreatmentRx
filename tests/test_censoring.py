@@ -159,6 +159,35 @@ class CensoredRowHandlingTests(unittest.TestCase):
         model = QLearningModel(_COHORT, use_ipcw=False)
         self.assertIsNone(model.censoring)
 
+class CensoringPerformanceTests(unittest.TestCase):
+    """The memoised survival chain has to be the same chain."""
+
+    def test_repeated_lookups_return_the_same_probabilities(self):
+        model = CensoringModel(_COHORT)
+        trajectory = _COHORT[0]
+        first = list(model.survival_probabilities(trajectory))
+        second = model.survival_probabilities(trajectory)
+        self.assertEqual(first, second)
+
+    def test_the_cache_does_not_leak_between_trajectories(self):
+        """Identity-keyed caches are the kind that silently serve the wrong row."""
+        model = CensoringModel(_COHORT)
+        by_trajectory = {
+            id(trajectory): model.survival_probabilities(trajectory)
+            for trajectory in _COHORT[:20]
+        }
+        for trajectory in _COHORT[:20]:
+            self.assertEqual(
+                model.survival_probabilities(trajectory), by_trajectory[id(trajectory)]
+            )
+        # Distinct patients should not all share one answer.
+        self.assertGreater(len({tuple(v) for v in by_trajectory.values()}), 1)
+
+    def test_weights_are_unchanged_by_memoisation(self):
+        model = CensoringModel(_COHORT)
+        recomputed = CensoringModel(_COHORT)
+        for trajectory in _COHORT[:30]:
+            self.assertEqual(model.weights(trajectory), recomputed.weights(trajectory))
 
 if __name__ == "__main__":
     unittest.main()

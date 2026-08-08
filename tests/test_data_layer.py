@@ -9,7 +9,7 @@ from treatmentrx.data.dag import CausalDAGRegistry
 from treatmentrx.data.encoders import GRUBaselineEncoder, HandcraftedFeatureEncoder
 from treatmentrx.data.fhir import FHIRAdapter
 from treatmentrx.data.leakage import LeakageError, LeakageTestSuite, TemporalFirewall
-from treatmentrx.data.stages import IPCWHandler, StageHistoryBuilder, VisitAligner
+from treatmentrx.data.stages import StageHistoryBuilder
 from treatmentrx.arms import TREATMENT_ARMS
 from treatmentrx.demo_data import sample_ra_bundle
 from treatmentrx.domain import (
@@ -62,10 +62,18 @@ class IngestionTests(unittest.TestCase):
         self.assertIn("colliders", result.causal_path_text)
 
     def test_encoders_produce_stable_state_vectors(self):
-        patient, stages = _stages()
-        stages = IPCWHandler().apply(VisitAligner().apply(stages, patient.encounters))
+        _, stages = _stages()
         self.assertEqual(len(HandcraftedFeatureEncoder().encode(stages).vector), 32)
         self.assertEqual(len(GRUBaselineEncoder().encode(stages).vector), 256)
+
+    def test_only_the_handcrafted_prefix_of_the_encoding_is_read(self):
+        """Documented rather than assumed: the recurrent tail holds the shape of
+        the planned `z_t` interface, and no consumer reads it yet. The OOD score
+        slices `vector[:32]`."""
+        _, stages = _stages()
+        vector = GRUBaselineEncoder().encode(stages).vector
+        handcrafted = HandcraftedFeatureEncoder().encode(stages, dimension=32).vector
+        self.assertEqual(vector[:32], handcrafted)
 
 
 class ClinicalRealismTests(unittest.TestCase):

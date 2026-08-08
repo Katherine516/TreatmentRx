@@ -63,6 +63,9 @@ class CensoringModel:
         self.n_stages = max((traj.n_observed for traj in cohort), default=1)
         self._coefficients: list[float] = []
         self._marginal: list[float] = [1.0] * (self.n_stages + 1)
+        # Keyed by identity: trajectories are frozen and the cache lives exactly
+        # as long as the model that built it.
+        self._survival_cache: dict[int, list[float]] = {}
         self._fit(cohort)
 
     def _fit(self, cohort: list[CohortTrajectory]) -> None:
@@ -111,13 +114,21 @@ class CensoringModel:
         return clamp(linalg.dot(row, self._coefficients), PROBABILITY_FLOOR, 1.0)
 
     def survival_probabilities(self, trajectory: CohortTrajectory) -> list[float]:
-        """P(still observed) at each of this trajectory's stages, cumulatively."""
+        """P(still observed) at each of this trajectory's stages, cumulatively.
+
+        Memoised: the fit asks for a weight once per row, and each ask used to
+        rebuild the patient's whole survival chain from the start.
+        """
+        cached = self._survival_cache.get(id(trajectory))
+        if cached is not None:
+            return cached
         probabilities = [1.0]
         for stage in trajectory.stages[:-1]:
             probabilities.append(
                 probabilities[-1]
                 * self.continuation_probability(stage.features, stage.outcome, stage.arm)
             )
+        self._survival_cache[id(trajectory)] = probabilities
         return probabilities
 
     def weights(self, trajectory: CohortTrajectory) -> list[float]:

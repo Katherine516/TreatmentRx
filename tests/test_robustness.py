@@ -224,7 +224,9 @@ class JointBootstrapTests(unittest.TestCase):
         cls.cohort = generate_ra_cohort(150, seed=5)
 
     def tearDown(self):
-        self.training.reset()
+        # Turning the mode off is enough; discarding the fits would refit three
+        # models between every test in this class for no reason.
+        self.training.disable_joint_inference()
 
     def test_loadings_reproduce_each_estimator_contrast(self):
         """The flat-vector view has to be the same quantity, or the resampled
@@ -280,8 +282,16 @@ class JointBootstrapTests(unittest.TestCase):
         contrast = TreatmentRxOrchestrator().run(sample_ra_bundle()).audit_event["contrast"]
         self.assertIn("weighted sum", contrast["caveat"])
 
-    def test_reset_clears_the_joint_draws(self):
+    def test_the_mode_can_be_turned_off_without_discarding_the_fits(self):
         self.training.enable_joint_inference(replicates=4)
+        fitted_before = self.training.fitted()
         self.assertIsNotNone(self.training.joint_inference())
+
+        self.training.disable_joint_inference()
+        self.assertIsNone(self.training.joint_inference())
+        self.assertIs(self.training.fitted(), fitted_before, "the fits were thrown away")
+
+    def test_a_full_reset_clears_the_joint_draws_too(self):
+        self.training.enable_joint_inference(replicates=4)
         self.training.reset()
         self.assertIsNone(self.training.joint_inference())

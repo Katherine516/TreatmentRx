@@ -54,12 +54,23 @@ class HandcraftedFeatureEncoder:
         return vector
 
 
+# The hand-rolled bias cycles with this period, which is what makes the
+# recurrent half collapse to a handful of distinct trajectories.
+_BIAS_PERIOD = 7
+
+
 class GRUBaselineEncoder:
     """Dependency-free GRU-compatible baseline interface.
 
     This is a deterministic sequence summarizer, not a trained neural GRU. It
     preserves the planned `z_t` interface so the statistical layer can be tested
     before PyTorch pretraining is introduced.
+
+    Only the first 32 entries — the handcrafted prefix — are read by anything
+    today: the out-of-distribution score in `decision/uncertainty.py` slices
+    `vector[:32]`. The recurrent tail exists to hold the interface's shape, not
+    because a consumer uses it, and that is worth knowing before anyone reads
+    meaning into its contents.
     """
 
     encoder_name = "gru-compatible-baseline"
@@ -74,11 +85,24 @@ class GRUBaselineEncoder:
         for index, value in enumerate(base.vector):
             hidden[index] = value
 
+        # Every hidden unit past the handcrafted prefix starts at zero and is
+        # driven by the same recurrence, differing only by a bias that depends on
+        # `index % 7`. There are therefore exactly `_BIAS_PERIOD` distinct
+        # trajectories, not `hidden_size - 32` of them: solve those and broadcast.
+        # Bit-identical to updating each unit in turn, at a thirty-second of the
+        # arithmetic.
+        recurrent = range(len(base.vector), self.hidden_size)
+        tracks = [0.0] * _BIAS_PERIOD
         for stage in stages:
-            stage_signal = (stage.outcome * stage.visit_weight * stage.censoring_weight) / max(stage.stage, 1)
-            for index in range(len(base.vector), self.hidden_size):
-                previous = hidden[index]
-                hidden[index] = math.tanh(0.88 * previous + 0.12 * stage_signal + ((index % 7) - 3) * 0.002)
+            stage_signal = stage.outcome / max(stage.stage, 1)
+            for residue in range(_BIAS_PERIOD):
+                tracks[residue] = math.tanh(
+                    0.88 * tracks[residue]
+                    + 0.12 * stage_signal
+                    + (residue - 3) * 0.002
+                )
+        for index in recurrent:
+            hidden[index] = tracks[index % _BIAS_PERIOD]
 
         return EncodedState(
             encoder_name=self.encoder_name,

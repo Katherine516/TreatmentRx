@@ -172,6 +172,23 @@ def joint_inference():
     return _JOINT_BOOTSTRAP
 
 
+def disable_joint_inference() -> None:
+    """Turn off joint inference without discarding the fits it was built from.
+
+    Distinct from `reset()`: switching an inference mode off is not a reason to
+    throw away models that cost a second to fit and have not changed.
+    """
+    global _JOINT_BOOTSTRAP
+    _JOINT_BOOTSTRAP = None
+
+
+def disable_bootstrap_inference() -> None:
+    """Detach the per-estimator bootstrap draws, keeping the fits."""
+    fit = fitted()
+    fit.q_shared.attach_bootstrap(None)
+    fit.stage_specific.attach_bootstrap(None)
+
+
 def policy_value_for(method_name: str) -> float:
     """Held-out IPW policy value for an estimator, used as its `policy_value`."""
     score = fitted().scores.get(method_name)
