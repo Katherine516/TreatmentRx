@@ -33,11 +33,17 @@ from treatmentrx.estimation.q_learning import (
 from treatmentrx.estimation.inference import joint_bootstrap
 from treatmentrx.estimation.propensity import PropensityModel
 from treatmentrx.estimation.specification import specification_report
-from treatmentrx.feedback.offline_evaluation import PolicyScore, estimand_values, evaluate_policy
+from treatmentrx.feedback.offline_evaluation import (
+    PolicyScore,
+    estimand_values,
+    evaluate_policy,
+    sequential_dr_sensitivity,
+)
 from treatmentrx.domain import CalibrationReport
 from treatmentrx.scientific import EvaluationPartitionContract
 from treatmentrx.simulation.ra_cohort import (
     CohortTrajectory,
+    behaviour_policy,
     generate_ra_cohort,
     rollout_value,
     train_test_split,
@@ -645,6 +651,52 @@ def oracle_rollout_value(method_name: str) -> float | None:
     value = rollout_value(model.greedy_policy(), n=ROLLOUT_SAMPLES) if model else None
     _ORACLE_CACHE[method_name] = value
     return value
+
+
+def behaviour_uncensored_value() -> float:
+    """What the behaviour policy is worth on the DR estimate's scale.
+
+    The doubly-robust sequential value is a value-to-go under full follow-up, so
+    the thing it claims to beat has to be measured the same way.
+    `PolicyScore.behaviour_value` is the per-decision observational mean and is
+    not that quantity — comparing the two would be invariant 14 again.
+
+    Simulation-only, like every rollout here, and cached for the same reason.
+    """
+    key = "behaviour:uncensored"
+    if key not in _ORACLE_CACHE:
+        _ORACLE_CACHE[key] = rollout_value(
+            behaviour_policy, n=ROLLOUT_SAMPLES, dropout=False
+        )
+    return _ORACLE_CACHE[key]
+
+
+def dr_sensitivity(method_name: str | None = None) -> dict[str, object]:
+    """How wrong the outcome model would have to be to overturn the DR claim.
+
+    Not computed at fit time: it re-runs the DR recursion at a dozen
+    perturbations plus a bisection, and nothing on the serving path reads it.
+    `cli evaluate` asks for it.
+    """
+    fit = fitted()
+    name = method_name or best_score().estimator
+    model = {
+        Q_SHARED: fit.q_shared,
+        STAGE_SPECIFIC: fit.stage_specific,
+        Q_POOLED: fit.pooled,
+        DWOLS_SHARED: fit.dwols,
+    }[name]
+    # dWOLS has no value-to-go Q-function to perturb, so it borrows the pooled
+    # one exactly as its DR estimate does. `augmentation_model` on that estimate
+    # is where the borrowing is already recorded.
+    augmentation = model if isinstance(model, QLearningModel) else fit.pooled
+    return sequential_dr_sensitivity(
+        model.greedy_policy(),
+        fit.holdout,
+        augmentation,
+        behaviour_uncensored_value(),
+        propensity=fit.propensity.propensity,
+    ).as_dict()
 
 
 def oracle_uncensored_value(method_name: str) -> float | None:

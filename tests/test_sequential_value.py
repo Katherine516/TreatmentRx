@@ -316,6 +316,111 @@ class SequentialDRTests(unittest.TestCase):
         self.assertIn("doubly-robust estimate", sequential[0])
 
 
+class DRSensitivityTests(unittest.TestCase):
+    """The DR estimate leans on the outcome model; this prices how much.
+
+    Double robustness is consistent if *either* nuisance model is right, and on
+    this holdout only one is checkable — the inverse-weighted estimate has an
+    effective sample of 14.6 and cannot falsify anything. So the question is not
+    whether the Q-model is right but how wrong it would have to be to matter.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.report = training.dr_sensitivity()
+        cls.rows = cls.report["rows"]
+
+    def test_the_unperturbed_claim_is_separated_from_zero(self):
+        baseline = [r for r in self.rows if r["gamma"] == 0.0]
+        self.assertEqual(len(baseline), 1)
+        self.assertTrue(baseline[0]["separated_from_zero"])
+
+    def test_the_advantage_decays_monotonically_in_the_perturbation(self):
+        """Over-stating every blip can only shrink the estimated advantage.
+
+        The augmentation term carries the perturbation with a positive loading,
+        so a non-monotone sweep would mean the recursion is not doing what the
+        docstring says.
+        """
+        ordered = sorted(self.rows, key=lambda r: r["gamma"])
+        gains = [r["gain_over_benchmark"] for r in ordered]
+        for earlier, later in zip(gains, gains[1:]):
+            self.assertGreaterEqual(earlier, later)
+
+    def test_the_tipping_point_is_bisected_not_read_off_the_grid(self):
+        """It must not move when someone adds a row to the display sweep."""
+        tipping = self.report["tipping_point"]
+        self.assertIsNotNone(tipping)
+        self.assertGreater(tipping, 0.0)
+        grid = {r["gamma"] for r in self.rows}
+        self.assertNotIn(round(tipping, 3), grid)
+
+    def test_separation_holds_below_the_tipping_point_and_fails_above(self):
+        tipping = self.report["tipping_point"]
+        for row in self.rows:
+            with self.subTest(gamma=row["gamma"]):
+                if row["gamma"] < tipping:
+                    self.assertTrue(row["separated_from_zero"])
+                elif row["gamma"] > tipping:
+                    self.assertFalse(row["separated_from_zero"])
+
+    def test_the_benchmark_is_on_the_dr_estimates_own_scale(self):
+        """A value-to-go claim has to be measured against a value-to-go benchmark.
+
+        `PolicyScore.behaviour_value` is the per-decision observational mean —
+        about 0.67 — while the DR estimate is a total over the horizon, about
+        1.9. Comparing the two directly would be invariant 14 with a fresh pair
+        of quantities, and the ratio between them is a horizon rather than an
+        improvement: 2.83 against a fitted horizon of 3.
+        """
+        per_decision = training.best_score().behaviour_value
+        benchmark = self.report["benchmark"]
+        horizon = training.fitted().pooled.n_stages
+        self.assertAlmostEqual(
+            benchmark, training.behaviour_uncensored_value(), places=9
+        )
+        # Tied to the horizon rather than a chosen constant: a total over J
+        # visits cannot be less than one visit's worth or more than J of them.
+        self.assertGreater(benchmark / per_decision, 2.0)
+        self.assertLess(benchmark / per_decision, horizon + 0.5)
+
+    def test_the_perturbation_leaves_the_treatment_free_surface_alone(self):
+        """Only the blip is scaled; the nuisance surface cancels from a contrast."""
+        from treatmentrx.feedback.offline_evaluation import _ScaledBlipQ
+
+        model = training.fitted().pooled
+        features = training.fitted().holdout[0].stages[0].features
+        arm = model.arms[1]
+        scaled = _ScaledBlipQ(model, 1.0)
+        free = model.treatment_free(features, 0)
+        blip = model.blip(arm, features, 0)
+        self.assertAlmostEqual(model.raw_q(features, arm, 0), free + blip, places=9)
+        self.assertAlmostEqual(scaled.raw_q(features, arm, 0), free + 2.0 * blip, places=9)
+
+    def test_the_precision_is_best_near_the_unperturbed_model(self):
+        """A wrong Q-model costs the augmentation precision as well as centre.
+
+        Worth pinning because it means the DR estimate's own standard error
+        carries a weak signal about the model it leans on.
+
+        *Near*, not at. The minimum sits exactly at gamma = 0 only when the
+        augmenting model is the policy's own — for the deployed pairing it lands
+        at +0.1, because dWOLS's regime is evaluated with `Q-Pooled`'s value
+        function and the best control variate for someone else's policy is not
+        their unmodified one. That is the efficiency cost the borrowing was
+        already documented to carry.
+        """
+        by_gamma = {r["gamma"]: r["standard_error"] for r in self.rows}
+        best = min(by_gamma, key=by_gamma.get)
+        self.assertLessEqual(abs(best), 0.25, f"precision peaks at gamma={best}")
+        extreme = max(abs(g) for g in by_gamma)
+        self.assertGreater(
+            by_gamma[extreme],
+            1.5 * by_gamma[best],
+            "a badly wrong Q-model should cost precision, not just centring",
+        )
+
+
 class WeightDiagnosticTests(unittest.TestCase):
     def test_flat_weights_are_fully_efficient(self):
         diagnostics = weight_diagnostics([1.0] * 40)

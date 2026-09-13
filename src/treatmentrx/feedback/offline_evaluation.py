@@ -695,6 +695,214 @@ def sequential_dr_value(
     )
 
 
+class _ScaledBlipQ:
+    """A Q-function whose every blip is scaled by `1 + gamma`.
+
+    The treatment-free surface is left alone deliberately: it cancels out of a
+    contrast and is not what the claim under test rests on. Scaling the blip is
+    the same axis `generate_ra_cohort(..., blip_modifier=)` and the transfer
+    study's estimand shift bend, so a gamma here is comparable to a
+    misspecification this repo has already priced.
+    """
+
+    def __init__(self, model, gamma: float) -> None:
+        self.model = model
+        self.gamma = gamma
+
+    def raw_q(self, features: dict[str, float], arm: str, stage_index: int) -> float:
+        return self.model.treatment_free(features, stage_index) + (
+            1.0 + self.gamma
+        ) * self.model.blip(arm, features, stage_index)
+
+
+# How far the outcome model is perturbed. The range brackets the 1.5x estimand
+# shift `cli transfer` applies, which is the largest misspecification this repo
+# has a measured monitor for.
+DR_SENSITIVITY_GAMMAS = (-0.5, -0.25, -0.1, 0.0, 0.1, 0.25, 0.4, 0.5, 0.75, 1.0)
+
+
+@dataclass(frozen=True)
+class SequentialDRSensitivity:
+    """How wrong the Q-model has to be before the regime's advantage disappears.
+
+    **Why this is the analysis the DR estimate needs.** Double robustness is
+    consistent if *either* the outcome model or the propensity model is right,
+    and on this holdout only one of those is checkable: the inverse-weighted
+    estimate has an effective sample of 14.6 and cannot falsify anything. So the
+    useful question is not whether the Q-model is right — nothing here can answer
+    that — but how wrong it would have to be to matter.
+
+    Misspecification is parameterised as a proportional error in every blip:
+    `Q_gamma = treatment_free + (1 + gamma) * blip`. The regime under evaluation
+    is held **fixed**, so this measures the error in the value estimate rather
+    than quietly evaluating a different policy.
+
+    Measured on the deployed holdout, against a behaviour policy worth 1.9032 on
+    the same value-to-go scale:
+
+        gamma    DR value    gain over behaviour      z
+        +0.00     2.3278          +0.4246           6.31
+        +0.25     2.2243          +0.3211           3.33
+        +0.50     2.1208          +0.2176           1.42   <- gone
+        +1.00     1.9139          +0.0107           0.04
+
+    **The tipping point is near +0.4**, and where it lands is the point. A
+    proportional blip error of 50% is exactly the shift `cli transfer` applies in
+    its estimand-shifted row — the row where calibration rises to 0.051 against
+    0.002-0.006 everywhere else while policy value gets *better*. So the
+    misspecification that would overturn this claim is one the deployment monitor
+    already detects, and it detects it through calibration rather than value.
+    That is not a coincidence worth glossing: it is the same finding from the
+    other end.
+
+    One caveat on the comparison. The transfer row shifts the *truth* upward
+    while the model stays put; gamma shifts the *model* while the truth stays
+    put. Both are a 1.5x mismatch between the two, and calibration reads the gap
+    between predicted and observed either way, but the direction is not identical
+    and the magnitudes need not match exactly.
+
+    A second reading, almost free: the standard error is minimised **near** gamma
+    = 0 (0.067, against 0.15 at either +/-0.5). A badly wrong Q-model degrades
+    the augmentation's precision as well as its centre, so the estimator's own
+    interval carries a weak signal about the model it leans on.
+
+    *Near*, not at. The minimum sits exactly at 0 only when the augmenting model
+    is the evaluated policy's own; for the deployed pairing — dWOLS's regime
+    scored with `Q-Pooled`'s value function — it lands at +0.1, because the best
+    control variate for someone else's policy is not their unmodified one. That
+    is the efficiency cost the borrowing already carries, showing up in a second
+    place.
+    """
+
+    gammas: tuple[float, ...]
+    values: tuple[float, ...]
+    standard_errors: tuple[float, ...]
+    benchmark: float
+    tipping_point: float | None
+    alpha: float = 0.05
+
+    @property
+    def rows(self) -> tuple[dict[str, object], ...]:
+        critical = normal_critical_value(self.alpha)
+        out = []
+        for gamma, value, se in zip(self.gammas, self.values, self.standard_errors):
+            gain = value - self.benchmark
+            out.append(
+                {
+                    "gamma": round(gamma, 3),
+                    "value": round(value, 4),
+                    "standard_error": round(se, 4),
+                    "gain_over_benchmark": round(gain, 4),
+                    "gain_interval": [
+                        round(gain - critical * se, 4),
+                        round(gain + critical * se, 4),
+                    ],
+                    "separated_from_zero": bool(gain - critical * se > 0.0),
+                }
+            )
+        return tuple(out)
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "benchmark": round(self.benchmark, 4),
+            "parameterisation": (
+                "every estimated blip scaled by (1 + gamma); the treatment-free "
+                "surface and the evaluated regime are both held fixed"
+            ),
+            "tipping_point": (
+                round(self.tipping_point, 3) if self.tipping_point is not None else None
+            ),
+            "rows": list(self.rows),
+            "note": (
+                "How wrong the outcome model would have to be before the regime's "
+                "advantage over the behaviour policy stops being separated from "
+                "zero. This matters because the doubly-robust estimate leans on "
+                "that model and the inverse-weighted estimate that could falsify "
+                "it has an effective sample of 14.6. A tipping point near +0.4 "
+                "sits at the same magnitude as `cli transfer`'s estimand-shifted "
+                "row, where calibration rises an order of magnitude while policy "
+                "value improves — so the misspecification that would overturn "
+                "this claim is one calibration already catches and value does not."
+            ),
+        }
+
+
+def sequential_dr_sensitivity(
+    policy,
+    holdout: list[CohortTrajectory],
+    q_model,
+    benchmark: float,
+    propensity=None,
+    gammas: tuple[float, ...] = DR_SENSITIVITY_GAMMAS,
+    alpha: float = 0.05,
+) -> SequentialDRSensitivity:
+    """Sweep proportional outcome-model error. See `SequentialDRSensitivity`.
+
+    `benchmark` is the value the regime is being claimed to beat, on the same
+    value-to-go scale — `training.behaviour_uncensored_value()` supplies it, and
+    like every rollout here it is simulation-only.
+    """
+    values: list[float] = []
+    errors: list[float] = []
+    for gamma in gammas:
+        estimate = sequential_dr_value(
+            policy,
+            holdout,
+            _ScaledBlipQ(q_model, gamma) if gamma else q_model,
+            propensity,
+            alpha=alpha,
+        )
+        values.append(estimate.value)
+        errors.append(estimate.standard_error)
+
+    return SequentialDRSensitivity(
+        gammas=tuple(gammas),
+        values=tuple(values),
+        standard_errors=tuple(errors),
+        benchmark=benchmark,
+        tipping_point=_tipping_point(
+            policy, holdout, q_model, benchmark, propensity, alpha
+        ),
+        alpha=alpha,
+    )
+
+
+def _tipping_point(
+    policy, holdout, q_model, benchmark, propensity, alpha, upper: float = 3.0
+) -> float | None:
+    """Smallest positive gamma at which the gain stops excluding zero.
+
+    Bisected rather than read off the sweep, because the sweep's grid is chosen
+    for legibility and the tipping point should not move when someone adds a row
+    to it. `None` means the claim survives every perturbation up to `upper`,
+    which is a tripling of every effect and well past useful.
+    """
+    critical = normal_critical_value(alpha)
+
+    def separated(gamma: float) -> bool:
+        estimate = sequential_dr_value(
+            policy,
+            holdout,
+            _ScaledBlipQ(q_model, gamma) if gamma else q_model,
+            propensity,
+            alpha=alpha,
+        )
+        return estimate.value - benchmark - critical * estimate.standard_error > 0.0
+
+    if not separated(0.0):
+        return 0.0
+    if separated(upper):
+        return None
+    low, high = 0.0, upper
+    for _ in range(14):
+        middle = (low + high) / 2.0
+        if separated(middle):
+            low = middle
+        else:
+            high = middle
+    return high
+
+
 def _trajectory_aggregates(policy, holdout: list[CohortTrajectory], propensity=None):
     """Per-trajectory partial sums for the Hajek value and the behaviour mean.
 

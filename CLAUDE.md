@@ -8,7 +8,7 @@ test fixture, not evidence.
 ## Commands
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests    # 466 tests, ~6 min
+PYTHONPATH=src python3 -m unittest discover -s tests    # 473 tests, ~6 min
 PYTHONPATH=src python3 -m treatmentrx.cli demo          # one patient end to end
 PYTHONPATH=src python3 -m treatmentrx.cli evaluate      # estimator scorecard
 PYTHONPATH=src python3 -m treatmentrx.cli stability     # k-fold + seed sweep (~10s)
@@ -762,6 +762,60 @@ produced a real clinical divergence, and the notes below are the scar tissue.
    augmenting model to be Q^d — but costs efficiency and shifts the estimator's
    weight onto the propensity model. `augmentation_model` names which was used.
    dWOLS's own `raw_q` is a single-visit outcome and must never be passed here.
+
+44. **"Identified under the outcome model" is a caveat until someone prices it.**
+   Invariant 43 ends by saying the doubly-robust estimate leans on the Q-model
+   and that the inverse-weighted check has no power to falsify it. That is true
+   and it is not enough: a reader cannot act on it. `sequential_dr_sensitivity`
+   turns it into a number by asking how wrong the model would have to be.
+
+   Misspecification is parameterised the way the rest of this repo already bends
+   an estimand — every estimated blip scaled by `1 + gamma`, treatment-free
+   surface untouched — and the **regime under evaluation is held fixed**, so this
+   measures error in the value estimate rather than quietly scoring a different
+   policy. `cli evaluate` reports it under `outcome_model_sensitivity`.
+
+   Measured on the deployed holdout, against a behaviour policy worth **1.9056**
+   on the same value-to-go scale:
+
+   | gamma | DR value | gain over behaviour | separated |
+   | --- | --- | --- | --- |
+   | +0.00 | 2.2742 | +0.3686 | yes |
+   | +0.25 | 2.1951 | +0.2895 | yes |
+   | +0.40 | 2.1476 | +0.2420 | yes |
+   | **+0.434** | — | — | **tipping point** |
+   | +0.50 | 2.1159 | +0.2103 | no |
+   | +1.00 | 1.9575 | +0.0519 | no |
+
+   **The claim survives the model over-stating every treatment effect by 43%.**
+   The tipping point is bisected rather than read off that grid, so adding a row
+   for legibility cannot move it.
+
+   **Where it lands is the point.** A 50% proportional blip error is the same
+   magnitude as the estimand shift `cli transfer` applies in its 1.5x row — the
+   row where calibration rises to 0.051 against 0.002-0.006 everywhere else
+   *while policy value gets better*. So the misspecification that would overturn
+   this claim is one the deployment monitor already detects, and it detects it
+   through calibration rather than value. That is the same finding as the
+   estimand-shift row, arrived at from the other end, and it is the argument for
+   why calibration is the monitor to watch.
+
+   Two caveats on that comparison, and neither is small. The transfer row shifts
+   the *truth* while the model stays put; gamma shifts the *model* while the
+   truth stays put. Both are a 1.5x mismatch and calibration reads the gap either
+   way, but the direction is not identical and the magnitudes need not match.
+   And the benchmark is a simulation rollout, like every other oracle here —
+   `training.behaviour_uncensored_value()`, on the value-to-go scale, because
+   `PolicyScore.behaviour_value` is the per-decision mean and comparing the DR
+   estimate against *that* would be invariant 14 with a fresh pair of quantities.
+   The ratio between them, 2.83, is a horizon and not an improvement.
+
+   A second reading comes almost free: the standard error is minimised **near**
+   gamma = 0 (0.067 against 0.15 at either end), so a badly wrong Q-model costs
+   the augmentation precision as well as centre. *Near*, not at — the minimum is
+   exactly at 0 only when the augmenting model is the evaluated policy's own, and
+   for the deployed pairing it sits at +0.1. That is invariant 43's borrowing
+   cost showing up in a second place.
 
 ## What is real vs. still a placeholder
 

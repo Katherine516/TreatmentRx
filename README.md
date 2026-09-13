@@ -550,6 +550,40 @@ model-based estimate wearing a robustness label. So the validation ladder's
 blocker now reads "not identified *without leaning on the outcome model*" and
 names the DR value alongside, instead of reporting only what is unknown.
 
+#### How wrong would the outcome model have to be?
+
+A caveat a reader cannot act on is half a finding. `cli evaluate` reports
+`outcome_model_sensitivity`: scale every estimated blip by `1 + γ`, leave the
+treatment-free surface alone, hold the evaluated regime **fixed**, and ask when
+the claimed advantage over the behaviour policy stops excluding zero.
+
+| γ | DR value | gain over behaviour | separated? |
+| --- | --- | --- | --- |
+| +0.00 | 2.2742 | +0.3686 | yes |
+| +0.25 | 2.1951 | +0.2895 | yes |
+| +0.40 | 2.1476 | +0.2420 | yes |
+| **+0.434** | — | — | **tipping point** |
+| +0.50 | 2.1159 | +0.2103 | no |
+| +1.00 | 1.9575 | +0.0519 | no |
+
+**The claim survives the model over-stating every treatment effect by 43%.** The
+tipping point is bisected, not read off that grid, so adding a row for legibility
+cannot move it.
+
+**Where it lands is the point.** A 50% proportional blip error is the same
+magnitude as the estimand shift in the transfer table's 1.5× row — the row where
+calibration rises to 0.051 against 0.002–0.006 everywhere else *while policy
+value gets better*. The misspecification that would overturn this claim is one
+the deployment monitor already detects, and it detects it through calibration
+rather than value. That is the estimand-shift finding arrived at from the other
+end, and it is the argument for which monitor to watch.
+
+Two caveats. The transfer row shifts the *truth* while the model stays put; γ
+shifts the *model* while the truth stays put — both a 1.5× mismatch, but not the
+same direction. And the benchmark (1.9056) is a simulation rollout on the
+value-to-go scale; the per-decision behaviour value (0.674) is a different
+quantity, and the 2.83 between them is a horizon, not an improvement.
+
 **Every IPW number carries its weights.** `WeightDiagnostics` reports the maximum
 weight, the mean, the share of mass in the heaviest row, and the share of rows
 pinned to the propensity floor. A value of 0.74 at ESS 75 looks the same whether

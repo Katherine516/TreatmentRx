@@ -232,6 +232,11 @@ def _evaluation_report() -> dict[str, Any]:
             "myopic_oracle": rollout_value(myopic_optimal_policy),
         },
         "estimators": training.scorecard(include_oracle=True),
+        # How wrong the outcome model would have to be to overturn the regime's
+        # claimed advantage. The doubly-robust estimate leans on that model and
+        # the inverse-weighted estimate that could falsify it has an effective
+        # sample of 14.6, so the caveat needs a number rather than a sentence.
+        "outcome_model_sensitivity": training.dr_sensitivity(),
         "propensity": training.propensity_comparison(),
         "selection": {
             "ranking_resolved": training.ranking_is_resolved(),
