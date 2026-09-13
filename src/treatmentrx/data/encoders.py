@@ -66,11 +66,18 @@ class GRUBaselineEncoder:
     preserves the planned `z_t` interface so the statistical layer can be tested
     before PyTorch pretraining is introduced.
 
-    Only the first 32 entries — the handcrafted prefix — are read by anything
-    today: the out-of-distribution score in `decision/uncertainty.py` slices
-    `vector[:32]`. The recurrent tail exists to hold the interface's shape, not
-    because a consumer uses it, and that is worth knowing before anyone reads
-    meaning into its contents.
+    **Nothing reads the vector.** It had one consumer — the out-of-distribution
+    score sliced `vector[:32]` and added `max(rms - 0.85, 0)` — and that term
+    could not fire: the handcrafted prefix is nine features normalised into
+    [0, 1] and tiled, so its root-mean-square is bounded well below the
+    threshold by construction, and over 121 patients it ran 0.374 to 0.664. The
+    term contributed zero to every score ever produced and has been removed.
+
+    What survives is the *shape* of the planned `z_t` interface and the
+    `feature_map`, which the audit event reports. Read the vector as a
+    placeholder holding a seat, not as a state representation: it is a fixed
+    function of nine clinical features, and its 224-entry recurrent tail
+    collapses to `_BIAS_PERIOD` distinct values per patient by construction.
     """
 
     encoder_name = "gru-compatible-baseline"

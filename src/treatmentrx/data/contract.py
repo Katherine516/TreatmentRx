@@ -2,7 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from treatmentrx.arms import MANUAL_REVIEW, TREATMENT_ARMS, normalize_arm
+from treatmentrx.arms import (
+    MANUAL_REVIEW,
+    TREATMENT_ARMS,
+    is_concomitant,
+    is_current_decision,
+    normalize_arm,
+)
+from treatmentrx.data import units
 from treatmentrx.domain import DataContractIssue, DataContractReport, PatientRecord
 
 
@@ -40,7 +47,8 @@ class RAStudyConfig:
     """Active RA study definition used before training or inference."""
 
     primary_endpoint: str = "DAS28_response"
-    minimum_treatment_events: int = 1
+    # One completed treatment line plus the explicit open decision marker.
+    minimum_treatment_events: int = 2
     minimum_encounters: int = 2
     required_variable_families: tuple[str, ...] = (
         "disease_activity",
@@ -67,6 +75,10 @@ class RADataContract:
 
     def validate(self, patient: PatientRecord) -> DataContractReport:
         issues: list[DataContractIssue] = []
+        line_events = [
+            medication for medication in patient.medications
+            if not is_concomitant(medication.name)
+        ]
 
         if "rheumatoid" not in patient.disease.lower():
             issues.append(
@@ -77,12 +89,50 @@ class RADataContract:
                 )
             )
 
-        if len(patient.medications) < self.config.minimum_treatment_events:
+        if len(line_events) < self.config.minimum_treatment_events:
             issues.append(
                 DataContractIssue(
                     field="medications",
                     severity="error",
-                    message="At least one treatment event is required for stage construction.",
+                    message=(
+                        "At least one completed treatment-line event plus an open current "
+                        "decision-point event are required."
+                    ),
+                )
+            )
+        if line_events and not is_current_decision(line_events[-1].name):
+            issues.append(
+                DataContractIssue(
+                    field="medications.current_decision",
+                    severity="error",
+                    message=(
+                        "The final treatment-line event must explicitly mark the current "
+                        "decision point; otherwise the agent cannot know which visit it is "
+                        "being asked to score."
+                    ),
+                )
+            )
+        elif line_events and line_events[-1].stop_day is not None:
+            issues.append(
+                DataContractIssue(
+                    field="medications.current_decision.stop_day",
+                    severity="error",
+                    message="The current decision-point event must be open (no stopDay).",
+                )
+            )
+        elif (
+            line_events
+            and line_events[-1].response
+            and "unknown" not in line_events[-1].response.lower()
+        ):
+            issues.append(
+                DataContractIssue(
+                    field="medications.current_decision.response",
+                    severity="error",
+                    message=(
+                        "The open current decision point cannot carry a known response; "
+                        "that outcome has not occurred yet."
+                    ),
                 )
             )
 
@@ -105,6 +155,10 @@ class RADataContract:
                 )
             )
 
+        # Units first: a range check on a value in the wrong unit is a range
+        # check on the wrong number, and the conversion has already happened by
+        # the time the record reaches here.
+        issues.extend(self._unit_issues(patient))
         issues.extend(self._implausible_values(patient))
         issues.extend(self._unusable_values(patient))
 
@@ -139,6 +193,41 @@ class RADataContract:
 
     def normalize_treatment_arm(self, medication_name: str) -> str:
         return normalize_arm(medication_name)
+
+    def _unit_issues(self, patient: PatientRecord) -> list[DataContractIssue]:
+        """Report what was done with each reported unit.
+
+        `data/units.py` converts recognised equivalents in the adapter; this is
+        where the record says so. An incompatible unit — an ALT in mg/dL — is an
+        error for the same reason an impossible value is: the number is not the
+        quantity it claims to be, and modelling it anyway moves the
+        recommendation with nothing on the face of it to show that.
+
+        An unrecognised or absent unit is a *warning*, not an error. The value is
+        modelled as canonical, which is the only thing that can be done with an
+        unlabelled number, and the warning is the difference between a documented
+        assumption and a silent one.
+        """
+        issues = []
+        for observation in patient.observations:
+            code = self._normalise(observation.code)
+            result = units.check(code, observation.unit)
+            if result is None or result.status == "canonical":
+                continue
+            severity = {
+                "incompatible": "error",
+                "unrecognised": "warning",
+                "absent": "warning",
+                "converted": "info",
+            }[result.status]
+            issues.append(
+                DataContractIssue(
+                    field=f"observations.{code}.unit",
+                    severity=severity,
+                    message=result.message,
+                )
+            )
+        return issues
 
     def _implausible_values(self, patient: PatientRecord) -> list[DataContractIssue]:
         """Range-check the clinical values the estimators condition on."""

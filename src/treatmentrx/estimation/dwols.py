@@ -29,7 +29,7 @@ from treatmentrx.estimation.basis import (
     blip_basis,
     treatment_free_basis,
 )
-from treatmentrx.estimation.features import model_features
+from treatmentrx.estimation.features import model_features, top_tailoring_variables
 from treatmentrx.estimation.inference import (
     DEFAULT_ALPHA,
     Z_QUANTILE,
@@ -44,7 +44,7 @@ from treatmentrx.simulation.ra_cohort import (
     clamp,
 )
 from treatmentrx.contracts import RegimeEstimate
-from treatmentrx.domain import RegimeAssignment, RegimeType, StageRecord
+from treatmentrx.domain import RegimeType, StageRecord
 
 DEFAULT_TREATMENT_MENU = TREATMENT_ARMS
 DWOLS_METHOD = "dWOLS-Shared"
@@ -106,14 +106,26 @@ class ArmFit:
         n_features = len(beta)
         sparse = [[(i, value) for i, value in enumerate(row) if value != 0.0] for row in design]
         residuals = [y - linalg.dot(row, beta) for row, y in zip(design, targets)]
+        normal = linalg.sparse_normal_matrix(sparse, weights, n_features, _RIDGE)
         self.covariance = sandwich_covariance(
-            sparse,
-            residuals,
-            weights,
-            self.clusters,
-            linalg.sparse_normal_matrix(sparse, weights, n_features, _RIDGE),
-            n_features,
+            sparse, residuals, weights, self.clusters, normal, n_features
         )
+
+        # Kept for the *cross*-arm covariance. Each arm is fit one-vs-reference,
+        # so two arms share every reference-arm row and their estimates are
+        # correlated — measured at +0.20 to +0.51 on this cohort. A contrast that
+        # adds their variances as if independent is therefore too wide by 15-29%,
+        # which is pure lost precision: it buys no validity and it feeds straight
+        # into the abstention rate. `cross_covariance` needs the bread and the
+        # per-cluster scores, and recomputing them later would mean refitting.
+        self._bread = linalg.inverse(normal)
+        self._scores: dict[int, list[float]] = {}
+        distinct = len(set(self.clusters))
+        self._cluster_scale = distinct / max(distinct - 1, 1)
+        for row, residual, weight, cluster in zip(sparse, residuals, weights, self.clusters):
+            score = self._scores.setdefault(cluster, [0.0] * n_features)
+            for index, value in row:
+                score[index] += weight * value * residual
 
     def blip_standard_error(self, features: dict[str, float]) -> float:
         if not self.covariance:
@@ -123,6 +135,50 @@ class ArmFit:
         for offset, value in enumerate(blip_basis(features)):
             loading[n_free + offset] = value
         return math.sqrt(max(linalg.quadratic_form(loading, self.covariance), 0.0))
+
+    def cross_covariance(self, other: "ArmFit") -> list[list[float]]:
+        """Cov(beta_self, beta_other) for two one-vs-reference fits.
+
+        The usual M-estimator sandwich with a cross meat term:
+
+            Cov = A_self^-1 . (sum_i s_self,i s_other,i') . A_other^-1'
+
+        summed over clusters present in *both* fits. A patient who received only
+        one of the two arms has a zero score in the other fit and contributes
+        nothing, so the whole cross term comes from the reference-arm rows the
+        two fits share — which is exactly the mechanism that correlates them.
+        """
+        if not self._scores or not other._scores:
+            return []
+        size = len(self._bread)
+        shared = self._scores.keys() & other._scores.keys()
+        if not shared:
+            return [[0.0] * size for _ in range(size)]
+
+        meat = [[0.0] * size for _ in range(size)]
+        for cluster in shared:
+            mine = self._scores[cluster]
+            theirs = other._scores[cluster]
+            active_mine = [(i, v) for i, v in enumerate(mine) if v != 0.0]
+            active_theirs = [(j, v) for j, v in enumerate(theirs) if v != 0.0]
+            for i, vi in active_mine:
+                row = meat[i]
+                for j, vj in active_theirs:
+                    row[j] += vi * vj
+
+        # `sandwich_covariance` scales by G/(G-1) — without that small-cluster
+        # correction the sandwich is anti-conservative — so the cross term has to
+        # carry a matching one or it will not reduce to the variance when the two
+        # fits are the same. The geometric mean of the two corrections is the
+        # symmetric rule that does: it equals G/(G-1) exactly when `other is
+        # self`, which is what makes Var(x - x) come out at zero rather than at a
+        # small positive residual.
+        scale = math.sqrt(self._cluster_scale * other._cluster_scale)
+
+        # A_self^-1 . meat . A_other^-1', with A symmetric so the transpose is free.
+        left = linalg.matmul(self._bread, meat)
+        product = linalg.matmul(left, other._bread)
+        return [[value * scale for value in row] for row in product]
 
     def treatment_free_value(self, features: dict[str, float]) -> float:
         return linalg.dot(self.treatment_free, treatment_free_basis(features))
@@ -194,6 +250,49 @@ class DWOLSModel:
     def blip_standard_error(self, arm: str, features: dict[str, float]) -> float:
         fit = self.fits.get(arm)
         return fit.blip_standard_error(features) if fit else 0.0
+
+    def contrast_standard_error(
+        self, arm: str, comparator: str, features: dict[str, float]
+    ) -> float:
+        """SE of `blip(arm) - blip(comparator)`, with the covariance kept.
+
+            Var(a - b) = Var(a) + Var(b) - 2 Cov(a, b)
+
+        The third term is not optional here. Both arms are fit against the same
+        reference, so they share its rows and move together: measured over 60
+        refits the correlation runs +0.20 to +0.51, and dropping it left the
+        contrast 15-29% too wide. Widening an interval for a covariance that is
+        positive and known is the same class of error as widening one for a
+        correction already paid (invariant 21) — it costs decisiveness and buys
+        nothing.
+
+        The reference arm is its own comparator: it has no `ArmFit`, its blip is
+        identically zero, and the contrast reduces to the other arm's own SE.
+        """
+        mine, theirs = self.fits.get(arm), self.fits.get(comparator)
+        if mine is None or theirs is None:
+            present = mine or theirs
+            return present.blip_standard_error(features) if present else 0.0
+
+        variance = (
+            mine.blip_standard_error(features) ** 2
+            + theirs.blip_standard_error(features) ** 2
+        )
+        cross = mine.cross_covariance(theirs)
+        if cross:
+            n_free = len(TREATMENT_FREE_BASIS)
+            loading = [0.0] * len(cross)
+            for offset, value in enumerate(blip_basis(features)):
+                loading[n_free + offset] = value
+            covariance = sum(
+                loading[i] * cross[i][j] * loading[j]
+                for i in range(len(loading))
+                if loading[i]
+                for j in range(len(loading))
+                if loading[j]
+            )
+            variance -= 2.0 * covariance
+        return math.sqrt(max(variance, 0.0))
 
     # --------------------------------------------------- joint-bootstrap support
     #
@@ -270,17 +369,27 @@ class DWOLSModel:
         return summary
 
 
-_MODEL: DWOLSModel | None = None
-
-
 def fitted_model() -> DWOLSModel:
-    """Lazily fit once per process; deterministic given the seeded cohort."""
-    global _MODEL
-    if _MODEL is None:
-        from treatmentrx.estimation.training import training_cohort
+    """The fitted dWOLS model — owned by `training`, not cached here.
 
-        _MODEL = DWOLSModel(training_cohort())
-    return _MODEL
+    This used to keep its own `_MODEL` global, fit from `training_cohort()`. The
+    result was two dWOLS objects: `training.fitted().dwols`, which is scored,
+    joint-bootstrapped and measured by every study in `feedback/`, and this one,
+    which is what actually served patients. They agreed only because both were
+    fit on the same default cohort.
+
+    `training.reset()` cleared the first and not the second, so after changing a
+    training constant the serving estimator silently kept the *old* fit. It cost
+    a duplicated fit on every cold start, and it hid a sample-size effect: with
+    the Q-learning half refitting and the dWOLS half frozen, the averaged
+    contrast's standard error appeared to shrink at n^-0.15 instead of n^-0.39.
+
+    Invariant 7 says every estimator is fit through `training.py`. This is that,
+    enforced by having nowhere else to keep a model.
+    """
+    from treatmentrx.estimation.training import fitted
+
+    return fitted().dwols
 
 
 class DWOLSSharedEstimator:
@@ -291,8 +400,6 @@ class DWOLSSharedEstimator:
     def fit_predict(
         self,
         stages: list[StageRecord],
-        assignment: RegimeAssignment,
-        tailoring_variables: list[str],
         treatment_menu: tuple[str, ...] = DEFAULT_TREATMENT_MENU,
     ) -> RegimeEstimate:
         from treatmentrx.estimation.training import policy_value_for
@@ -313,7 +420,9 @@ class DWOLSSharedEstimator:
             policy_value=policy_value_for(self.method_name),
             confidence_band=(round(max(best - half_width, 0.0), 3), round(min(best + half_width, 1.0), 3)),
             coefficients=model.coefficient_summary(recommended),
-            top_tailoring_variables=_format_tailoring_vars(stages[-1], tailoring_variables),
+            top_tailoring_variables=top_tailoring_variables(
+                model.blip_parameters(recommended), features
+            ),
         )
 
     def contrast(
@@ -325,19 +434,18 @@ class DWOLSSharedEstimator:
     ) -> ContrastTest:
         """Difference of two one-vs-reference blips.
 
-        The arms are fit on separate (overlapping) subsets, so their covariance
-        is not available and the variances are added as if independent. That
-        overstates the standard error whenever the fits share reference
-        patients — conservative in the direction that matters for a safety
-        decision.
+        The arms are fit on separate but *overlapping* subsets — both against the
+        same reference — so their covariance is real and is now computed rather
+        than dropped. Adding the variances as if independent left this 24% wider
+        than the estimator's actual spread across refits; with the cross term it
+        sits at 0.95 of it. Conservatism bought by ignoring a known positive
+        covariance is not a safety margin, it is lost precision, and here it fed
+        straight into the abstention rate.
         """
         model = fitted_model()
         features = model_features(stages)
         difference = model.blip(arm, features) - model.blip(comparator, features)
-        variance = sum(
-            model.blip_standard_error(candidate, features) ** 2 for candidate in (arm, comparator)
-        )
-        standard_error = math.sqrt(variance)
+        standard_error = model.contrast_standard_error(arm, comparator, features)
         margin = Z_QUANTILE.get(alpha, Z_QUANTILE[DEFAULT_ALPHA]) * standard_error
         return ContrastTest(
             arm=arm,
@@ -347,17 +455,8 @@ class DWOLSSharedEstimator:
             lower=difference - margin,
             upper=difference + margin,
             alpha=alpha,
-            caveat="Arm variances added as if independent; conservative where the fits overlap.",
+            caveat="",
         )
-
-
-def _format_tailoring_vars(stage: StageRecord, variables: list[str]) -> list[str]:
-    formatted = []
-    for variable in variables:
-        value = stage.features.get(variable)
-        if value is not None:
-            formatted.append(f"{variable}={value}")
-    return formatted[:5]
 
 
 __all__ = [

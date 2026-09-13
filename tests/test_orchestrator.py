@@ -26,7 +26,7 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(audit["calibration"]["measured_on"], "held-out cohort")
         self.assertIn("estimator_scorecard", audit)
         self.assertIn("competing_risk_incidence", audit)
-        self.assertIn("iptw_policy_value", audit["ope"])
+        self.assertIn("observed_mean_outcome", audit["ope"])
         self.assertIsNotNone(recommendation.explanation)
         self.assertIsNotNone(recommendation.validation)
         self.assertEqual(

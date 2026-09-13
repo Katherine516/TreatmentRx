@@ -2,8 +2,23 @@
 
 Estimators optimize a clinically relevant cause (e.g. progression-free
 survival), with death/dropout handled as competing events rather than folded
-into a single survival time. This adjusts a fitted RegimeEstimate so its policy
-value reflects the competing-event landscape on the trajectory.
+into a single survival time. This annotates a fitted `RegimeEstimate` with how
+much of *this patient's* trajectory was consumed by events that cap what any
+treatment can deliver.
+
+**It no longer multiplies the policy value.** It used to return
+``policy_value * (1 - penalty)``, where `policy_value` is the estimator's
+held-out IPW score over the whole cohort and `penalty` comes from one patient's
+own competing-risk incidence. That is a population number scaled by an individual
+one — the exact operation invariant 14 exists to forbid, and the resulting figure
+answered no question: not "how good is this policy" (it had been discounted by a
+patient it never saw) and not "how did this patient do" (it started from a
+cohort-level score). It then travelled into the memory-guarded
+`statistical_output`, the audit event, and `SwitchingAwareOPE.model_policy_value`,
+where it was labelled as the estimator's held-out score.
+
+The penalty is still computed and still reported. It is a patient-level
+annotation, in `coefficients`, next to the other patient-level context.
 """
 
 from __future__ import annotations
@@ -14,26 +29,38 @@ from treatmentrx.contracts import RegimeEstimate
 from treatmentrx.domain import ClinicalEventType, StageRecord
 
 
-# Causes that erode the value of the *recommended* regime if they dominate the
-# observed trajectory (you cannot benefit a patient who died or dropped out).
+# Causes that cap what any treatment can deliver for this patient, if they
+# dominate the observed trajectory. Weights are clinical judgement, not fitted —
+# which is another reason they must not touch a measured quantity.
 COMPETING_PENALTY = {
     ClinicalEventType.DEATH.value: 0.5,
     ClinicalEventType.DROPOUT.value: 0.25,
     ClinicalEventType.SERIOUS_TOXICITY.value: 0.2,
 }
+PENALTY_CEILING = 0.9
 
 
 class CompetingRiskEndpoint:
-    """Re-weights policy value against the progression-free cause."""
+    """Annotates the estimate with this patient's competing-event burden."""
 
-    def adjust(self, result: RegimeEstimate, stages: list[StageRecord], incidence: dict[str, float]) -> RegimeEstimate:
-        penalty = sum(
-            COMPETING_PENALTY.get(cause, 0.0) * fraction
-            for cause, fraction in incidence.items()
+    def adjust(
+        self,
+        result: RegimeEstimate,
+        stages: list[StageRecord],
+        incidence: dict[str, float],
+    ) -> RegimeEstimate:
+        penalty = min(
+            sum(
+                COMPETING_PENALTY.get(cause, 0.0) * fraction
+                for cause, fraction in incidence.items()
+            ),
+            PENALTY_CEILING,
         )
-        adjusted_value = round(max(result.policy_value * (1.0 - min(penalty, 0.9)), 0.0), 3)
-        coefficients = result.coefficients | {
-            "competing_risk_penalty": round(min(penalty, 0.9), 4),
-            "endpoint": "progression_free",
-        }
-        return replace(result, policy_value=adjusted_value, coefficients=coefficients)
+        return replace(
+            result,
+            coefficients=result.coefficients
+            | {
+                "competing_risk_penalty": round(penalty, 4),
+                "endpoint": "progression_free",
+            },
+        )

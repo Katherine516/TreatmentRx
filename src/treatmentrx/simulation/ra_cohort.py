@@ -169,12 +169,54 @@ def blip_basis(features: dict[str, float]) -> list[float]:
     return [1.0, das28_std(features["das28"]), features["anti_ccp"], features["prior_tnf"]]
 
 
-def true_blip(arm: str, features: dict[str, float]) -> float:
-    """tau_a(X): the causal advantage of `arm` over the reference arm."""
+# How strongly the true treatment effect varies over a covariate the estimators'
+# blip basis does not contain. `curvature` bends the *nuisance* surface, which
+# double robustness is supposed to survive; this bends the **estimand**, which
+# nothing survives — it is the failure mode a real deployment actually has, since
+# the true effect modifiers will not be exactly `anti_ccp` and `prior_tnf`.
+#
+# CRP is the natural choice: it is measured, it is in the treatment-free basis,
+# and it is deliberately *not* in `BLIP_BASIS`. So an estimator can adjust for it
+# as a confounder and still be unable to represent it as an effect modifier.
+DEFAULT_BLIP_MODIFIER = 0.0
+
+# Per-arm sensitivity to the omitted modifier. Signed, so it is not a uniform
+# shift the intercept could absorb: the inflammatory arms benefit more in high
+# CRP, the csDMARD less.
+_OMITTED_MODIFIER_WEIGHT = {
+    "methotrexate-optimization": -1.0,
+    "TNF-inhibitor": 0.4,
+    "IL-6 inhibitor": 1.0,
+    "JAK-inhibitor": 0.5,
+    "rituximab": -0.3,
+}
+
+
+def true_blip(
+    arm: str,
+    features: dict[str, float],
+    blip_modifier: float = DEFAULT_BLIP_MODIFIER,
+) -> float:
+    """tau_a(X): the causal advantage of `arm` over the reference arm.
+
+    With `blip_modifier` non-zero the effect also varies over standardised CRP,
+    which `blip_basis` does not carry — so no amount of data lets the estimators
+    recover it, and the contrast they report is the CRP-averaged one. That is a
+    bias in the estimand rather than in the nuisance model, and it is what
+    `feedback/misspecification.omitted_modifier_report` measures.
+    """
     psi = TRUE_BLIPS.get(arm)
     if psi is None:
         return 0.0
-    return sum(p * b for p, b in zip(psi, blip_basis(features)))
+    value = sum(p * b for p, b in zip(psi, blip_basis(features)))
+    if blip_modifier:
+        value += (
+            blip_modifier
+            * _OMITTED_MODIFIER_WEIGHT.get(arm, 0.0)
+            * (features["crp"] - 30.0)
+            / 25.0
+        )
+    return value
 
 
 def treatment_free_value(features: dict[str, float], curvature: float = DEFAULT_CURVATURE) -> float:
@@ -199,21 +241,148 @@ def treatment_free_value(features: dict[str, float], curvature: float = DEFAULT_
     )
 
 
-def expected_outcome(features: dict[str, float], arm: str) -> float:
+def expected_outcome(
+    features: dict[str, float],
+    arm: str,
+    curvature: float = DEFAULT_CURVATURE,
+    blip_modifier: float = DEFAULT_BLIP_MODIFIER,
+) -> float:
     """E[Y | X, A] — noise-free, used by the oracle policy evaluator."""
-    return clamp(treatment_free_value(features) + true_blip(arm, features), 0.0, 1.0)
+    return clamp(
+        treatment_free_value(features, curvature) + true_blip(arm, features, blip_modifier),
+        0.0,
+        1.0,
+    )
 
 
 def optimal_arm(features: dict[str, float]) -> str:
-    """The myopically optimal arm for these covariates (ignores delayed cost)."""
+    """The myopically optimal arm for these covariates (ignores delayed cost).
+
+    This is *not* the optimal policy for the sequential problem and must not be
+    used as an oracle for one — it over-prescribes the hepatotoxic arms whose
+    cost lands at the next stage, and it ignores that the burdensome arms lose
+    patients to dropout. `oracle_arm` is the backward-induction optimum; measured
+    over 4000 rollouts this myopic rule scores below every fitted estimator's
+    policy, so scoring the agent's regret against it rewards the wrong behaviour.
+    """
     return max(TREATMENT_ARMS, key=lambda arm: true_blip(arm, features))
 
 
-def assignment_probabilities(features: dict[str, float]) -> dict[str, float]:
+def oracle_action_value(
+    features: dict[str, float],
+    arm: str,
+    stage_index: int = 0,
+    stages: int = DEFAULT_STAGES,
+) -> float:
+    """True value-to-go of taking `arm` now and playing optimally afterwards.
+
+    Backward induction over the *generating process*, with the transition taken
+    at its conditional mean rather than integrated by Monte Carlo. The recursion
+    mirrors `rollout_value`: reward accrues only while the patient is still in
+    care, so the continuation is weighted by the probability they return. A
+    policy that drives toxicity or burden is charged for the visits it costs,
+    which is the whole reason the myopic blip argmax is not the oracle.
+
+    **It is a near-optimal reference, not a proven upper bound.** Certainty
+    equivalence moves the `max` inside the expectation, so the value it computes
+    sits below the true optimum by a Jensen gap. Measured over eight seeds at
+    n=3000 rollouts each:
+
+        oracle (this function)  2.1570      myopic blip argmax  2.1367
+        Q-Shared + Penalized    2.1553      dWOLS-Shared        2.1319
+
+    It clears the myopic rule by +0.0203 on every seed, which is what makes it a
+    usable regret reference. It clears the fitted Q-Shared policy by only +0.0016
+    against a paired standard deviation of 0.0040 — that policy is at the
+    certainty-equivalent optimum to within the noise, and on individual seeds it
+    can come out ahead. Read a small negative regret as "indistinguishable from
+    optimal", not as a bug.
+    """
+    outcome = expected_outcome(features, arm)
+    if stage_index >= stages - 1:
+        return outcome
+    survival = 1.0 - dropout_probability(features, outcome, arm)
+    following = transition(features, arm, outcome)
+    return outcome + survival * oracle_value(following, stage_index + 1, stages)
+
+
+def oracle_value(
+    features: dict[str, float], stage_index: int = 0, stages: int = DEFAULT_STAGES
+) -> float:
+    """V*(X, j) under the generating process."""
+    return max(
+        oracle_action_value(features, arm, stage_index, stages) for arm in TREATMENT_ARMS
+    )
+
+
+def oracle_arm(
+    features: dict[str, float], stage_index: int = 0, stages: int = DEFAULT_STAGES
+) -> str:
+    """The sequentially optimal arm: the one the agent's regret is measured against."""
+    return max(
+        TREATMENT_ARMS,
+        key=lambda arm: oracle_action_value(features, arm, stage_index, stages),
+    )
+
+
+def oracle_policy(stages: int = DEFAULT_STAGES):
+    """`policy(features, stage_index) -> arm` for the backward-induction optimum."""
+
+    def policy(features: dict[str, float], stage_index: int) -> str:
+        return oracle_arm(features, stage_index, stages)
+
+    return policy
+
+
+@dataclass(frozen=True)
+class CohortShift:
+    """A structurally different site, with the *same* treatment effects.
+
+    The estimand is deliberately untouched: `TRUE_BLIPS` is the same function of
+    the same covariates, and it stays representable in `BLIP_BASIS`. What differs
+    is everything around it — who walks through the door, how clinicians
+    prescribe, and who stops coming back. That separation is the point. Bending
+    the estimand is already measured by `blip_modifier`, and nothing survives it;
+    the open question is whether a pipeline that is *correctly specified* still
+    works when the population and the practice change, which is the shift a real
+    deployment actually meets.
+
+    `blip_scale` is the exception and is off by default: it multiplies every true
+    effect, so the parameters fitted at the training site are genuinely wrong at
+    the evaluation site. It exists to bound the other results, not to be mixed
+    with them.
+    """
+
+    name: str = "unshifted"
+    # Case mix — a different population walking through the door.
+    das28_range: tuple[float, float] = (3.0, 8.0)
+    crp_range: tuple[float, float] = (5.0, 60.0)
+    anti_ccp_rate: float = 0.6
+    prior_tnf_rate: float = 0.35
+    # Practice — clinicians here prefer different arms, by an additive tilt on
+    # each arm's assignment intercept.
+    assignment_tilt: tuple[tuple[str, float], ...] = ()
+    # Retention — more or less attrition, on the logit scale.
+    dropout_shift: float = 0.0
+    # The bound case. 1.0 leaves the estimand alone.
+    blip_scale: float = 1.0
+
+    @property
+    def shifts_the_estimand(self) -> bool:
+        return self.blip_scale != 1.0
+
+
+UNSHIFTED = CohortShift()
+
+
+def assignment_probabilities(
+    features: dict[str, float], shift: CohortShift | None = None
+) -> dict[str, float]:
     """The behaviour policy pi_b(a | X) that generated the observational data."""
     basis = blip_basis(features)
+    tilt = dict(shift.assignment_tilt) if shift is not None else {}
     scores = {
-        arm: sum(k * b for k, b in zip(kappa, basis))
+        arm: sum(k * b for k, b in zip(kappa, basis)) + tilt.get(arm, 0.0)
         for arm, kappa in _ASSIGNMENT_SCORE.items()
     }
     largest = max(scores.values())
@@ -222,33 +391,55 @@ def assignment_probabilities(features: dict[str, float]) -> dict[str, float]:
     return {arm: value / total for arm, value in exponentiated.items()}
 
 
-def sample_baseline_features(rng: random.Random) -> dict[str, float]:
+def sample_baseline_features(
+    rng: random.Random, shift: CohortShift | None = None
+) -> dict[str, float]:
+    """Baseline X. With `shift=None` the draw order and values are unchanged.
+
+    Determinism matters more than tidiness here: every seeded result in the repo
+    depends on this consuming exactly six numbers from `rng` in this order, so a
+    shift changes the *parameters* of each draw and never the sequence.
+    """
+    s = shift if shift is not None else UNSHIFTED
     return {
-        "das28": rng.uniform(3.0, 8.0),
-        "crp": rng.uniform(5.0, 60.0),
-        "anti_ccp": 1.0 if rng.random() < 0.6 else 0.0,
-        "prior_tnf": 1.0 if rng.random() < 0.35 else 0.0,
+        "das28": rng.uniform(*s.das28_range),
+        "crp": rng.uniform(*s.crp_range),
+        "anti_ccp": 1.0 if rng.random() < s.anti_ccp_rate else 0.0,
+        "prior_tnf": 1.0 if rng.random() < s.prior_tnf_rate else 0.0,
         "egfr": rng.uniform(45.0, 110.0),
         "alt": rng.uniform(12.0, 45.0),
     }
 
 
-def transition(features: dict[str, float], arm: str, outcome: float, rng: random.Random) -> dict[str, float]:
-    """X_{j+1} | X_j, A_j, Y_j — responders improve; hepatotoxic arms raise ALT."""
+def transition(
+    features: dict[str, float],
+    arm: str,
+    outcome: float,
+    rng: random.Random | None = None,
+) -> dict[str, float]:
+    """X_{j+1} | X_j, A_j, Y_j — responders improve; hepatotoxic arms raise ALT.
+
+    `rng=None` gives the noise-free (conditional-mean) transition, which is what
+    the oracle's backward induction integrates over. One definition of the
+    dynamics, used by both the generator and the oracle, so they cannot drift.
+    """
+    noise = (lambda sd: rng.gauss(0.0, sd)) if rng is not None else (lambda sd: 0.0)
     response = outcome - 0.5
     alt_shift = _ALT_RISE if arm in HEPATOTOXIC_ARMS else -_ALT_DECAY
     return {
-        "das28": clamp(features["das28"] - 3.0 * response + rng.gauss(0.0, 0.3), 1.5, 9.0),
-        "crp": clamp(features["crp"] - 30.0 * response + rng.gauss(0.0, 4.0), 2.0, 120.0),
+        "das28": clamp(features["das28"] - 3.0 * response + noise(0.3), 1.5, 9.0),
+        "crp": clamp(features["crp"] - 30.0 * response + noise(4.0), 2.0, 120.0),
         "anti_ccp": features["anti_ccp"],
         "prior_tnf": 1.0 if features["prior_tnf"] or arm == "TNF-inhibitor" else 0.0,
-        "egfr": clamp(features["egfr"] + rng.gauss(0.0, 2.0), 15.0, 130.0),
-        "alt": clamp(features["alt"] + alt_shift + rng.gauss(0.0, 3.0), 5.0, 200.0),
+        "egfr": clamp(features["egfr"] + noise(2.0), 15.0, 130.0),
+        "alt": clamp(features["alt"] + alt_shift + noise(3.0), 5.0, 200.0),
     }
 
 
-def _sample_arm(features: dict[str, float], rng: random.Random) -> tuple[str, float]:
-    probabilities = assignment_probabilities(features)
+def _sample_arm(
+    features: dict[str, float], rng: random.Random, shift: CohortShift | None = None
+) -> tuple[str, float]:
+    probabilities = assignment_probabilities(features, shift)
     draw = rng.random()
     cumulative = 0.0
     for arm, probability in probabilities.items():
@@ -265,6 +456,8 @@ def generate_ra_cohort(
     stages: int = DEFAULT_STAGES,
     dropout: bool = True,
     curvature: float = DEFAULT_CURVATURE,
+    blip_modifier: float = DEFAULT_BLIP_MODIFIER,
+    shift: CohortShift | None = None,
 ) -> list[CohortTrajectory]:
     """Generate `n` confounded multi-stage trajectories under the behaviour policy.
 
@@ -276,7 +469,7 @@ def generate_ra_cohort(
     rng = random.Random(seed)
     cohort: list[CohortTrajectory] = []
     for index in range(n):
-        features = sample_baseline_features(rng)
+        features = sample_baseline_features(rng, shift)
         trajectory: list[CohortStage] = []
         day = 0
         interval: int | None = None
@@ -285,15 +478,20 @@ def generate_ra_cohort(
         reason: str | None = None
 
         for stage in range(1, stages + 1):
-            arm, propensity = _sample_arm(features, rng)
+            arm, propensity = _sample_arm(features, rng, shift)
+            scale = shift.blip_scale if shift is not None else 1.0
             outcome = clamp(
                 treatment_free_value(features, curvature)
-                + true_blip(arm, features)
+                + scale * true_blip(arm, features, blip_modifier)
                 + rng.gauss(0.0, _OUTCOME_NOISE_SD),
                 0.0,
                 1.0,
             )
-            leaving = dropout and stage < stages and rng.random() < dropout_probability(features, outcome, arm)
+            leaving = (
+                dropout
+                and stage < stages
+                and rng.random() < dropout_probability(features, outcome, arm, shift)
+            )
             if leaving:
                 reason = dropout_reason(features, outcome)
             trajectory.append(
@@ -346,6 +544,7 @@ def rollout_value(
     seed: int = 101,
     stages: int = DEFAULT_STAGES,
     dropout: bool = True,
+    shift: CohortShift | None = None,
 ) -> float:
     """Oracle policy value: expected total reward under the generating process.
 
@@ -359,20 +558,23 @@ def rollout_value(
     accrued had they stayed.
     """
     rng = random.Random(seed)
+    scale = shift.blip_scale if shift is not None else 1.0
     total = 0.0
     for _ in range(n):
-        features = sample_baseline_features(rng)
+        features = sample_baseline_features(rng, shift)
         for stage_index in range(stages):
             arm = policy(features, stage_index)
             outcome = clamp(
-                treatment_free_value(features) + true_blip(arm, features) + rng.gauss(0.0, _OUTCOME_NOISE_SD),
+                treatment_free_value(features)
+                + scale * true_blip(arm, features)
+                + rng.gauss(0.0, _OUTCOME_NOISE_SD),
                 0.0,
                 1.0,
             )
             total += outcome
             if stage_index >= stages - 1:
                 break
-            if dropout and rng.random() < dropout_probability(features, outcome, arm):
+            if dropout and rng.random() < dropout_probability(features, outcome, arm, shift):
                 break
             features = transition(features, arm, outcome, rng)
     return round(total / n, 4)
@@ -405,7 +607,12 @@ def rollout_retention(
     return round(observed / n, 4)
 
 
-def dropout_probability(features: dict[str, float], outcome: float, arm: str = REFERENCE_ARM) -> float:
+def dropout_probability(
+    features: dict[str, float],
+    outcome: float,
+    arm: str = REFERENCE_ARM,
+    shift: CohortShift | None = None,
+) -> float:
     """P(patient leaves the study before the next decision point).
 
     Depends on toxicity, on response, and — for burdensome infusion arms — on
@@ -419,6 +626,7 @@ def dropout_probability(features: dict[str, float], outcome: float, arm: str = R
         + _DROPOUT_ALT * max(features["alt"] - 40.0, 0.0)
         + (_DROPOUT_RESPONSE + (_DROPOUT_BURDEN_RESPONSE if burden else 0.0)) * (outcome - 0.5)
         + (_DROPOUT_BURDEN if burden else 0.0)
+        + (shift.dropout_shift if shift is not None else 0.0)
     )
     return _logistic(logit)
 

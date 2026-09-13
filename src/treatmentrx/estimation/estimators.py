@@ -14,15 +14,20 @@ weights estimators by out-of-sample performance.
 from __future__ import annotations
 
 from treatmentrx.estimation import training
-from treatmentrx.estimation.features import model_features, stage_index
+from treatmentrx.estimation.features import (
+    model_features,
+    stage_index,
+    top_tailoring_variables,
+)
 from treatmentrx.estimation.q_learning import (
+    Q_POOLED_METHOD,
     Q_SHARED_METHOD,
     STAGE_SPECIFIC_METHOD,
     QLearningModel,
 )
 from treatmentrx.simulation.ra_cohort import TREATMENT_ARMS
 from treatmentrx.contracts import RegimeEstimate
-from treatmentrx.domain import RegimeAssignment, RegimeType, StageRecord
+from treatmentrx.domain import RegimeType, StageRecord
 from treatmentrx.estimation.inference import DEFAULT_ALPHA, ContrastTest
 
 DEFAULT_TREATMENT_MENU = TREATMENT_ARMS
@@ -43,8 +48,6 @@ class _QLearningEstimator:
     def fit_predict(
         self,
         stages: list[StageRecord],
-        assignment: RegimeAssignment,
-        tailoring_variables: list[str],
         treatment_menu: tuple[str, ...] = DEFAULT_TREATMENT_MENU,
     ) -> RegimeEstimate:
         model = self.model()
@@ -67,7 +70,9 @@ class _QLearningEstimator:
                 round(min(best + half_width, 1.0), 3),
             ),
             coefficients=model.coefficient_summary(recommended, index),
-            top_tailoring_variables=_format_tailoring_vars(stages[-1], tailoring_variables),
+            top_tailoring_variables=top_tailoring_variables(
+                model.blip_parameters(recommended, index), features
+            ),
         )
 
     def contrast(
@@ -103,13 +108,21 @@ class StageSpecificQEstimator(_QLearningEstimator):
         return training.fitted().stage_specific
 
 
-def _format_tailoring_vars(stage: StageRecord, variables: list[str]) -> list[str]:
-    formatted = []
-    for variable in variables:
-        value = stage.features.get(variable)
-        if value is not None:
-            formatted.append(f"{variable}={value}")
-    return formatted[:5]
+class PooledQEstimator(_QLearningEstimator):
+    """Partially pooled Q-learning — the serving Q-learning model.
+
+    A shared blip level plus penalized per-stage deviations, which is the same
+    axis `QSharedEstimator` and `StageSpecificQEstimator` sit at the ends of.
+    Both of those remain available as comparators; this is the one averaged into
+    a recommendation, because it is the only one that borrows strength across
+    stages without inheriting the shared fit's stage bias.
+    """
+
+    method_name = Q_POOLED_METHOD
+    regime_type = RegimeType.HYBRID
+
+    def model(self) -> QLearningModel:
+        return training.fitted().pooled
 
 
 # The doubly-robust dWOLS-Shared estimator lives in `dwols.py`; re-exported here
@@ -118,9 +131,17 @@ from treatmentrx.estimation.dwols import DWOLS_METHOD, DWOLSSharedEstimator  # n
 
 
 class PolicyValueSelector:
-    """Pick the most interpretable estimator among those within `tolerance`.
+    """Pick the most interpretable estimator among those it cannot separate.
 
     Used when a single named method is wanted instead of a model average.
+
+    The tolerance is no longer a hand-set 0.02. It comes from the held-out
+    bootstrap intervals in `training`: two estimators are contenders unless the
+    leader's interval clears the other's. A fixed tolerance answers "is the gap
+    smaller than a number I chose"; this answers "can the holdout tell these
+    apart", which is the question. Where an interval is unavailable the estimator
+    is treated as a contender, because an unmeasured difference is not a
+    demonstrated one.
     """
 
     interpretability_order = {
@@ -131,9 +152,18 @@ class PolicyValueSelector:
         "Survival Forest DTR": 4,
     }
 
-    def choose(self, results: list[RegimeEstimate], tolerance: float = 0.02) -> RegimeEstimate:
+    def choose(self, results: list[RegimeEstimate]) -> RegimeEstimate:
         if not results:
             raise ValueError("No method results to select from")
-        best_value = max(result.policy_value for result in results)
-        contenders = [result for result in results if best_value - result.policy_value <= tolerance]
-        return sorted(contenders, key=lambda result: self.interpretability_order.get(result.estimator, 99))[0]
+        ranked = sorted(results, key=lambda result: result.policy_value, reverse=True)
+        leader = training.score_for(ranked[0].estimator)
+        contenders = [
+            result
+            for result in ranked
+            if result is ranked[0]
+            or leader is None
+            or not leader.beats(training.score_for(result.estimator) or leader)
+        ]
+        return sorted(
+            contenders, key=lambda result: self.interpretability_order.get(result.estimator, 99)
+        )[0]

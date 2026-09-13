@@ -25,8 +25,14 @@ the first).
 **Penalization.** Ridge is applied to the blip block only. Treatment-free
 nuisance terms are left unpenalized, and the penalty is what makes the
 stage-specific variant (five times as many blip parameters, fit on the same
-rows) usable at all — which is exactly the shared-vs-stage-specific trade-off
-the regime selector is choosing between.
+rows) usable at all.
+
+**Three parameterisations, one axis.** `share_blip` picks the endpoints and
+`pooling_ridge` fills in between them: a shared level plus penalized per-stage
+deviations, which recovers the shared fit as the ridge grows and the
+stage-specific fit as it vanishes. `_blip_starts` is where that lives, and the
+serving model (`training.Q_POOLED`) sits in the interior because the interior
+measures better than either end.
 """
 
 from __future__ import annotations
@@ -60,6 +66,30 @@ from treatmentrx.simulation.ra_cohort import (
 # `training` at class-definition time just to know what it is called.
 Q_SHARED_METHOD = "Q-Shared + Penalized"
 STAGE_SPECIFIC_METHOD = "Stage-Specific Q-learning"
+Q_POOLED_METHOD = "Q-Pooled"
+
+# Shrinkage of the per-stage blip deviations toward the shared level. Chosen by
+# sweep, not by feel — five seeds at n=280, terminal-stage recovery against
+# `TRUE_BLIPS` and total blip error under a misspecified nuisance surface:
+#
+#   variant            term.|err|  worst param err   curv=0   curv=.15
+#   shared                 0.0751           0.0977   0.5266     0.9240
+#   stage-specific         0.0143           0.0467   0.4245     0.7632
+#   pooled, ridge 2.0      0.0134           0.0363   0.3108     0.7354
+#   pooled, ridge 1.0      0.0132           0.0370   0.3358     0.7445
+#   pooled, ridge 0.5      0.0137           0.0406   0.3823     0.7642
+#
+# Partial pooling is more accurate than *both* endpoints at every curvature —
+# it borrows strength across stages without inheriting the shared fit's stage
+# bias. Its degradation *ratio* looks worse only because its baseline is lower;
+# the worst-case absolute error, which is what a robustness claim is about, is
+# the best of the three.
+#
+# The plateau over [0.5, 2.0] is flat: ensemble contrast coverage is 98-99% for
+# all of them against 97% for stage-specific, differences inside Monte Carlo
+# error. 1.0 is the midpoint and has the smallest measured bias (+0.0000).
+# Re-run `cli misspecification` and `cli coverage` before moving it.
+DEFAULT_POOLING_RIDGE = 1.0
 
 # Chosen by measurement, not by feel. `treatmentrx.cli coverage` sweeps it: at
 # 1.0 the penalty shrinks contrasts enough to cost ~0.014 of bias on an effect of
@@ -104,11 +134,16 @@ class QLearningModel:
         use_visit_intensity: bool = USE_VISIT_INTENSITY,
         compute_covariance: bool = True,
         treat_censored_as_terminal: bool = False,
+        pooling_ridge: float | None = None,
     ) -> None:
         if not cohort:
             raise ValueError("Cannot fit a Q-learning model on an empty cohort")
         self.share_blip = share_blip
         self.blip_ridge = blip_ridge
+        # Partial pooling: psi_{j,a} = psibar_a + delta_{j,a}, with only the
+        # per-stage deviations penalized at `pooling_ridge`. See `_blip_starts`.
+        # `None` keeps the two endpoint parameterisations exactly as they were.
+        self.pooling_ridge = pooling_ridge if share_blip else None
         self.backward_induction = backward_induction
         self.use_ipcw = use_ipcw
         self.use_visit_intensity = use_visit_intensity
@@ -124,9 +159,14 @@ class QLearningModel:
         self._n_blip = len(BLIP_BASIS)
         self._blip_offset = self.n_stages * self._n_free
         self._blip_span = self._n_blip * len(self.blip_arms)
-        self.n_features = self._blip_offset + (
-            self._blip_span * (1 if share_blip else self.n_stages)
-        )
+        if self.pooling_ridge is not None:
+            self._deviation_offset = self._blip_offset + self._blip_span
+            self.n_features = self._deviation_offset + self._blip_span * self.n_stages
+        else:
+            self._deviation_offset = None
+            self.n_features = self._blip_offset + (
+                self._blip_span * (1 if share_blip else self.n_stages)
+            )
         self.iterations = 0
         self.censoring = None
         self.visit_intensity = None
@@ -137,13 +177,43 @@ class QLearningModel:
 
     # ---------------------------------------------------------------- fitting
 
-    def _blip_columns(self, stage_index: int, arm: str) -> list[int] | None:
+    def _blip_starts(self, stage_index: int, arm: str) -> list[int]:
+        """First column of every blip block this (stage, arm) pair loads on.
+
+        Three parameterisations, one mechanism:
+
+        * shared — one block, used at every stage. Stable, and biased wherever
+          the true blip varies by stage, because one vector absorbs all of them.
+        * stage-specific — one block per stage, nothing borrowed across them.
+          Unbiased and, at five arms times four basis terms times three stages,
+          expensive in variance.
+        * partially pooled — a shared block *plus* a per-stage deviation block,
+          with only the deviations penalized. `pooling_ridge` interpolates: at
+          infinity the deviations vanish and this is the shared fit; at zero they
+          are free and it is the stage-specific one.
+
+        The two endpoints were previously two separate models, which is why the
+        ensemble ended up averaging estimators of different parameters. They are
+        one axis, and the interior of that axis is where the answer sits.
+        """
         if arm == REFERENCE_ARM or arm not in self.blip_arms:
-            return None
-        arm_index = self.blip_arms.index(arm)
-        block = 0 if self.share_blip else stage_index
-        start = self._blip_offset + block * self._blip_span + arm_index * self._n_blip
-        return list(range(start, start + self._n_blip))
+            return []
+        offset = self.blip_arms.index(arm) * self._n_blip
+        if not self.share_blip:
+            return [self._blip_offset + stage_index * self._blip_span + offset]
+        starts = [self._blip_offset + offset]
+        if self._deviation_offset is not None:
+            starts.append(
+                self._deviation_offset + stage_index * self._blip_span + offset
+            )
+        return starts
+
+    def _blip_pairs(self, stage_index: int, arm: str, basis: list[float]):
+        """(column, value) pairs for this (stage, arm), across every block."""
+        for start in self._blip_starts(stage_index, arm):
+            for offset, value in enumerate(basis):
+                if value != 0.0:
+                    yield start + offset, value
 
     def _row(self, stage_index: int, features: dict[str, float], arm: str) -> list[tuple[int, float]]:
         offset = stage_index * self._n_free
@@ -152,19 +222,24 @@ class QLearningModel:
             for i, value in enumerate(treatment_free_basis(features))
             if value != 0.0
         ]
-        columns = self._blip_columns(stage_index, arm)
-        if columns is not None:
-            row.extend(
-                (column, value)
-                for column, value in zip(columns, blip_basis(features))
-                if value != 0.0
-            )
+        row.extend(self._blip_pairs(stage_index, arm, blip_basis(features)))
         return row
 
     def _penalties(self) -> list[float]:
+        """Ridge per column: none on the nuisance block, `blip_ridge` on the blip
+        parameters, `pooling_ridge` on the stage deviations.
+
+        Penalising only the deviations is what identifies the split. The
+        unpenalised-in-comparison shared block absorbs everything common across
+        stages and the deviations carry only what is left, which is the shrinkage
+        this parameterisation exists for.
+        """
         penalties = [_NUISANCE_RIDGE] * self.n_features
         for index in range(self._blip_offset, self.n_features):
             penalties[index] = self.blip_ridge
+        if self._deviation_offset is not None:
+            for index in range(self._deviation_offset, self.n_features):
+                penalties[index] = self.pooling_ridge
         return penalties
 
     def _fit(self, cohort: list[CohortTrajectory]) -> None:
@@ -269,15 +344,9 @@ class QLearningModel:
             if value != 0.0
         ]
         basis = blip_basis(features)
-        per_arm = []
-        for arm in self.arms:
-            columns = self._blip_columns(stage_index, arm)
-            if columns is None:
-                per_arm.append(())
-            else:
-                per_arm.append(
-                    tuple((column, value) for column, value in zip(columns, basis) if value != 0.0)
-                )
+        per_arm = [
+            tuple(self._blip_pairs(stage_index, arm, basis)) for arm in self.arms
+        ]
         return free, per_arm
 
     def _optimal_value_from(self, terms, beta: list[float]) -> float:
@@ -337,12 +406,18 @@ class QLearningModel:
         return sum(self._beta[offset + i] * value for i, value in enumerate(basis))
 
     def blip(self, arm: str, features: dict[str, float], stage_index: int) -> float:
-        """Estimated causal advantage of `arm` over the reference arm."""
-        columns = self._blip_columns(self._clamp_stage(stage_index), arm)
-        if columns is None:
-            return 0.0
+        """Estimated causal advantage of `arm` over the reference arm.
+
+        Under partial pooling this is `psibar_a . h(X) + delta_{j,a} . h(X)`,
+        summed over both blocks — the shared level plus this stage's shrunk
+        deviation from it.
+        """
+        index = self._clamp_stage(stage_index)
         basis = blip_basis(features)
-        return sum(self._beta[column] * value for column, value in zip(columns, basis))
+        return sum(
+            self._beta[column] * value
+            for column, value in self._blip_pairs(index, arm, basis)
+        )
 
     def raw_q(self, features: dict[str, float], arm: str, stage_index: int) -> float:
         """Value-to-go: this stage's outcome plus the optimal remaining horizon.
@@ -422,10 +497,10 @@ class QLearningModel:
         """Is the sandwich interval honest at this stage?
 
         Only at a terminal stage *and* only when the blip is stage-specific.
-        With a shared blip there is no fully regular stage: the one parameter
-        vector is estimated jointly from every stage's rows, and the
-        earlier-stage rows carry pseudo-outcomes. Its terminal-stage interval
-        inherits that, so the sandwich understates it too.
+        Wherever a parameter is estimated jointly across stages — a shared blip,
+        or a partially pooled one whose shared level borrows from earlier rows
+        carrying pseudo-outcomes — the terminal-stage interval inherits that, so
+        the sandwich understates it too.
         """
         return index == self.n_stages - 1 and not self.share_blip
 
@@ -479,6 +554,7 @@ class QLearningModel:
             use_ipcw=self.use_ipcw,
             use_visit_intensity=self.use_visit_intensity,
             compute_covariance=False,
+            pooling_ridge=self.pooling_ridge,
         )
         if replica.n_features != self.n_features:
             # A resample that lost a whole stage cannot be aligned with the fit.
@@ -582,30 +658,33 @@ class QLearningModel:
         loading = [0.0] * self.n_features
         basis = blip_basis(features)
         for sign, candidate in ((1.0, arm), (-1.0, comparator)):
-            columns = self._blip_columns(index, candidate)
-            if columns is None:
-                continue
-            for column, value in zip(columns, basis):
+            for column, value in self._blip_pairs(index, candidate, basis):
                 loading[column] += sign * value
         return loading
 
     def blip_standard_error(self, arm: str, features: dict[str, float], stage_index: int) -> float:
         """Standard error of a single arm's blip, on the per-remaining-visit scale."""
         index = self._clamp_stage(stage_index)
-        columns = self._blip_columns(index, arm)
-        if columns is None:
+        starts = self._blip_starts(index, arm)
+        if not starts:
             return 0.0
         loading = [0.0] * self.n_features
-        for column, value in zip(columns, blip_basis(features)):
-            loading[column] = value
+        for start in starts:
+            for offset, value in enumerate(blip_basis(features)):
+                loading[start + offset] += value
         variance = max(linalg.quadratic_form(loading, self._covariance), 0.0)
         return math.sqrt(variance) / self.remaining_stages(index)
 
     def blip_parameters(self, arm: str, stage_index: int = 0) -> dict[str, float]:
-        columns = self._blip_columns(self._clamp_stage(stage_index), arm)
-        if columns is None:
+        """This stage's effective psi, with the pooled level and its deviation
+        already summed — one number per basis term, whatever the parameterisation."""
+        starts = self._blip_starts(self._clamp_stage(stage_index), arm)
+        if not starts:
             return {name: 0.0 for name in BLIP_BASIS}
-        return {name: self._beta[column] for name, column in zip(BLIP_BASIS, columns)}
+        return {
+            name: sum(self._beta[start + offset] for start in starts)
+            for offset, name in enumerate(BLIP_BASIS)
+        }
 
     def coefficient_summary(self, arm: str, stage_index: int = 0) -> dict[str, float]:
         """Flat, audit-friendly view of every parameter behind the decision.

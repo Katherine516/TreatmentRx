@@ -18,7 +18,6 @@ from treatmentrx.estimation.estimators import QSharedEstimator, StageSpecificQEs
 from treatmentrx.estimation.features import model_features, prior_tnf_exposure
 from treatmentrx.estimation.q_learning import QLearningModel, myopic_model
 from treatmentrx.feedback.offline_evaluation import evaluate_policy
-from treatmentrx.domain import RegimeAssignment, RegimeType
 from treatmentrx.simulation.ra_cohort import (
     HEPATOTOXIC_ARMS,
     HIGH_BURDEN_ARMS,
@@ -29,6 +28,7 @@ from treatmentrx.simulation.ra_cohort import (
     behaviour_policy,
     generate_ra_cohort,
     myopic_optimal_policy,
+    oracle_policy,
     rollout_value,
     true_blip,
 )
@@ -44,9 +44,24 @@ _CLEAN_ARMS = tuple(
     if arm not in HEPATOTOXIC_ARMS and arm not in HIGH_BURDEN_ARMS
 )
 
-_ASSIGNMENT = RegimeAssignment(
-    regime_type=RegimeType.SPTR, reason="test", shared_bic=1.0, stage_specific_bic=1.0
-)
+_ROLLOUT_SEEDS = (404, 505)
+_ROLLOUT_CACHE: dict[str, float] = {}
+
+
+def _mean_rollout(label, policy, n=2000, seeds=_ROLLOUT_SEEDS):
+    """Average a policy's true value over several rollout seeds, memoised.
+
+    A single rollout at n=2000 carries a Monte Carlo sd of about 0.013, which is
+    larger than the differences between the better policies, so a comparison off
+    one seed is a coin flip. Caching by label keeps the cost of averaging from
+    being paid once per test — the oracle's backward induction is the expensive
+    part and two tests need the same number.
+    """
+    if label not in _ROLLOUT_CACHE:
+        _ROLLOUT_CACHE[label] = sum(
+            rollout_value(policy, n=n, seed=seed) for seed in seeds
+        ) / len(seeds)
+    return _ROLLOUT_CACHE[label]
 
 
 def _demo_stages():
@@ -202,6 +217,86 @@ class PolicyValueTests(unittest.TestCase):
             self.assertGreater(score.improvement, 0.0, msg=name)
             self.assertGreater(score.effective_sample_size, 10.0, msg=name)
 
+    def test_the_regret_reference_beats_the_myopic_rule_it_replaced(self):
+        """An oracle that the agent beats is not an oracle.
+
+        Layer 3's regret used to be measured against the per-visit blip argmax,
+        which loses to all three fitted policies on the true trajectory value
+        because it over-prescribes the arms whose cost is delayed. This pins the
+        margin that makes the replacement reference worth having: +0.020 over the
+        myopic rule, measured 8/8 across seeds against a paired sd of 0.007.
+        """
+        oracle = _mean_rollout("oracle", oracle_policy())
+        myopic = _mean_rollout("myopic", myopic_optimal_policy)
+        behaviour = _mean_rollout("behaviour", behaviour_policy)
+        self.assertGreater(oracle - myopic, 0.010, "oracle margin over the myopic rule collapsed")
+        self.assertGreater(myopic, behaviour)
+
+    def test_no_fitted_policy_materially_exceeds_the_regret_reference(self):
+        """Certainty equivalence leaves a Jensen gap, so this is a tolerance, not
+        an inequality.
+
+        The measured paired sd of oracle-minus-fitted is 0.0040 for the closest
+        estimator; 0.010 is comfortably outside it, so a failure here means the
+        reference has genuinely stopped bounding the policies rather than that a
+        seed went the other way.
+        """
+        fit = training.fitted()
+        oracle = _mean_rollout("oracle", oracle_policy())
+        for name, model in (
+            (training.Q_SHARED, fit.q_shared),
+            (training.DWOLS_SHARED, fit.dwols),
+        ):
+            value = _mean_rollout(name, model.greedy_policy())
+            self.assertLess(
+                value - oracle, 0.010, msg=f"{name} exceeded the reference: {value} vs {oracle}"
+            )
+
+    def test_the_myopic_rule_is_not_the_optimal_policy(self):
+        """The two references must actually differ, or the distinction is decorative."""
+        from treatmentrx.simulation.ra_cohort import oracle_arm, optimal_arm
+
+        train = training.fitted().train
+        patients = [stage.features for trajectory in train for stage in trajectory.stages[:1]]
+        disagreements = sum(1 for f in patients if oracle_arm(f, 0) != optimal_arm(f))
+        self.assertGreater(disagreements, 0)
+
+    def test_every_estimator_gains_over_behaviour_with_an_interval(self):
+        """The gain is real; the ordering between estimators is not."""
+        for name, score in training.fitted().scores.items():
+            self.assertIsNotNone(score.improvement_interval, msg=name)
+            self.assertGreater(score.improvement_interval[0], 0.0, msg=name)
+
+    def test_the_estimator_ranking_is_not_read_off_indistinguishable_values(self):
+        """Four call sites used to argmax over three overlapping numbers.
+
+        If the intervals overlap, the selection must come from the stated
+        interpretability order rather than from whichever value happened to land
+        on top — otherwise a re-seed silently changes which model's calibration
+        gates deployment and which policy defines the estimands.
+        """
+        ranked = sorted(
+            training.fitted().scores.values(),
+            key=lambda score: score.ipw_policy_value,
+            reverse=True,
+        )
+        if training.ranking_is_resolved():
+            self.assertEqual(training.best_score().estimator, ranked[0].estimator)
+        else:
+            expected = min(
+                (score.estimator for score in ranked),
+                key=lambda name: training.INTERPRETABILITY_ORDER.get(name, 99),
+            )
+            self.assertEqual(training.best_score().estimator, expected)
+
+    def test_an_estimator_only_beats_another_when_the_intervals_separate(self):
+        scores = list(training.fitted().scores.values())
+        for score in scores:
+            self.assertFalse(score.beats(score), "an estimator cannot beat itself")
+            for other in scores:
+                if score.beats(other):
+                    self.assertGreater(score.value_interval[0], other.value_interval[1])
+
     def test_policy_score_reports_no_agreement_honestly(self):
         holdout = training.fitted().holdout
         never_taken = evaluate_policy(
@@ -215,6 +310,76 @@ class PolicyValueTests(unittest.TestCase):
             "policy never agreed with the observed arm; IPW value is not identified",
             never_taken.notes,
         )
+
+
+class PropensityTests(unittest.TestCase):
+    """The held-out estimate must not need a probability only the simulator knows.
+
+    `CohortStage.propensity` is what the generator drew from. Every quantity the
+    validation ladder gates on was computed from it, which is an advantage no
+    deployment has.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from treatmentrx.estimation.propensity import PropensityModel
+
+        cls.fit = training.fitted()
+        cls.model = PropensityModel(cls.fit.train)
+
+    def test_it_recovers_the_behaviour_policy_on_held_out_patients(self):
+        """Fit on train, checked on holdout — the same discipline as everything else."""
+        calibration = self.model.calibration(self.fit.holdout)
+        self.assertLess(calibration["mean_absolute_error"], 0.05)
+        self.assertAlmostEqual(calibration["mean_ratio_to_truth"], 1.0, delta=0.1)
+
+    def test_the_probabilities_are_a_distribution(self):
+        features = self.fit.holdout[0].stages[0].features
+        probabilities = self.model.probabilities(features)
+        self.assertEqual(set(probabilities), set(TREATMENT_ARMS))
+        self.assertAlmostEqual(sum(probabilities.values()), 1.0, places=9)
+        self.assertTrue(all(p > 0.0 for p in probabilities.values()))
+
+    def test_it_reports_convergence_honestly(self):
+        """`converged` has to mean the fixed point, not the iteration budget."""
+        self.assertTrue(self.model.fit.converged)
+        self.assertLess(self.model.fit.iterations, 200)
+
+    def test_the_deployed_scores_use_the_fitted_propensity(self):
+        """Not the generator's — otherwise the ladder gates on oracle knowledge."""
+        from treatmentrx.feedback.offline_evaluation import evaluate_policy
+
+        name, model = training.Q_POOLED, self.fit.pooled
+        oracle = evaluate_policy(
+            name, model.greedy_policy(), model.predict_outcome, self.fit.holdout,
+            with_intervals=False,
+        )
+        self.assertNotEqual(
+            self.fit.scores[name].ipw_policy_value,
+            oracle.ipw_policy_value,
+            "the deployed score still reads stage.propensity",
+        )
+
+    def test_swapping_the_oracle_for_the_fit_does_not_move_the_conclusion(self):
+        """The claim this supports: the evaluation is reproducible without the
+        generator. Every estimator shifts by less than its own interval width."""
+        from treatmentrx.feedback.offline_evaluation import evaluate_policy
+
+        for name, model in (
+            (training.Q_POOLED, self.fit.pooled),
+            (training.DWOLS_SHARED, self.fit.dwols),
+        ):
+            with self.subTest(estimator=name):
+                score = self.fit.scores[name]
+                oracle = evaluate_policy(
+                    name, model.greedy_policy(), model.predict_outcome, self.fit.holdout,
+                    with_intervals=False,
+                )
+                width = score.value_interval[1] - score.value_interval[0]
+                self.assertLess(
+                    abs(score.ipw_policy_value - oracle.ipw_policy_value), width / 2.0
+                )
+                self.assertGreater(score.improvement_interval[0], 0.0)
 
 
 class CalibrationTests(unittest.TestCase):
@@ -238,13 +403,140 @@ class CalibrationTests(unittest.TestCase):
         self.assertFalse(biased.calibration.passed)
 
 
+class FittedCacheTests(unittest.TestCase):
+    """One fitted ensemble per process, including under a threaded server.
+
+    `service.py` runs a thread per request, so `fitted()`'s lazy global is
+    reachable concurrently. Unguarded, four cold callers each ran the whole fit
+    and three ensembles were discarded — and because the fit is deterministic
+    they all agreed, so nothing would ever have surfaced it.
+    """
+
+    def test_concurrent_cold_callers_fit_exactly_once(self):
+        """A stub fit, not the real one, and deliberately slow.
+
+        Two reasons not to refit for real here. It costs ~3s of suite time to
+        demonstrate something that is about the guard rather than about the
+        models; and a fast fit is a *worse* race detector — the second thread
+        may simply arrive after the first has finished, so an unguarded
+        implementation could pass by luck. The sleep holds the window open so
+        the assertion means what it says.
+        """
+        import threading
+        import time as _time
+
+        original_fitted = training._FITTED
+        original_fit_all = training._fit_all
+        fits = []
+        sentinel = object()
+
+        def slow_stub():
+            fits.append(1)
+            _time.sleep(0.05)
+            return sentinel
+
+        training._fit_all = slow_stub
+        training._FITTED = None
+        try:
+            handed_out = []
+            threads = [
+                threading.Thread(target=lambda: handed_out.append(training.fitted()))
+                for _ in range(8)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+        finally:
+            training._fit_all = original_fit_all
+            training._FITTED = original_fitted
+
+        self.assertEqual(len(fits), 1, f"the fit ran {len(fits)} times, not once")
+        self.assertEqual(len(handed_out), 8)
+        self.assertTrue(
+            all(fit is sentinel for fit in handed_out),
+            "callers were handed different ensembles",
+        )
+
+
+class DWOLSContrastCovarianceTests(unittest.TestCase):
+    """Two arms fit against the same reference are not independent.
+
+    Each `ArmFit` is one-vs-reference, so any two arms share every reference-arm
+    row and their estimates move together — measured at +0.20 to +0.51 on this
+    cohort. Adding their variances as if independent left the contrast 24% wider
+    than the estimator's actual spread across refits; with the cross term it sits
+    at 0.95 of it. That width was pure lost precision and it fed straight into
+    the abstention rate.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = training.fitted().dwols
+        cls.features = model_features(_demo_stages()[1])
+
+    def _independent(self, arm, comparator):
+        return (
+            self.model.blip_standard_error(arm, self.features) ** 2
+            + self.model.blip_standard_error(comparator, self.features) ** 2
+        ) ** 0.5
+
+    def test_the_covariance_is_positive_so_the_contrast_narrows(self):
+        pairs = [
+            ("rituximab", "IL-6 inhibitor"),
+            ("IL-6 inhibitor", "JAK-inhibitor"),
+            ("TNF-inhibitor", "methotrexate-optimization"),
+        ]
+        for arm, comparator in pairs:
+            with self.subTest(pair=(arm, comparator)):
+                joint = self.model.contrast_standard_error(arm, comparator, self.features)
+                self.assertGreater(joint, 0.0)
+                self.assertLess(joint, self._independent(arm, comparator))
+
+    def test_it_is_symmetric_in_its_arguments(self):
+        a = self.model.contrast_standard_error("rituximab", "JAK-inhibitor", self.features)
+        b = self.model.contrast_standard_error("JAK-inhibitor", "rituximab", self.features)
+        self.assertAlmostEqual(a, b, places=9)
+
+    def test_an_arm_against_itself_has_no_spread(self):
+        """Var(x - x) = 0. If the cross term were dropped this would return
+        sqrt(2) times the arm's own standard error instead."""
+        self.assertAlmostEqual(
+            self.model.contrast_standard_error("rituximab", "rituximab", self.features),
+            0.0,
+            places=9,
+        )
+
+    def test_the_reference_arm_reduces_to_the_other_arm_alone(self):
+        """The reference has no `ArmFit` and a blip identically zero, so the
+        contrast is just the other arm's own uncertainty."""
+        from treatmentrx.arms import REFERENCE_ARM
+
+        self.assertAlmostEqual(
+            self.model.contrast_standard_error("rituximab", REFERENCE_ARM, self.features),
+            self.model.blip_standard_error("rituximab", self.features),
+            places=9,
+        )
+
+    def test_the_coverage_study_measures_the_rule_the_facade_deploys(self):
+        """Invariant 19's shape: a study that computes a wider interval than the
+        agent emits is reporting a rule nobody deploys."""
+        from treatmentrx.feedback.coverage import _dwols_contrast
+
+        replica = _dwols_contrast(self.model, "rituximab", "IL-6 inhibitor", self.features)
+        deployed = self.model.contrast_standard_error(
+            "rituximab", "IL-6 inhibitor", self.features
+        )
+        self.assertAlmostEqual(replica.standard_error, deployed, places=9)
+
+
 class EstimatorFacadeTests(unittest.TestCase):
     def test_estimators_share_one_scale_and_one_menu(self):
         _, stages = _demo_stages()
         results = [
-            QSharedEstimator().fit_predict(stages, _ASSIGNMENT, ["das28"]),
-            StageSpecificQEstimator().fit_predict(stages, _ASSIGNMENT, ["das28"]),
-            DWOLSSharedEstimator().fit_predict(stages, _ASSIGNMENT, ["das28"]),
+            QSharedEstimator().fit_predict(stages),
+            StageSpecificQEstimator().fit_predict(stages),
+            DWOLSSharedEstimator().fit_predict(stages),
         ]
         menus = {tuple(sorted(result.q_values)) for result in results}
         self.assertEqual(len(menus), 1, "estimators must score the same arm menu")
@@ -254,12 +546,12 @@ class EstimatorFacadeTests(unittest.TestCase):
 
     def test_policy_value_is_the_held_out_score_not_a_self_report(self):
         _, stages = _demo_stages()
-        result = QSharedEstimator().fit_predict(stages, _ASSIGNMENT, ["das28"])
+        result = QSharedEstimator().fit_predict(stages)
         self.assertEqual(result.policy_value, training.policy_value_for(training.Q_SHARED))
 
     def test_blip_parameters_are_exposed_for_audit(self):
         _, stages = _demo_stages()
-        result = DWOLSSharedEstimator().fit_predict(stages, _ASSIGNMENT, ["das28"])
+        result = DWOLSSharedEstimator().fit_predict(stages)
         recommended = result.recommended_arm
         self.assertEqual(result.estimator, training.DWOLS_SHARED)
         self.assertTrue(
@@ -281,7 +573,7 @@ class EstimatorFacadeTests(unittest.TestCase):
         self.assertEqual(features["prior_tnf"], 1.0)
         self.assertEqual(myopic_optimal_policy(features, 0), "rituximab")
         self.assertEqual(
-            QSharedEstimator().fit_predict(stages, _ASSIGNMENT, ["das28"]).recommended_arm,
+            QSharedEstimator().fit_predict(stages).recommended_arm,
             "rituximab",
         )
 
@@ -290,7 +582,7 @@ class EstimatorFacadeTests(unittest.TestCase):
         from treatmentrx.estimation.explainability import ModelExplainer
 
         _, stages = _demo_stages()
-        result = QSharedEstimator().fit_predict(stages, _ASSIGNMENT, ["das28"])
+        result = QSharedEstimator().fit_predict(stages)
         attribution = ModelExplainer().explain(result, [result], stages).attributions[0]
         self.assertEqual(attribution.action, result.recommended_arm)
         self.assertAlmostEqual(

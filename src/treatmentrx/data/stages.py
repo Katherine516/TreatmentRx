@@ -3,25 +3,67 @@ from __future__ import annotations
 import math
 from collections import Counter
 
+from treatmentrx.arms import is_concomitant, is_current_decision
+from treatmentrx.data.endpoints import DEFAULT_ENDPOINT, UNKNOWN, Endpoint
 from treatmentrx.domain import Observation, PatientRecord, StageRecord
 
 
+def split_medications(patient: PatientRecord):
+    """Separate the DMARD line sequence from medications given alongside it.
+
+    One definition, two callers: the stage builder needs the line events to
+    number the decision points, and `SwitchingCapture` needs the concomitant
+    ones to flag rescue therapy on the stage they overlap. Deriving it twice is
+    how the two would disagree about which stage a steroid belongs to.
+    """
+    line_events = [m for m in patient.medications if not is_concomitant(m.name)]
+    concomitant = [m for m in patient.medications if is_concomitant(m.name)]
+    return line_events, concomitant
+
+
 class StageHistoryBuilder:
-    """Builds H_j-like stage records from treatment initiations."""
+    """Builds H_j-like stage records from treatment initiations.
+
+    The `endpoint` decides what a stage's outcome *is* — the reward the whole
+    system optimises. It is a constructor argument rather than a hard-coded
+    keyword match because that choice belongs to whoever knows what the study is
+    measuring; see `data/endpoints.py` for why the default is the text one on
+    this synthetic cohort.
+    """
+
+    def __init__(self, endpoint: Endpoint | None = None) -> None:
+        self.endpoint = endpoint or DEFAULT_ENDPOINT
 
     def build(self, patient: PatientRecord) -> list[StageRecord]:
         if not patient.medications:
             raise ValueError("Patient record has no treatment history")
 
+        line_events, _ = split_medications(patient)
+        if not line_events:
+            raise ValueError(
+                "Patient record has no treatment-line events: every medication is "
+                "concomitant, so there is no decision sequence to build"
+            )
+
         stages: list[StageRecord] = []
-        for index, treatment in enumerate(patient.medications):
+        for index, treatment in enumerate(line_events):
             next_start = (
-                patient.medications[index + 1].start_day
-                if index + 1 < len(patient.medications)
-                else None
+                line_events[index + 1].start_day
+                if index + 1 < len(line_events)
+                else treatment.stop_day
             )
             features = self._features_until(patient.observations, treatment.start_day)
-            outcome = self._stage_outcome(treatment.response, patient.outcomes)
+            outcome = (
+                UNKNOWN
+                if is_current_decision(treatment.name) and next_start is None
+                else self.endpoint.score(
+                    treatment.response,
+                    patient.observations,
+                    treatment.start_day,
+                    next_start,
+                    default=float(patient.outcomes.get("default_stage_outcome", UNKNOWN)),
+                )
+            )
             stages.append(
                 StageRecord(
                     patient_id=patient.patient_id,
@@ -44,44 +86,18 @@ class StageHistoryBuilder:
                 features[self._feature_name(observation.code)] = observation.value
         return features
 
-    def _stage_outcome(self, response: str | None, outcomes: dict[str, object]) -> float:
-        if response:
-            normalized = response.lower()
-            if "remission" in normalized or "good" in normalized:
-                return 1.0
-            if "partial" in normalized:
-                return 0.55
-            if "inadequate" in normalized or "failure" in normalized:
-                return 0.15
-        value = outcomes.get("default_stage_outcome", 0.5)
-        return float(value)
-
     def _feature_name(self, code: str) -> str:
         return code.lower().replace(" ", "_").replace("-", "_")
 
 
-class VariableSelector:
-    """Identifies candidate tailoring variables from numeric feature variance."""
-
-    def select(self, stages: list[StageRecord], limit: int = 5) -> list[str]:
-        numeric_values: dict[str, list[float]] = {}
-        for stage in stages:
-            for key, value in stage.features.items():
-                if isinstance(value, (int, float)) and not isinstance(value, bool):
-                    numeric_values.setdefault(key, []).append(float(value))
-
-        scored: list[tuple[float, str]] = []
-        for key, values in numeric_values.items():
-            if not values:
-                continue
-            mean = sum(values) / len(values)
-            variance = sum((value - mean) ** 2 for value in values) / len(values)
-            latest = values[-1]
-            score = math.sqrt(variance) + abs(latest)
-            scored.append((score, key))
-
-        if scored:
-            return [key for _, key in sorted(scored, reverse=True)[:limit]]
-
-        counts = Counter(key for stage in stages for key in stage.features)
-        return [key for key, _ in counts.most_common(limit)]
+# `VariableSelector` used to live here, scoring raw features by
+# `sqrt(variance) + abs(latest)` and handing the result to Layer 2 as the
+# patient's "tailoring variables". It is gone for the same reason
+# `StageRecord.visit_weight` is: it named a statistical role it did not have.
+#
+# Unstandardised, the score ranked by unit size — `egfr` (82) above `crp` (28)
+# above `das28` (5.2) — and it skipped booleans entirely, so neither of the two
+# effect modifiers in the blip basis could ever be selected. A tailoring variable
+# is one the treatment effect varies over, which is a property of the *fitted
+# blip*, not of a feature's raw spread, and Layer 1 has no model. The selection
+# now happens where the model is: `estimation.features.top_tailoring_variables`.

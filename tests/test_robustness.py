@@ -206,6 +206,280 @@ class ModelAveragedContrastTests(unittest.TestCase):
         self.assertGreater(result.se_to_sd_ratio, 1.0)
 
 
+class OmittedEffectModifierTests(unittest.TestCase):
+    """The other kind of wrong, and the one nothing used to test.
+
+    `curvature` bends the nuisance surface, which double robustness survives.
+    An omitted *effect modifier* bends the estimand, which nothing survives —
+    and it is what a real cohort will have, because the true modifiers will not
+    be exactly `anti_ccp` and `prior_tnf`.
+    """
+
+    def test_the_modifier_is_inert_at_zero(self):
+        """Every other result in the repo assumes the default cohort is unchanged."""
+        from treatmentrx.simulation.ra_cohort import generate_ra_cohort, true_blip
+
+        plain = generate_ra_cohort(40, seed=3)
+        explicit = generate_ra_cohort(40, seed=3, blip_modifier=0.0)
+        self.assertEqual(
+            [s.outcome for t in plain for s in t.stages],
+            [s.outcome for t in explicit for s in t.stages],
+        )
+        features = {"das28": 5.2, "crp": 90.0, "anti_ccp": 1.0, "prior_tnf": 0.0,
+                    "egfr": 82.0, "alt": 25.0}
+        self.assertEqual(true_blip("IL-6 inhibitor", features),
+                         true_blip("IL-6 inhibitor", features, 0.0))
+
+    def test_it_bends_the_estimand_not_the_nuisance_surface(self):
+        """A modifier that only moved the outcome level would be absorbed by the
+        treatment-free model and prove nothing."""
+        from treatmentrx.simulation.ra_cohort import true_blip
+
+        low = {"das28": 5.2, "crp": 8.0, "anti_ccp": 0.0, "prior_tnf": 0.0,
+               "egfr": 82.0, "alt": 25.0}
+        high = dict(low, crp=100.0)
+        # Same arm, same blip basis values, different true effect.
+        self.assertEqual(true_blip("IL-6 inhibitor", low), true_blip("IL-6 inhibitor", high))
+        self.assertNotEqual(
+            true_blip("IL-6 inhibitor", low, 0.1), true_blip("IL-6 inhibitor", high, 0.1)
+        )
+
+    def test_coverage_collapses_and_the_interval_does_not_notice(self):
+        """The finding: an omitted modifier is bias, and the SE cannot see it.
+
+        Small configuration — the quotable numbers are `cli misspecification
+        --omitted-modifier`. What holds at this size is the direction and the
+        mechanism: coverage falls *and* SE/spread falls with it, which is what
+        distinguishes a bias from an interval that is merely too narrow.
+        """
+        from treatmentrx.feedback.misspecification import omitted_modifier_study
+
+        results = omitted_modifier_study(modifiers=(0.0, 0.2), replications=5, n=180)
+        clean, bent = results[0.0], results[0.2]
+        self.assertGreater(clean["coverage"], 0.8)
+        self.assertLess(bent["coverage"], 0.6)
+        self.assertGreater(abs(bent["bias"]), 4 * abs(clean["bias"]))
+        self.assertLess(bent["se_to_sd_ratio"], clean["se_to_sd_ratio"])
+
+    def test_the_study_grid_varies_the_omitted_covariate(self):
+        """`coverage.PATIENT_GRID` holds CRP fixed, so it is structurally blind
+        to CRP as an effect modifier. This study needs its own grid."""
+        from treatmentrx.feedback import coverage
+        from treatmentrx.feedback.misspecification import _modifier_grid
+
+        self.assertEqual(len({p["crp"] for p in coverage.PATIENT_GRID.values()}), 1)
+        self.assertGreater(len({p["crp"] for p in _modifier_grid().values()}), 1)
+
+
+class SpecificationTestCalibrationTests(unittest.TestCase):
+    """A specification test is only useful if its error rates are known.
+
+    The first working version rejected on 33% of null cohorts against a nominal
+    5% — it corrected multiplicity over arms while running covariates times arms
+    tests, and took the sandwich at face value when this repo measures it at
+    0.86-0.90 of the actual spread. A test that cries wolf a third of the time
+    sends an analyst chasing a modifier that is not there.
+
+    Deliberately few seeds here; the quotable rates are in the module docstring.
+    What is asserted is that the test is silent on a null cohort and fires on a
+    real modifier, which is the property that makes it worth running at all.
+    """
+
+    def test_the_threshold_corrects_for_every_test_performed(self):
+        from treatmentrx.estimation.inference import SANDWICH_INFLATION
+        from treatmentrx.estimation.specification import rejection_threshold
+
+        over_arms_only = rejection_threshold(0.05, 1, 5)
+        over_everything = rejection_threshold(0.05, 3, 5)
+        self.assertGreater(over_everything, over_arms_only)
+        # And the sandwich correction is in there, not just multiplicity.
+        self.assertGreater(rejection_threshold(0.05, 1, 1), 1.96 * SANDWICH_INFLATION * 0.99)
+
+    def test_it_is_silent_when_the_basis_is_correct(self):
+        from treatmentrx.estimation.specification import specification_report
+
+        flagged = 0
+        for seed in (7000, 7001, 7002, 7003, 7004, 7005):
+            report = specification_report(generate_ra_cohort(280, seed=seed))
+            if report["flagged"]:
+                flagged += 1
+        self.assertLessEqual(flagged, 1, "the null false-positive rate has drifted up")
+
+    def test_it_finds_a_modifier_that_is_really_there(self):
+        """Silence is only worth something if the test can speak."""
+        from treatmentrx.estimation.specification import specification_report
+
+        for seed in (7100, 7101, 7102):
+            report = specification_report(
+                generate_ra_cohort(280, seed=seed, blip_modifier=0.10)
+            )
+            with self.subTest(seed=seed):
+                self.assertIn("crp_std", report["flagged"])
+
+    def test_the_statistic_grows_with_the_modifier(self):
+        from treatmentrx.estimation.specification import specification_report
+
+        z = [
+            specification_report(
+                generate_ra_cohort(280, seed=9000, blip_modifier=modifier)
+            )["candidates"]["crp_std"]["max_abs_z"]
+            for modifier in (0.0, 0.05, 0.20)
+        ]
+        self.assertEqual(z, sorted(z), f"the statistic is not monotone in the modifier: {z}")
+
+    def test_a_mediator_is_not_offered_as_a_candidate(self):
+        """ALT is caused by the previous arm, so interacting it with the current
+        one measures mediation. It rejected at z=4.35 on a cohort with no ALT
+        effect modification at all, which is how it was found."""
+        from treatmentrx.estimation.specification import (
+            CANDIDATE_MODIFIERS,
+            EXCLUDED_CANDIDATES,
+        )
+
+        self.assertIn("alt_excess", EXCLUDED_CANDIDATES)
+        self.assertNotIn("alt_excess", CANDIDATE_MODIFIERS)
+        self.assertFalse(set(CANDIDATE_MODIFIERS) & set(EXCLUDED_CANDIDATES))
+
+    def test_alt_really_is_downstream_of_treatment_in_this_cohort(self):
+        """The justification for excluding it, as a measurement rather than a claim."""
+        from treatmentrx.simulation.ra_cohort import HEPATOTOXIC_ARMS
+
+        cohort = generate_ra_cohort(300, seed=9000)
+        after_hepatotoxic, after_other = [], []
+        for trajectory in cohort:
+            for previous, current in zip(trajectory.stages, trajectory.stages[1:]):
+                target = (
+                    after_hepatotoxic
+                    if previous.arm in HEPATOTOXIC_ARMS
+                    else after_other
+                )
+                target.append(current.features["alt"])
+        mean_hepatotoxic = sum(after_hepatotoxic) / len(after_hepatotoxic)
+        mean_other = sum(after_other) / len(after_other)
+        self.assertGreater(mean_hepatotoxic, mean_other + 20.0)
+
+
+class CausalCertificateTests(unittest.TestCase):
+    """The certificate has to describe the model, not the record.
+
+    `_has_adjuster` counted a `birthDate` as adjusting for age and any
+    medication as adjusting for steroid use, so `identified` was true for
+    essentially every patient while no basis carried either variable.
+    """
+
+    def test_the_adjustment_set_is_derived_from_the_graph(self):
+        """Not hand-listed. A declared set drifts from the edges it claims to
+        summarise; a derived one cannot."""
+        from treatmentrx.data.dag import CausalDAGRegistry, minimal_backdoor_set
+
+        dag = CausalDAGRegistry()._ra_v1()
+        derived = minimal_backdoor_set(dag)
+        self.assertEqual(
+            derived, set(dag.adjustment_set) | set(dag.unmodelled_confounders)
+        )
+
+    def test_the_backdoor_criterion_finds_the_confounders(self):
+        from treatmentrx.data.dag import CausalDAGRegistry, backdoor_paths
+
+        dag = CausalDAGRegistry()._ra_v1()
+        paths = backdoor_paths(dag.edges, "treatment", "ra_response")
+        self.assertTrue(paths)
+        # Every backdoor path here is treatment <- confounder -> outcome.
+        for path in paths:
+            self.assertEqual(len(path), 3, path)
+            self.assertEqual(path[0], "treatment")
+            self.assertEqual(path[-1], "ra_response")
+
+    def test_colliders_are_not_adjusted_for(self):
+        """Conditioning on one opens a path rather than closing it."""
+        from treatmentrx.data.dag import CausalDAGRegistry
+
+        dag = CausalDAGRegistry()._ra_v1()
+        for collider in dag.colliders:
+            self.assertNotIn(collider, dag.adjustment_set)
+            self.assertNotIn(collider, dag.unmodelled_confounders)
+
+    def test_the_model_set_does_not_satisfy_the_backdoor_criterion(self):
+        """The honest verdict, and it should stay False until the basis grows.
+
+        Four confounders the graph requires are in no estimator basis, so the
+        adjustment the model performs is incomplete. Reporting otherwise is what
+        the old presence-check did.
+        """
+        from treatmentrx.data.dag import CausalDAGRegistry, satisfies_backdoor
+
+        dag = CausalDAGRegistry()._ra_v1()
+        identified, open_paths = satisfies_backdoor(dag, set(dag.adjustment_set))
+        self.assertFalse(identified)
+        self.assertEqual(
+            {path[1] for path in open_paths}, set(dag.unmodelled_confounders)
+        )
+        # ...and the full derived set does satisfy it, which is what makes the
+        # failure a statement about the model rather than about the graph.
+        full = set(dag.adjustment_set) | set(dag.unmodelled_confounders)
+        self.assertTrue(satisfies_backdoor(dag, full)[0])
+
+    def test_every_claimed_adjuster_is_in_a_model_basis(self):
+        from treatmentrx.data.dag import MODELLED_BY, CausalDAGRegistry
+        from treatmentrx.estimation.basis import TREATMENT_FREE_BASIS
+
+        dag = CausalDAGRegistry()._ra_v1()
+        for node in dag.adjustment_set:
+            with self.subTest(node=node):
+                self.assertIn(node, MODELLED_BY, f"{node} maps to no basis term")
+                self.assertIn(MODELLED_BY[node], TREATMENT_FREE_BASIS)
+
+    def test_the_unadjusted_confounders_are_named(self):
+        """Silence is what made the old verdict readable as 'adjusted for'."""
+        from treatmentrx.data.dag import CausalDAGRegistry
+
+        dag = CausalDAGRegistry()._ra_v1()
+        self.assertEqual(
+            set(dag.unmodelled_confounders), {"age", "gender", "steroid_use", "comorbidity_burden"}
+        )
+        self.assertFalse(set(dag.adjustment_set) & set(dag.unmodelled_confounders))
+
+    def test_every_patient_is_told_what_was_not_adjusted_for(self):
+        from treatmentrx.data import DataLayer
+        from treatmentrx.demo_data import sample_ra_bundle
+
+        state = DataLayer().build_patient_state(sample_ra_bundle())
+        warning = next(
+            d for d in state.diagnostics if d.name == "unmodelled_confounders"
+        )
+        self.assertEqual(warning.severity, "warning")
+        for node in ("age", "gender", "steroid_use", "comorbidity_burden"):
+            self.assertIn(node, warning.message)
+
+    def test_identifiability_can_actually_fail(self):
+        """A verdict that cannot fail is not a verdict.
+
+        A record with no disease-activity measurement runs the estimators on a
+        default; the effect is not identified for that patient, and the old
+        check would have passed them on a `birthDate`.
+        """
+        import copy
+
+        from treatmentrx.data import DataLayer
+        from treatmentrx.data.dag import CausalDAGRegistry
+        from treatmentrx.data.fhir import FHIRAdapter
+        from treatmentrx.demo_data import sample_ra_bundle
+
+        bundle = copy.deepcopy(sample_ra_bundle())
+        bundle["entry"] = [
+            entry
+            for entry in bundle["entry"]
+            if not (
+                entry["resource"].get("resourceType") == "Observation"
+                and entry["resource"]["code"]["text"].upper() in {"DAS28", "HAQ-DI"}
+            )
+        ]
+        patient = FHIRAdapter().parse_bundle(bundle)
+        result = CausalDAGRegistry().validate(patient, treatment="methotrexate")
+        self.assertFalse(result.identified)
+        self.assertIn("baseline_disease_activity", result.blocked_reason)
+
+
 class JointBootstrapTests(unittest.TestCase):
     """Measuring the estimators' covariance instead of bounding it.
 
@@ -261,7 +535,12 @@ class JointBootstrapTests(unittest.TestCase):
         for draw in bootstrap.draws:
             self.assertEqual(
                 sorted(draw),
-                sorted([self.training.Q_SHARED, self.training.STAGE_SPECIFIC, self.training.DWOLS_SHARED]),
+                sorted([
+                    self.training.Q_SHARED,
+                    self.training.STAGE_SPECIFIC,
+                    self.training.Q_POOLED,
+                    self.training.DWOLS_SHARED,
+                ]),
             )
 
     def test_the_measured_interval_is_narrower_than_the_bound(self):
@@ -295,3 +574,131 @@ class JointBootstrapTests(unittest.TestCase):
         self.training.enable_joint_inference(replicates=4)
         self.training.reset()
         self.assertIsNone(self.training.joint_inference())
+
+    def test_reset_refits_every_serving_estimator(self):
+        """`reset()` has to reach the models that actually serve patients.
+
+        dWOLS used to keep its own module-level cache, so `reset()` refit the
+        Q-learning half and left the dWOLS half at whatever cohort it first saw.
+        Nothing failed — the two agree on the default cohort — but the serving
+        ensemble was half stale, and a sample-size sweep silently measured a
+        standard error that could not shrink.
+        """
+        from treatmentrx.estimation import dwols
+
+        self.assertIs(self.training.fitted().dwols, dwols.fitted_model())
+        original = self.training.COHORT_SIZE
+        try:
+            self.training.COHORT_SIZE = original + 60
+            self.training.reset()
+            self.assertIs(self.training.fitted().dwols, dwols.fitted_model())
+            self.assertEqual(
+                dwols.fitted_model().n_train,
+                len(self.training.fitted().train),
+                "the serving dWOLS fit did not follow the training split",
+            )
+        finally:
+            self.training.COHORT_SIZE = original
+            self.training.reset()
+
+
+class AutomaticSpecificationCheckTests(unittest.TestCase):
+    """The basis check runs on every fit, not only when someone remembers to look.
+
+    `cli misspecification --omitted-modifier` measures an omitted effect modifier
+    costing up to 65 points of interval coverage, with the interval *narrowing*
+    as it happens. A caveat that only appears in a command nobody runs is not a
+    caveat.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from treatmentrx.estimation import training
+
+        cls.training = training
+
+    def tearDown(self):
+        import treatmentrx.estimation.specification as specification
+
+        specification.rejection_threshold = self._original_threshold
+        self.training.reset()
+
+    def setUp(self):
+        import treatmentrx.estimation.specification as specification
+
+        self._original_threshold = specification.rejection_threshold
+
+    def _force_flag(self):
+        """Lower the bar so the wiring can be exercised on the default cohort.
+
+        The deployed basis is correct, so nothing flags — which is the right
+        answer and a useless test. Dropping the threshold makes the *propagation*
+        observable without pretending the cohort is misspecified.
+        """
+        import treatmentrx.estimation.specification as specification
+
+        specification.rejection_threshold = lambda *args, **kwargs: 2.0
+        self.training.reset()
+
+    def test_it_is_computed_at_fit_time(self):
+        report = self.training.basis_specification()
+        self.assertIn("candidates", report)
+        self.assertIs(report, self.training.fitted().specification)
+
+    def test_the_deployed_basis_is_not_flagged(self):
+        self.assertFalse(self.training.basis_is_flagged())
+        self.assertEqual(self.training.basis_specification()["flagged"], [])
+
+    def test_a_flag_blocks_the_validation_ladder(self):
+        from treatmentrx.domain import ValidationRung
+        from treatmentrx.feedback.validation_ladder import ValidationLadder
+
+        self._force_flag()
+        readiness = self.training.deployment_readiness()
+        self.assertFalse(readiness["blip_basis_unflagged"])
+        status = ValidationLadder().assess(ValidationRung.SILENT, readiness)
+        self.assertFalse(status.gate_passed)
+        self.assertTrue(any("blip basis" in blocker for blocker in status.blockers))
+
+    def test_a_flag_reaches_every_patient_as_an_uncertainty_flag(self):
+        from treatmentrx.demo_data import sample_ra_bundle
+        from treatmentrx.orchestrator import TreatmentRxOrchestrator
+
+        self._force_flag()
+        recommendation = TreatmentRxOrchestrator().run(sample_ra_bundle())
+        flags = recommendation.audit_event["uncertainty"]["flags"]
+        self.assertTrue(any(flag.startswith("blip_basis_may_omit:") for flag in flags))
+
+    def test_a_flag_reaches_the_clinician_card(self):
+        """The reader who acts on the interval is the one who needs to know."""
+        from treatmentrx.demo_data import sample_ra_bundle
+        from treatmentrx.orchestrator import TreatmentRxOrchestrator
+
+        self._force_flag()
+        card = TreatmentRxOrchestrator().run(sample_ra_bundle()).clinician_card
+        self.assertIn("CAVEAT", card)
+        self.assertIn("missing an effect modifier", card)
+
+    def test_a_clean_basis_adds_no_caveat(self):
+        from treatmentrx.demo_data import sample_ra_bundle
+        from treatmentrx.orchestrator import TreatmentRxOrchestrator
+
+        card = TreatmentRxOrchestrator().run(sample_ra_bundle()).clinician_card
+        self.assertNotIn("CAVEAT", card)
+
+    def test_a_flag_does_not_silently_change_the_decision(self):
+        """Stated policy, not an oversight — see `BLOCK_ON_FLAGGED_BASIS`.
+
+        The test is a falsification test with an actionable fix. Turning a
+        diagnostic into a silent behaviour change is the pattern this repo keeps
+        removing; it makes the flag loud instead.
+        """
+        from treatmentrx.demo_data import sample_ra_bundle
+        from treatmentrx.orchestrator import TreatmentRxOrchestrator
+
+        self.assertFalse(self.training.BLOCK_ON_FLAGGED_BASIS)
+        clean = TreatmentRxOrchestrator().run(sample_ra_bundle())
+        self._force_flag()
+        flagged = TreatmentRxOrchestrator().run(sample_ra_bundle())
+        self.assertEqual(clean.recommended_arm, flagged.recommended_arm)
+        self.assertEqual(clean.status, flagged.status)

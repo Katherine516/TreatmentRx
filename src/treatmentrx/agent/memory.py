@@ -14,6 +14,7 @@ with an assertion, not a convention.
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -104,7 +105,14 @@ def apply_memory(bundle: dict[str, Any], memory: EpisodicMemory, kb: SemanticKno
     FORBIDDEN: anything under statistical_output.
     """
     patient_hash = bundle["patient_context"]["patient_id"]
-    before = dict(bundle["statistical_output"])  # snapshot to prove non-influence
+    # Deep, not shallow. `q_values` and `confidence_band` are containers: a
+    # shallow snapshot holds the *same* objects the bundle does, so a component
+    # that mutates one in place — `q_values["TNF-inhibitor"] = 0.99` — passes the
+    # comparison below unchanged. The guard is the strongest claim this layer
+    # makes and it only held because `apply_memory` happens to replace containers
+    # rather than edit them; that stops being true the moment a real memory
+    # component gets a handle on the bundle.
+    before = copy.deepcopy(bundle["statistical_output"])
 
     preferences = memory.preferences(patient_hash)
     rag_query = " ".join(

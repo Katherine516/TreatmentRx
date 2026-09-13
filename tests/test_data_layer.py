@@ -1,8 +1,10 @@
 """Layer 1 — ingestion, stage construction, and the guards that must raise."""
 
+import copy
 import unittest
 
 from treatmentrx.contracts import PatientState
+from treatmentrx.arms import normalize_arm
 from treatmentrx.data import DataLayer
 from treatmentrx.data.contract import RADataContract
 from treatmentrx.data.dag import CausalDAGRegistry
@@ -242,8 +244,10 @@ class SimulatedIngestionTests(unittest.TestCase):
         statuses = {recommendation.status for recommendation in recommendations}
         self.assertGreater(len(statuses), 1, "every patient took the same path")
         for recommendation in recommendations:
-            if recommendation.status is not RecommendationStatus.BLOCKED:
+            if recommendation.status is RecommendationStatus.RECOMMEND:
                 self.assertIn(recommendation.recommended_arm, TREATMENT_ARMS)
+            else:
+                self.assertIsNone(recommendation.recommended_arm)
 
     def test_no_simulated_patient_trips_the_leakage_guard(self):
         """The exporter must not leak the future into the record it writes."""
@@ -253,3 +257,193 @@ class SimulatedIngestionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RealizedTreatmentTests(unittest.TestCase):
+    """`SwitchingRecord.realized` used to be a copy of `assigned`.
+
+    That made the ITT / per-protocol / as-treated split a distinction with no
+    input: every estimand was computed from the same assignment sequence. It now
+    comes from `MedicationDispense` / `MedicationAdministration` when the bundle
+    carries one.
+    """
+
+    def _bundle(self, dispensed=None, days_supply=None, stop_day=180):
+        entries = [
+            {"resource": {"resourceType": "Patient", "id": "p1"}},
+            {"resource": {"resourceType": "Condition", "code": {"text": "Rheumatoid Arthritis"}}},
+            {"resource": {"resourceType": "Encounter", "day": 0}},
+            {"resource": {"resourceType": "Encounter", "day": stop_day}},
+            {
+                "resource": {
+                    "resourceType": "Observation",
+                    "code": {"text": "DAS28"},
+                    "valueQuantity": {"value": 5.2, "unit": "score"},
+                    "effectiveDay": 0,
+                }
+            },
+            {
+                "resource": {
+                    "resourceType": "MedicationRequest",
+                    "medicationCodeableConcept": {"text": "adalimumab"},
+                    "authoredOnDay": 0,
+                    "stopDay": stop_day,
+                    "response": "partial response",
+                }
+            },
+        ]
+        if dispensed is not None:
+            entries.append(
+                {
+                    "resource": {
+                        "resourceType": "MedicationDispense",
+                        "medicationCodeableConcept": {"text": dispensed},
+                        "whenHandedOverDay": 5,
+                        "daysSupply": days_supply,
+                    }
+                }
+            )
+        entries.append(
+            {
+                "resource": {
+                    "resourceType": "MedicationRequest",
+                    "medicationCodeableConcept": {"text": "current decision point"},
+                    "authoredOnDay": stop_day,
+                }
+            }
+        )
+        return {"resourceType": "Bundle", "entry": entries}
+
+    def _switching(self, **kwargs):
+        return DataLayer().build_patient_state(self._bundle(**kwargs)).stages[0].switching
+
+    def test_no_dispense_record_leaves_realized_equal_to_assigned(self):
+        """An absent supply chain is a missing measurement, not evidence that
+        nothing was supplied — the two must not read the same."""
+        switching = self._switching()
+        self.assertEqual(switching.realized, switching.assigned)
+        self.assertEqual(switching.adherence, 1.0)
+
+    def test_a_cross_arm_substitution_is_a_switch(self):
+        switching = self._switching(dispensed="tocilizumab", days_supply=180)
+        self.assertNotEqual(
+            normalize_arm(switching.realized), normalize_arm(switching.assigned)
+        )
+        self.assertTrue(switching.switched)
+        self.assertIn("dispensed", switching.discontinuation_reason)
+
+    def test_a_within_class_substitution_is_not(self):
+        """Etanercept against an adalimumab order is the same arm, and the arm
+        is what the model reasons about."""
+        switching = self._switching(dispensed="etanercept", days_supply=180)
+        self.assertEqual(switching.realized, "etanercept")
+        self.assertEqual(
+            normalize_arm(switching.realized), normalize_arm(switching.assigned)
+        )
+        self.assertFalse(switching.switched)
+
+    def test_adherence_comes_from_days_covered_when_it_can(self):
+        full = self._switching(dispensed="adalimumab", days_supply=180)
+        half = self._switching(dispensed="adalimumab", days_supply=90)
+        self.assertEqual(full.adherence, 1.0)
+        self.assertEqual(half.adherence, 0.5)
+
+    def test_oversupply_does_not_exceed_full_adherence(self):
+        switching = self._switching(dispensed="adalimumab", days_supply=400)
+        self.assertEqual(switching.adherence, 1.0)
+
+    def test_a_dispense_without_days_supply_does_not_invent_adherence(self):
+        switching = self._switching(dispensed="adalimumab", days_supply=None)
+        self.assertEqual(switching.realized, "adalimumab")
+        self.assertEqual(switching.adherence, 1.0)
+
+
+class ConcomitantMedicationTests(unittest.TestCase):
+    """A steroid bridge is not a change of treatment line.
+
+    Every `MedicationRequest` used to become a stage, so a prednisone taper
+    recorded mid-line produced a phantom decision point: the agent read it as a
+    switch to an arm mapping to `manual-review`, renumbered every later stage,
+    and truncated the real DMARD line to end at the steroid's start day. Steroid
+    bridging is standard RA practice, so this would have hit real data at once.
+    """
+
+    def _bundle(self, *extra):
+        bundle = copy.deepcopy(sample_ra_bundle())
+        for resource in extra:
+            bundle["entry"].insert(-1, {"resource": resource})
+        return bundle
+
+    def _steroid(self, text="prednisone 20mg taper", start=120, stop=160):
+        return {
+            "resourceType": "MedicationRequest",
+            "medicationCodeableConcept": {"text": text},
+            "authoredOnDay": start,
+            "stopDay": stop,
+        }
+
+    def test_a_steroid_bridge_does_not_become_a_decision_point(self):
+        clean = DataLayer().build_patient_state(sample_ra_bundle())
+        bridged = DataLayer().build_patient_state(self._bundle(self._steroid()))
+        self.assertEqual(len(bridged.stages), len(clean.stages))
+        self.assertEqual(
+            [(s.treatment, s.start_day, s.end_day) for s in bridged.stages],
+            [(s.treatment, s.start_day, s.end_day) for s in clean.stages],
+            "the concomitant record changed the line sequence",
+        )
+
+    def test_it_flags_rescue_on_the_stage_it_overlaps(self):
+        state = DataLayer().build_patient_state(self._bundle(self._steroid(start=120)))
+        rescued = [s.stage for s in state.stages if s.switching.rescue_therapy]
+        self.assertEqual(rescued, [1], "day 120 falls inside stage 1 (0-240)")
+
+    def test_rescue_is_not_flagged_on_a_stage_it_misses(self):
+        state = DataLayer().build_patient_state(self._bundle(self._steroid(start=300, stop=330)))
+        rescued = [s.stage for s in state.stages if s.switching.rescue_therapy]
+        self.assertEqual(rescued, [2], "day 300 falls inside stage 2 (240-365)")
+
+    def test_a_clean_record_flags_no_rescue(self):
+        """The old check searched the arm name for 'steroid', which no canonical
+        arm contains, so the flag was permanently False either way."""
+        state = DataLayer().build_patient_state(sample_ra_bundle())
+        self.assertFalse(any(s.switching.rescue_therapy for s in state.stages))
+
+    def test_an_unrecognised_dmard_still_becomes_a_stage(self):
+        """Conservative on purpose: only positively-recognised concomitants are
+        dropped. A biologic newer than `ARM_SYNONYMS` must still surface for
+        manual review rather than vanish from the sequence.
+        """
+        from treatmentrx.arms import MANUAL_REVIEW, is_concomitant, normalize_arm
+
+        name = "some-new-biologic-2029"
+        self.assertEqual(normalize_arm(name), MANUAL_REVIEW)
+        self.assertFalse(is_concomitant(name))
+        clean = DataLayer().build_patient_state(sample_ra_bundle())
+        state = DataLayer().build_patient_state(
+            self._bundle(
+                {
+                    "resourceType": "MedicationRequest",
+                    "medicationCodeableConcept": {"text": name},
+                    "authoredOnDay": 300,
+                }
+            )
+        )
+        self.assertEqual(len(state.stages), len(clean.stages) + 1)
+
+    def test_a_record_of_only_concomitants_is_rejected_clearly(self):
+        from treatmentrx.data.stages import StageHistoryBuilder
+        from treatmentrx.domain import PatientRecord, TreatmentEvent
+
+        patient = PatientRecord(
+            patient_id="p",
+            disease="Rheumatoid Arthritis",
+            demographics={},
+            conditions=[],
+            allergies=[],
+            medications=[TreatmentEvent(name="prednisone 10mg", start_day=0)],
+            observations=[],
+            encounters=[0, 90],
+        )
+        with self.assertRaises(ValueError) as raised:
+            StageHistoryBuilder().build(patient)
+        self.assertIn("concomitant", str(raised.exception))

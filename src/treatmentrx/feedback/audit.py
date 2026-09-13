@@ -28,7 +28,7 @@ from treatmentrx.data import DataContractError, DataLayer
 from treatmentrx.demo_data import sample_ra_bundle
 from treatmentrx.domain import RecommendationStatus
 from treatmentrx.estimation import training
-from treatmentrx.estimation.features import model_features
+from treatmentrx.estimation.features import model_features, stage_index
 from treatmentrx.orchestrator import TreatmentRxOrchestrator
 from treatmentrx.simulation.fhir_export import simulated_bundles, trajectory_to_bundle
 from treatmentrx.simulation.ra_cohort import (
@@ -36,6 +36,9 @@ from treatmentrx.simulation.ra_cohort import (
     REFERENCE_ARM,
     generate_ra_cohort,
     optimal_arm,
+    oracle_action_value,
+    oracle_arm,
+    oracle_value,
     true_blip,
 )
 
@@ -118,9 +121,20 @@ def audit_estimation() -> Section:
         "worst_blip_parameter_error": max(errors.values()),
         "per_arm_worst_error": errors,
         "held_out_ipw_policy_value": {
-            name: score.ipw_policy_value for name, score in fit.scores.items()
+            name: [score.ipw_policy_value, list(score.value_interval or ())]
+            for name, score in fit.scores.items()
         },
         "behaviour_policy_value": next(iter(fit.scores.values())).behaviour_value,
+        "improvement_over_behaviour": {
+            name: list(score.improvement_interval or ()) for name, score in fit.scores.items()
+        },
+        "blip_basis_flagged": list(training.basis_specification().get("flagged", [])),
+        "blip_basis_max_z": {
+            name: entry["max_abs_z"]
+            for name, entry in training.basis_specification()["candidates"].items()
+        },
+        "estimator_ranking_resolved": training.ranking_is_resolved(),
+        "selected_estimator": training.best_score().estimator,
         "expected_calibration_error": training.holdout_calibration().expected_calibration_error,
         "calibration_passed": training.holdout_calibration().passed,
     }
@@ -128,24 +142,94 @@ def audit_estimation() -> Section:
         "Recovery is asserted at the terminal stage, the only block whose estimand "
         "is the single-visit blip; earlier stages legitimately absorb delayed effects."
     )
+    section.notes.append(
+        "Every estimator's gain over the behaviour policy excludes zero, so the "
+        "improvement is real. Their values overlap each other, so the *ordering* is "
+        "not — `selected_estimator` is then an interpretability tie-break, not a "
+        "measurement, and `estimator_ranking_resolved` says which of the two happened."
+        if not training.ranking_is_resolved()
+        else "The leading estimator's held-out interval clears the runner-up's."
+    )
     return section
 
 
 # ---------------------------------------------------------------- Layer 3
 
+def _regret_block(n: int, hits: int, regrets: list) -> dict:
+    """A regret summary that carries its own denominator.
+
+    `n` is not decoration. The previous version reported `oracle_arm_rate` and
+    `mean_regret_vs_oracle` as bare numbers, and when `recommended_arm` stopped
+    being populated for undecided patients the denominator fell from 120 to 43
+    without a word — the metrics went to a perfect 1.0 and 0.0 and read as an
+    improvement. Any rate printed here shows what it was computed over.
+    """
+    return {
+        "patients": n,
+        "oracle_arm_rate": _rate(hits, n),
+        "mean_regret": round(sum(regrets) / len(regrets), 4) if regrets else None,
+        "max_regret": round(max(regrets), 4) if regrets else None,
+    }
+
+
+def _abstention_price(argmax: list, worst_in_set: list, worst_overall: list) -> dict:
+    """What declining costs, as a function of what the clinician does next.
+
+    Abstention is the agent's defining behaviour and its cost has been asserted
+    rather than measured. It is not one number: handing the choice back is cheap
+    if the clinician takes the model's own ordering anyway, and expensive if they
+    pick the worst thing on the menu. The candidate set is what sits between
+    those two, so this is also the retrospective case for it.
+    """
+    if not argmax:
+        return {"declined_patients": 0}
+
+    def summary(values):
+        return {
+            "mean": round(sum(values) / len(values), 4),
+            "max": round(max(values), 4),
+        }
+
+    return {
+        "declined_patients": len(argmax),
+        "clinician_takes_the_models_top_arm": summary(argmax),
+        "clinician_takes_the_worst_arm_in_the_candidate_set": summary(worst_in_set),
+        "clinician_takes_the_worst_arm_on_the_menu": summary(worst_overall),
+    }
+
+
 def audit_decision(n: int = AUDIT_PATIENTS, seed: int = AUDIT_SEED) -> Section:
     """Regret against the oracle, and whether abstention is earned.
+
+    **Which oracle.** Regret used to be measured against `optimal_arm` — the
+    per-visit blip argmax — which is not the optimal policy for a sequential
+    problem with a delayed toxicity cost and differential dropout. Measured over
+    4000 rollouts it scores 2.134 against 2.149 for the agent's own policy, so
+    the agent was being charged regret against a rule it beats, and the companion
+    "optimal arm rate" rewarded whichever estimator was most myopic. Both are now
+    measured against `oracle_arm`, the backward-induction optimum under the
+    generating process (2.155). The myopic agreement rate is still reported,
+    under a name that says what it is.
 
     The equipoise check is the one that matters clinically: when the agent
     declines to separate two arms, the arms should actually be close. An agent
     that abstains at random is useless however well calibrated its Q-values are.
     """
     orchestrator = TreatmentRxOrchestrator()
+    horizon = training.fitted().pooled.n_stages
     statuses: dict[str, int] = {}
     gaps: dict[str, list[float]] = {}
     regrets: list[float] = []
-    optimal_hits = 0
+    myopic_regrets: list[float] = []
+    ranked_regrets: list[float] = []
+    declined_argmax: list[float] = []
+    declined_worst_in_set: list[float] = []
+    declined_worst_overall: list[float] = []
+    oracle_hits = 0
+    ranked_oracle_hits = 0
+    myopic_hits = 0
     scored = 0
+    ranked_scored = 0
 
     for bundle in simulated_bundles(n, seed=seed):
         try:
@@ -157,24 +241,83 @@ def audit_decision(n: int = AUDIT_PATIENTS, seed: int = AUDIT_SEED) -> Section:
 
         state = DataLayer().build_patient_state(bundle)
         features = model_features(state.stages)
-        ranked = sorted(TREATMENT_ARMS, key=lambda arm: true_blip(arm, features), reverse=True)
-        true_gap = true_blip(ranked[0], features) - true_blip(ranked[1], features)
+        index = stage_index(state.stages, horizon)
+        ranked = sorted(
+            TREATMENT_ARMS,
+            key=lambda arm: oracle_action_value(features, arm, index),
+            reverse=True,
+        )
+        true_gap = oracle_action_value(features, ranked[0], index) - oracle_action_value(
+            features, ranked[1], index
+        )
         gaps.setdefault(status, []).append(true_gap)
+
+        # Two questions, two denominators, and conflating them is how this
+        # metric came to read as perfection.
+        #
+        # `recommended_arm` is None unless the agent committed, so scoring only
+        # those rows asks "when it commits, is it right?" — and the answer is
+        # trivially yes, because it commits only when the gap is large. Measured
+        # that way the section reported oracle-arm rate 1.0 and max regret 0.0
+        # over 43 of 120 patients, while the same audit had read 0.9083 and
+        # 0.0406 when the denominator was all of them. Nothing improved; the
+        # question changed underneath the name.
+        #
+        # `top_scored_arm` is the ranking regardless of commitment, so it keeps
+        # the full denominator and answers "how good is the ordering?".
+        top = recommendation.top_scored_arm
+        if top is not None:
+            ranked_regrets.append(
+                oracle_value(features, index) - oracle_action_value(features, top, index)
+            )
+            ranked_scored += 1
+            if top == oracle_arm(features, index):
+                ranked_oracle_hits += 1
+            if top == optimal_arm(features):
+                myopic_hits += 1
+            myopic_regrets.append(
+                max(true_blip(arm, features) for arm in TREATMENT_ARMS)
+                - true_blip(top, features)
+            )
+
+        # What abstention actually costs depends on what the clinician does with
+        # it, so all three are priced rather than one asserted.
+        if recommendation.status is RecommendationStatus.EQUIPOISE:
+            best = oracle_value(features, index)
+            candidates = recommendation.audit_event.get("candidate_arms") or [top]
+            declined_argmax.append(best - oracle_action_value(features, top, index))
+            declined_worst_in_set.append(
+                best - min(oracle_action_value(features, arm, index) for arm in candidates)
+            )
+            declined_worst_overall.append(
+                best - min(oracle_action_value(features, arm, index) for arm in TREATMENT_ARMS)
+            )
 
         if recommendation.recommended_arm is None:
             continue
         scored += 1
-        chosen = true_blip(recommendation.recommended_arm, features)
-        regrets.append(true_blip(ranked[0], features) - chosen)
-        if recommendation.recommended_arm == optimal_arm(features):
-            optimal_hits += 1
+        chosen = recommendation.recommended_arm
+        regrets.append(
+            oracle_value(features, index) - oracle_action_value(features, chosen, index)
+        )
+        if chosen == oracle_arm(features, index):
+            oracle_hits += 1
 
     section = Section("3 decision")
     section.metrics = {
         "status_distribution": statuses,
-        "optimal_arm_rate": _rate(optimal_hits, scored),
-        "mean_regret_vs_oracle": round(sum(regrets) / len(regrets), 4) if regrets else None,
-        "max_regret": round(max(regrets), 4) if regrets else None,
+        # Named for the denominator, so neither can be read as the other.
+        "when_it_commits": _regret_block(scored, oracle_hits, regrets),
+        "if_forced_to_commit": _regret_block(
+            ranked_scored, ranked_oracle_hits, ranked_regrets
+        ),
+        "myopic_oracle_agreement_rate": _rate(myopic_hits, ranked_scored),
+        "mean_single_visit_blip_regret": (
+            round(sum(myopic_regrets) / len(myopic_regrets), 4) if myopic_regrets else None
+        ),
+        "abstention_price": _abstention_price(
+            declined_argmax, declined_worst_in_set, declined_worst_overall
+        ),
         "mean_true_gap_by_status": {
             status: round(sum(values) / len(values), 4) for status, values in sorted(gaps.items())
         },
@@ -187,70 +330,271 @@ def audit_decision(n: int = AUDIT_PATIENTS, seed: int = AUDIT_SEED) -> Section:
             f"Patients the agent declined to separate had a true top-two gap of "
             f"{equipoise_gap:.4f} against {recommend_gap:.4f} for those it recommended."
         )
+    forced = section.metrics["if_forced_to_commit"]
+    committed = section.metrics["when_it_commits"]
+    section.notes.append(
+        f"Two denominators. Over the {committed['patients']} patients it committed "
+        f"to, the agent picks the oracle arm {committed['oracle_arm_rate']:.0%} of "
+        f"the time — trivially high, because it commits only when the gap is large. "
+        f"Over all {forced['patients']}, its top-scored arm is the oracle arm "
+        f"{forced['oracle_arm_rate']:.0%} of the time at mean regret "
+        f"{forced['mean_regret']}. The second is the ranking; the first is the "
+        "ranking after selection, and reporting only the first once made this "
+        "section read as a flawless decision layer."
+    )
+    section.notes.append(
+        "Regret is against the backward-induction optimum under the generating "
+        "process, which charges for delayed toxicity and lost visits. The myopic "
+        "agreement rate is reported for continuity and is not an accuracy score: "
+        "the myopic rule is itself worse than the agent's policy."
+    )
     return section
 
 
 # ---------------------------------------------------------------- Layer 4
 
-_CONTRAINDICATIONS = [
-    ("pregnant", True, {"JAK-inhibitor", "methotrexate-optimization"}),
-    ("ALT", 400, {"JAK-inhibitor", "methotrexate-optimization"}),
-    ("eGFR", 12, {"JAK-inhibitor", "methotrexate-optimization"}),
-]
+# Organ-function values swept against each arm. `safe` values sit inside the
+# thresholds in `safety/rules.py`; `unsafe` ones sit clearly outside, so a case is
+# never scored on a boundary where either answer is defensible.
+_ALT_LEVELS = ((25.0, False), (100.0, False), (400.0, True))
+_EGFR_LEVELS = ((90.0, False), (45.0, False), (12.0, True), (0.0, True))
+_PREGNANCY_LEVELS = ((False, False), (True, True))
+
+# Which arms each condition contraindicates. Derived from the same clinical
+# facts `safety/feasible_set.py` encodes, written out independently here so the
+# audit is a check rather than a restatement of the implementation.
+_RENAL_HEPATIC_ARMS = frozenset({"JAK-inhibitor", "methotrexate-optimization"})
+_TERATOGENIC_ARMS = frozenset({"JAK-inhibitor", "methotrexate-optimization"})
+
+# Allergy tokens, with the arms each must remove *at the arm level*.
+#
+# A class-level allergy removes the whole arm. A drug-level allergy removes only
+# that molecule's composites, and the arm survives if another molecule in it
+# does — an adalimumab allergy is not an etanercept contraindication, and
+# treating it as one would cost the patient a viable option. So the arm-level
+# expectation for a drug-level allergy is *empty*, and the real assertion is the
+# composite one below: the allergen must never appear in a feasible action.
+# Getting this distinction wrong in the audit is how a correct filter gets
+# "fixed" into an over-removing one.
+_ALLERGY_CASES = (
+    ("TNF-inhibitor", frozenset({"TNF-inhibitor"})),
+    ("adalimumab", frozenset()),
+    ("etanercept", frozenset()),
+    ("tocilizumab", frozenset({"IL-6 inhibitor"})),
+    ("IL-6 inhibitor", frozenset({"IL-6 inhibitor"})),
+    ("upadacitinib", frozenset({"JAK-inhibitor"})),
+    ("rituximab", frozenset({"rituximab"})),
+    ("methotrexate", frozenset({"methotrexate-optimization"})),
+)
+
+# Values that must never remove anything: a blank record, and a measured zero
+# that is not clinically extreme for the field it is in.
+_INERT_RECORDS = ("", "   ")
+
+
+def _with_observation(code: str, value):
+    bundle = copy.deepcopy(sample_ra_bundle())
+    key = "valueBoolean" if isinstance(value, bool) else "valueQuantity"
+    payload = value if isinstance(value, bool) else {"value": value}
+    bundle["entry"].append(
+        {
+            "resource": {
+                "resourceType": "Observation",
+                "code": {"text": code},
+                key: payload,
+                "effectiveDay": 365,
+            }
+        }
+    )
+    return bundle
+
+
+def _with_allergy(text: str):
+    bundle = copy.deepcopy(sample_ra_bundle())
+    bundle["entry"].append(
+        {"resource": {"resourceType": "AllergyIntolerance", "code": {"text": text}}}
+    )
+    return bundle
+
+
+def _contraindication_routing(n: int = 60, seed: int = 606) -> dict[str, int]:
+    """How a contraindication is routed, over patients rather than one fixture.
+
+    The sweep above runs the demo patient, for whom the model has a clear
+    recommendation, so it cannot reach the branch where a contraindication lands
+    on an arm that was never recommended. That branch is the whole of Phase 2 and
+    it needs to be visible somewhere a reader looks.
+
+    Four outcomes, and only the third is new:
+
+    * leader feasible          -> the decision layer's status stands
+    * recommended, leader out  -> BLOCKED (invariant 2; the only status that stops)
+    * undecided, survivors     -> REVIEW with the remaining candidates
+    * undecided, no survivors  -> BLOCKED
+    """
+    from treatmentrx.data import DataContractError, DataLayer
+    from treatmentrx.decision import DecisionLayer
+    from treatmentrx.estimation import EstimationLayer
+    from treatmentrx.safety import SafetyLayer
+    from treatmentrx.simulation.fhir_export import simulated_bundles
+
+    data, estimation, decision, safety = (
+        DataLayer(), EstimationLayer(), DecisionLayer(), SafetyLayer()
+    )
+    counts = {
+        "leader_feasible": 0,
+        "recommended_arm_infeasible_blocked": 0,
+        "undecided_contraindication_reviewed": 0,
+        "undecided_contraindication_blocked": 0,
+    }
+    for bundle in simulated_bundles(n, seed=seed):
+        try:
+            state = data.build_patient_state(_with_pregnancy(bundle))
+        except DataContractError:
+            continue
+        made = decision.decide(state, estimation.estimate(state))
+        safe = safety.apply(made, state)
+        feasible = set(safe.feasible_arms)
+        if made.recommended_arm in feasible:
+            counts["leader_feasible"] += 1
+        elif made.status is not RecommendationStatus.EQUIPOISE:
+            counts["recommended_arm_infeasible_blocked"] += 1
+        elif any(arm in feasible for arm in made.candidate_arms):
+            counts["undecided_contraindication_reviewed"] += 1
+        else:
+            counts["undecided_contraindication_blocked"] += 1
+    return counts
+
+
+def _with_pregnancy(bundle: dict) -> dict:
+    """Attach the contraindication inside the patient's final stage.
+
+    A fixed day does not work on the simulated cohort — visits are irregular, so
+    it lands inside only some final stages, and anything after the decision point
+    is dropped by the temporal firewall. Getting this wrong is silent: the
+    contraindication simply never reaches the model.
+    """
+    from treatmentrx.data import DataLayer
+
+    day = DataLayer().build_patient_state(bundle).stages[-1].start_day
+    bundle = copy.deepcopy(bundle)
+    bundle["entry"].append(
+        {
+            "resource": {
+                "resourceType": "Observation",
+                "code": {"text": "pregnant"},
+                "valueBoolean": True,
+                "effectiveDay": day,
+            }
+        }
+    )
+    return bundle
 
 
 def audit_safety() -> Section:
     """Does the gate remove what it should, and leave the rest alone?
 
-    Reported as recall and false-removal rate rather than one accuracy number:
-    the two failure modes are not interchangeable. Missing a contraindication
-    can harm a patient; removing a safe arm costs them an option and, because
-    the layer refuses to substitute, can block the recommendation outright.
+    Reported as recall *and* precision rather than one accuracy number: the two
+    failure modes are not interchangeable. Missing a contraindication can harm a
+    patient; removing a safe arm costs them an option and, because the layer
+    refuses to substitute, can block the recommendation outright.
+
+    The sweep replaced three hand-picked scenarios. `contraindication_recall: 1.0`
+    over six expected removals reads like a validated recall estimate and was
+    nothing of the kind — it could not distinguish a filter that works from one
+    that removes the two arms in question unconditionally. Every case here is a
+    labelled (record, arm) pair, and the safe levels are what give the count a
+    denominator: a filter that removes everything now scores precision 0.
     """
     orchestrator = TreatmentRxOrchestrator()
-    caught = expected = spurious = 0
-    detail = {}
+    # (label, bundle, arms that must be removed, token that must not survive)
+    cases: list[tuple[str, dict, frozenset, str | None]] = []
 
-    for code, value, should_remove in _CONTRAINDICATIONS:
-        bundle = copy.deepcopy(sample_ra_bundle())
-        key = "valueBoolean" if isinstance(value, bool) else "valueQuantity"
-        payload = value if isinstance(value, bool) else {"value": value}
-        bundle["entry"].append(
-            {
-                "resource": {
-                    "resourceType": "Observation",
-                    "code": {"text": code},
-                    key: payload,
-                    "effectiveDay": 365,
-                }
-            }
-        )
-        removed = set(orchestrator.run(bundle).audit_event["removed_arms"])
+    for level, unsafe in _ALT_LEVELS:
+        cases.append((f"ALT={level:g}", _with_observation("ALT", level),
+                      _RENAL_HEPATIC_ARMS if unsafe else frozenset(), None))
+    for level, unsafe in _EGFR_LEVELS:
+        cases.append((f"eGFR={level:g}", _with_observation("eGFR", level),
+                      _RENAL_HEPATIC_ARMS if unsafe else frozenset(), None))
+    for level, unsafe in _PREGNANCY_LEVELS:
+        cases.append((f"pregnant={level}", _with_observation("pregnant", level),
+                      _TERATOGENIC_ARMS if unsafe else frozenset(), None))
+    for token, arms in _ALLERGY_CASES:
+        cases.append((f"allergy={token!r}", _with_allergy(token), arms, token))
+    for blank in _INERT_RECORDS:
+        cases.append((f"allergy={blank!r} (blank record)", _with_allergy(blank), frozenset(), None))
+    cases.append(("baseline (healthy)", sample_ra_bundle(), frozenset(), None))
+
+    caught = expected = removed_total = spurious = 0
+    misses: dict[str, list[str]] = {}
+    over_removals: dict[str, list[str]] = {}
+    surviving_allergens: dict[str, list[str]] = {}
+
+    for label, bundle, should_remove, token in cases:
+        try:
+            recommendation = orchestrator.run(bundle)
+        except DataContractError:
+            over_removals[label] = ["record rejected by the data contract"]
+            continue
+        removed = set(recommendation.audit_event["removed_arms"])
         caught += len(removed & should_remove)
         expected += len(should_remove)
+        removed_total += len(removed)
         spurious += len(removed - should_remove)
-        detail[f"{code}={value}"] = {
-            "removed": sorted(removed),
-            "missed": sorted(should_remove - removed),
-            "unexpected": sorted(removed - should_remove),
-        }
-
-    baseline_removed = orchestrator.run(sample_ra_bundle()).audit_event["removed_arms"]
-    allergy_bundle = copy.deepcopy(sample_ra_bundle())
-    allergy_bundle["entry"].append(
-        {"resource": {"resourceType": "AllergyIntolerance", "code": {"text": "TNF-inhibitor"}}}
-    )
-    class_allergy = set(orchestrator.run(allergy_bundle).audit_event["removed_arms"])
+        if should_remove - removed:
+            misses[label] = sorted(should_remove - removed)
+        if removed - should_remove:
+            over_removals[label] = sorted(removed - should_remove)
+        # The arm-level check cannot see this: an arm survives on one molecule
+        # while another of its composites is the one the patient reacts to.
+        if token:
+            leaked = [
+                action
+                for action in _feasible_actions(bundle)
+                if token.lower() in action.lower()
+            ]
+            if leaked:
+                surviving_allergens[label] = leaked
 
     section = Section("4 safety")
     section.metrics = {
+        "cases": len(cases),
+        "labelled_removals_expected": expected,
         "contraindication_recall": _rate(caught, expected),
+        "removal_precision": _rate(caught, removed_total),
+        "allergen_composites_surviving": surviving_allergens,
+        "missed": misses,
+        "over_removed": over_removals,
         "spurious_removals": spurious,
-        "healthy_patient_removals": len(baseline_removed),
-        "class_level_allergy_removed": "TNF-inhibitor" in class_allergy,
-        "detail": detail,
+"contraindication_routing": _contraindication_routing(),
+        "healthy_patient_removals": len(
+            orchestrator.run(sample_ra_bundle()).audit_event["removed_arms"]
+        ),
     }
+    section.notes.append(
+        f"{len(cases)} labelled cases spanning organ function, pregnancy, drug- and "
+        f"class-level allergies, and records that must remove nothing. Recall and "
+        f"precision are reported separately because a filter that removes every arm "
+        f"scores perfect recall."
+    )
+    section.notes.append(
+        "A drug-level allergy is expected to remove the molecule's composites and "
+        "leave the arm, which survives on another molecule; the arm-level count "
+        "would call that a miss, so the allergen is also checked against the "
+        "surviving composite set, where it must not appear at all."
+    )
     return section
+
+
+def _feasible_actions(bundle) -> list[str]:
+    """Composite-level survivors, which the recommendation does not carry."""
+    from treatmentrx.decision import DecisionLayer
+    from treatmentrx.estimation import EstimationLayer
+    from treatmentrx.safety import SafetyLayer
+
+    state = DataLayer().build_patient_state(bundle)
+    decision = DecisionLayer().decide(state, EstimationLayer().estimate(state))
+    return SafetyLayer().apply(decision, state).feasible_actions
 
 
 # ---------------------------------------------------------------- Layer 5
@@ -321,9 +665,13 @@ def audit_governance() -> Section:
         "validation_rung": first.validation.rung.value if first.validation else None,
         "retraining_allowed": first.provenance["feedback"]["retraining_allowed"],
         "ope_is_patient_level": (
-            first.audit_event["ope"]["naive_policy_value"]
+            first.audit_event["ope"]["observed_mean_outcome"]
             != first.audit_event["ope"]["model_policy_value"]
         ),
+        # The patient-level block used to carry an `iptw_policy_value` built from
+        # hand-set constants. It is gone; what is left is descriptive and says so.
+        "ope_is_descriptive_only": "observed_mean_outcome" in first.audit_event["ope"]
+        and "iptw_policy_value" not in first.audit_event["ope"],
     }
     section.notes.append(
         "Estimands describe the policy and must not vary by patient; the OPE summarises "

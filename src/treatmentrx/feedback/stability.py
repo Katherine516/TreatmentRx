@@ -29,6 +29,8 @@ from dataclasses import dataclass, field
 
 from treatmentrx.estimation.dwols import DWOLS_METHOD, DWOLSModel
 from treatmentrx.estimation.q_learning import (
+    DEFAULT_POOLING_RIDGE,
+    Q_POOLED_METHOD,
     Q_SHARED_METHOD,
     STAGE_SPECIFIC_METHOD,
     QLearningModel,
@@ -94,14 +96,22 @@ def _spread(values: list[float]) -> Spread:
 def _fit_and_score(train: list[CohortTrajectory], holdout: list[CohortTrajectory]) -> dict[str, dict]:
     q_shared = QLearningModel(train, share_blip=True)
     stage_specific = QLearningModel(train, share_blip=False)
+    # The serving Q-learning model has to be in the sweep, or the verdict about
+    # whether the ranking is resolved is about estimators that do not serve.
+    pooled = QLearningModel(train, share_blip=True, pooling_ridge=DEFAULT_POOLING_RIDGE)
     dwols = DWOLSModel(train)
     scored = {}
     for name, model in (
         (Q_SHARED_METHOD, q_shared),
         (STAGE_SPECIFIC_METHOD, stage_specific),
+        (Q_POOLED_METHOD, pooled),
         (DWOLS_METHOD, dwols),
     ):
-        score = evaluate_policy(name, model.greedy_policy(), model.predict_outcome, holdout)
+        # No intervals: this reads the point value only, and the sweep pays this
+        # once per estimator per fold per seed.
+        score = evaluate_policy(
+            name, model.greedy_policy(), model.predict_outcome, holdout, with_intervals=False
+        )
         scored[name] = {
             "policy_value": score.ipw_policy_value,
             "optimal_arm_rate": score.optimal_arm_rate,

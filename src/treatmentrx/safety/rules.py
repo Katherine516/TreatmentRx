@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from treatmentrx.contracts import Decision, PatientState
 from treatmentrx.domain import SafetyFlag, StageRecord
+from treatmentrx.safety.feasible_set import allergy_matches
 
 # Organ-function and pregnancy limits for the drug classes that have them.
 ALT_CEILING = 120.0
@@ -59,6 +60,15 @@ class SafetyRules:
         ]
 
     def _allergy_flags(self, state: PatientState, decision: Decision) -> list[SafetyFlag]:
+        """Block when a recorded allergy names the recommended arm.
+
+        The token is stripped and checked for emptiness first. An allergy
+        recorded as "" — a blank field in the source record, not a clinical fact
+        — is a substring of every arm name, so without the guard one data-quality
+        artefact blocked every patient it touched. `FeasibleSet` has always
+        guarded this; the arm-level rule did not, and blocking is the fail-safe
+        direction, which is exactly why it went unnoticed.
+        """
         recommended = decision.recommended_arm.lower()
         return [
             SafetyFlag(
@@ -68,7 +78,7 @@ class SafetyRules:
                 decision.recommended_arm,
             )
             for allergy in state.allergies
-            if allergy.lower() in recommended
+            if allergy_matches(allergy, recommended)
         ]
 
     def _delayed_toxicity(self, stages: list[StageRecord], recommended_arm: str) -> SafetyFlag | None:
@@ -100,9 +110,19 @@ class SafetyRules:
         return None
 
     def _out_of_support(self, stage: StageRecord) -> bool:
-        das28 = _numeric(stage.features.get("das28")) or 4.0
-        crp = _numeric(stage.features.get("crp")) or 8.0
-        egfr = _numeric(stage.features.get("egfr")) or 90.0
+        """Are the covariates past the edge of the training cohort's support?
+
+        `_numeric(...) or default` was wrong in the one direction that matters
+        here: 0.0 is falsy, so an anuric patient's eGFR of 0 was read as the
+        healthy default of 90 and the extrapolation warning never fired — on the
+        most extreme patient the range admits. The composite filter still removed
+        the renally-cleared arms, so no unsafe arm escaped; what was lost was the
+        warning that the estimates for the arms that *remained* are
+        extrapolations.
+        """
+        das28 = _numeric_or(stage, "das28", 4.0)
+        crp = _numeric_or(stage, "crp", 8.0)
+        egfr = _numeric_or(stage, "egfr", 90.0)
         return das28 > DAS28_CEILING or crp > CRP_CEILING or egfr < OOD_EGFR_FLOOR
 
 
@@ -110,6 +130,16 @@ def _numeric(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     return float(value)
+
+
+def _numeric_or(stage: StageRecord, key: str, default: float) -> float:
+    """The recorded value, or `default` only when there is genuinely no number.
+
+    Distinguishing "absent" from "zero" has to be done on the `None`, never on
+    truthiness — a measured 0 is a clinical fact and often the extreme one.
+    """
+    value = _numeric(stage.features.get(key))
+    return default if value is None else value
 
 
 __all__ = ["SafetyRules"]

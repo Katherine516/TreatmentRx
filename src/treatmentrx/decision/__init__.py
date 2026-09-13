@@ -19,12 +19,16 @@ from treatmentrx.decision.uncertainty import UncertaintyDecomposer
 from treatmentrx.domain import RecommendationStatus, Uncertainty
 from treatmentrx.estimation import training
 from treatmentrx.estimation.features import model_features, stage_index
-from treatmentrx.estimation.inference import DEFAULT_ALPHA, Z_QUANTILE, ContrastTest
+from treatmentrx.estimation.inference import (
+    DEFAULT_ALPHA,
+    ContrastTest,
+    normal_critical_value,
+)
 from treatmentrx.estimation.belief_aware import BeliefAwareAdjuster
 from treatmentrx.estimation.competing_risk_outcomes import CompetingRiskEndpoint
 from treatmentrx.estimation.explainability import ModelExplainer
 from treatmentrx.estimation.dwols import DWOLSSharedEstimator
-from treatmentrx.estimation.estimators import QSharedEstimator, StageSpecificQEstimator
+from treatmentrx.estimation.estimators import PooledQEstimator
 from treatmentrx.estimation.goal_conditioned import GoalConditionedThresholds
 
 OOD_REVIEW_THRESHOLD = 0.75
@@ -38,7 +42,9 @@ class DecisionLayer:
         self.goal_thresholds = GoalConditionedThresholds()
         self.uncertainty = UncertaintyDecomposer()
         self.explainer = ModelExplainer()
-        self.estimators = (QSharedEstimator(), DWOLSSharedEstimator(), StageSpecificQEstimator())
+        # Must match `EstimationLayer.estimators`: the interval has to describe
+        # the same ensemble the Q-values came from.
+        self.estimators = (PooledQEstimator(), DWOLSSharedEstimator())
 
     def decide(self, state: PatientState, estimates: list[RegimeEstimate]) -> Decision:
         if not estimates:
@@ -59,12 +65,12 @@ class DecisionLayer:
             state.stages,
             selected,
             estimates,
-            state.encoded_state,
             training.holdout_calibration(),
             contrast,
         )
         explanation = self.explainer.explain(selected, estimates, state.stages)
 
+        candidate_arms, candidate_contrasts = self._candidate_set(state, selected, model_weights)
         status, rationale = self._status(state, uncertainty, goal_decision, contrast)
         return Decision(
             recommended_arm=selected.recommended_arm,
@@ -79,6 +85,8 @@ class DecisionLayer:
             explanation=explanation,
             confidence_gap=goal_decision.observed_gap,
             contrast=contrast,
+            candidate_arms=candidate_arms,
+            candidate_contrasts=candidate_contrasts,
         )
 
     def _contrast(self, state: PatientState, selected: RegimeEstimate, weights: dict[str, float]):
@@ -95,19 +103,109 @@ class DecisionLayer:
 
         The variance of a weighted average is bounded above by the weighted sum
         of the component standard deviations, with equality under perfect
-        correlation. The three estimators are fit on the same patients and are
-        strongly correlated, so the bound is close to tight rather than wasteful,
-        and it errs in the safe direction for a decision a clinician will act on.
+        correlation. The estimators are fit on the same patients and are strongly
+        correlated, so the bound is close to tight rather than wasteful, and it
+        errs in the safe direction for a decision a clinician will act on.
+
+        **Centring is the part that had to be fixed first.** Swept across the
+        patient grid this interval once covered 74%, and the miss was not width —
+        its SE ran 1.12-1.52x the actual spread everywhere. The average included a
+        shared-blip estimator whose terminal contrast is a stage-pooled compromise
+        biased +0.067, so the ensemble sat between two parameters. It now averages
+        `training.SERVING_ENSEMBLE`, whose members estimate the same quantity, and
+        covers **95.0% pooled with 93% at the worst patient, at SE/spread 1.04**.
+        Those figures moved from 98%/97%/1.27 when `ArmFit.cross_covariance`
+        started being kept: the interval lost width that was an error rather than
+        a margin, so it is now at nominal rather than above it.
+
+        **The figure is measured at the terminal decision**, which is the one
+        stage where both serving members target the same quantity. Swept
+        (`coverage.decision_rule_stage_sweep`) it holds at 96.7% for stage 1 —
+        the only other stage Layer 1 can produce — and falls to 77.5% at stage 0,
+        which is fitted and never served because `build_patient_state` appends
+        the pending visit.
         """
         ordered = sorted(selected.q_values, key=selected.q_values.get, reverse=True)
         if len(ordered) < 2:
             return None
-        arm, comparator = ordered[0], ordered[1]
+        return self._pair_contrast(
+            state,
+            ordered[0],
+            ordered[1],
+            weights,
+            alpha=self._simultaneous_alpha(len(ordered)),
+        )
 
+    def _candidate_set(
+        self, state: PatientState, selected: RegimeEstimate, weights: dict[str, float]
+    ):
+        """Every arm the data cannot separate from the leader, and why.
+
+        **Why this exists.** The agent declines to name one arm for most patients
+        it sees — about 67% at the training population, 57-89% across the sites in
+        `cli transfer`, and 97% for seronegative patients. Until now that produced
+        a status and a paragraph, and the clinician, who still has to prescribe
+        something, got nothing to prescribe *with*. The information to do better
+        was already computed and discarded: measured over declined patients, the
+        arms that survive this test average 2.7 of 6, and choosing the worst of
+        them instead of the worst of all six cuts worst-case regret from 0.206 to
+        0.047, a 77% reduction. Replicated over 40 refits on the coverage grid the
+        set contains the truly optimal arm in 240/240 draws at mean size 1.97.
+
+        **What it is not.** It is not a way to recommend more often. The action
+        bar is untouched, `status` is unchanged, and an arm inside this set has
+        *not* been recommended — the set is what the agent can say when it cannot
+        recommend. Collapsing it toward one arm to raise the recommend rate would
+        be the tuning CLAUDE.md forbids, wearing a new name.
+
+        The rule is the one Layer 3 already applies to the runner-up:
+        `robustly_distinguishable`, on the same model-averaged interval. An arm is
+        excluded only if the interval that *would* have been reported for it
+        excludes zero.
+        """
+        arms = sorted(selected.q_values, key=selected.q_values.get, reverse=True)
+        if len(arms) < 2:
+            return tuple(arms), {}
+
+        leader = arms[0]
+        alpha = self._simultaneous_alpha(len(arms))
+        candidates = [leader]
+        contrasts: dict[str, object] = {}
+        for arm in arms[1:]:
+            test = self._pair_contrast(
+                state, leader, arm, weights, alpha=alpha
+            )
+            if test is None:
+                # No interval means no evidence to exclude on. Keeping the arm is
+                # the conservative direction: the set may only be too wide.
+                candidates.append(arm)
+                continue
+            contrasts[arm] = test
+            if not test.robustly_distinguishable:
+                candidates.append(arm)
+        return tuple(candidates), contrasts
+
+    def _pair_contrast(
+        self,
+        state: PatientState,
+        arm: str,
+        comparator: str,
+        weights: dict[str, float],
+        alpha: float = DEFAULT_ALPHA,
+    ):
+        """The model-averaged interval for one ordered pair.
+
+        Split out of `_contrast` so the candidate set can ask the same question
+        of every arm. Nothing about the rule changes with the pair — which is the
+        point: an arm is excluded by exactly the interval that would have been
+        reported had it been the runner-up.
+        """
         tests: dict[str, object] = {}
         for estimator in self.estimators:
             try:
-                tests[estimator.method_name] = estimator.contrast(state.stages, arm, comparator)
+                tests[estimator.method_name] = estimator.contrast(
+                    state.stages, arm, comparator, alpha
+                )
             except (KeyError, ValueError):
                 continue
         if not tests:
@@ -120,13 +218,13 @@ class DecisionLayer:
 
         # If the estimators have been resampled together, their covariance is
         # measured and the bound is unnecessary.
-        joint = self._joint_contrast(state, arm, comparator, weights)
+        joint = self._joint_contrast(state, arm, comparator, weights, alpha)
         if joint is not None:
             return joint
 
         difference = sum(weights.get(n, 0.0) * t.difference for n, t in tests.items()) / total
         standard_error = sum(weights.get(n, 0.0) * t.standard_error for n, t in tests.items()) / total
-        margin = Z_QUANTILE[DEFAULT_ALPHA] * standard_error
+        margin = normal_critical_value(alpha) * standard_error
         exact = all(getattr(t, "exact", False) for t in tests.values())
         return ContrastTest(
             arm=arm,
@@ -135,10 +233,15 @@ class DecisionLayer:
             standard_error=standard_error,
             lower=difference - margin,
             upper=difference + margin,
-            alpha=DEFAULT_ALPHA,
-            # The variance bound already errs wide — measured at 1.29x the
-            # estimator's actual spread — so this interval must not then be
-            # widened again by the sandwich-inflation guard.
+            alpha=alpha,
+            # Exempt from the sandwich-inflation guard, and the reason has
+            # changed. It used to be "the bound already errs wide", measured at
+            # 1.15x the estimator's actual spread. With the dWOLS cross-arm
+            # covariance kept, the bound runs at 1.04 — essentially exact — so
+            # the argument is no longer that widening is redundant but that it
+            # would make a calibrated interval wrong in the other direction.
+            # `SANDWICH_INFLATION` was calibrated on a single estimator's
+            # sandwich at 0.88 of its spread, which is not this quantity.
             conservative=True,
             caveat=(
                 ""
@@ -146,12 +249,15 @@ class DecisionLayer:
                 else (
                     "Model-averaged contrast; the variance is the weighted sum of the "
                     "component standard errors, an upper bound that is tight when they "
-                    "are perfectly correlated."
+                    "are perfectly correlated. The alpha level is Bonferroni-adjusted "
+                    "over every unordered arm pair."
                 )
             ),
         )
 
-    def _joint_contrast(self, state: PatientState, arm: str, comparator: str, weights):
+    def _joint_contrast(
+        self, state: PatientState, arm: str, comparator: str, weights, alpha: float
+    ):
         """Interval from the joint bootstrap, when one has been enabled.
 
         Falls back to None — and so to the conservative bound — whenever the
@@ -163,21 +269,47 @@ class DecisionLayer:
             return None
         fit = training.fitted()
         features = model_features(state.stages)
-        index = stage_index(state.stages, fit.q_shared.n_stages)
-        horizon = fit.q_shared.remaining_stages(index)
-        loadings = {
-            training.Q_SHARED: fit.q_shared.contrast_loading(arm, comparator, features, index),
-            training.STAGE_SPECIFIC: fit.stage_specific.contrast_loading(
+        index = stage_index(state.stages, fit.pooled.n_stages)
+        horizon = fit.pooled.remaining_stages(index)
+        # Only the serving ensemble: the joint draws cover all three estimators,
+        # but averaging the shared blip back in here would reintroduce exactly
+        # the centring error that keeping it out of `self.estimators` removed.
+        available = {
+            training.Q_POOLED: lambda: fit.pooled.contrast_loading(
                 arm, comparator, features, index
             ),
-            training.DWOLS_SHARED: fit.dwols.contrast_loading(arm, comparator, features),
+            training.DWOLS_SHARED: lambda: fit.dwols.contrast_loading(
+                arm, comparator, features
+            ),
+        }
+        loadings = {
+            name: build() for name, build in available.items()
+            if name in training.SERVING_ENSEMBLE
         }
         try:
             return bootstrap.contrast(
-                loadings, weights, arm, comparator, scale_by=float(horizon)
+                loadings,
+                weights,
+                arm,
+                comparator,
+                alpha=alpha,
+                scale_by=float(horizon),
             )
         except (ValueError, KeyError, IndexError):
             return None
+
+    def _simultaneous_alpha(self, number_of_arms: int) -> float:
+        """Bonferroni family-wise alpha over all unordered treatment pairs.
+
+        The leader and comparator are selected from the same estimates used for
+        inference.  A pointwise 95% interval does not account for that search.
+        This conservative correction makes the emitted candidate set an
+        all-pairs confidence set; joint bootstrap draws still supply covariance
+        within each contrast when enabled.
+        """
+        from treatmentrx.estimation.inference import simultaneous_alpha
+
+        return simultaneous_alpha(number_of_arms, DEFAULT_ALPHA)
 
     def _status(self, state, uncertainty: Uncertainty, goal_decision, contrast):
         if not state.diagnostics_passed:

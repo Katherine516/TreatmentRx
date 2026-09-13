@@ -37,6 +37,7 @@ from treatmentrx.domain import (
     Uncertainty,
     ValidationStatus,
 )
+from treatmentrx.scientific import EstimandContract, ScientificMode
 
 
 @dataclass(frozen=True)
@@ -84,9 +85,14 @@ class PatientState:
     data_contract: DataContractReport
     dag_validation: DAGValidationResult
     encoded_state: EncodedState
-    tailoring_variables: list[str] = field(default_factory=list)
+    # No `tailoring_variables` here. Which covariates the treatment effect varies
+    # over is a property of the fitted blip, so it is decided in Layer 2 and
+    # carried on `RegimeEstimate.top_tailoring_variables`. The Layer 1 version
+    # ranked raw features by magnitude and could not see the boolean effect
+    # modifiers at all — the same class of mistake as the old `visit_weight`.
     competing_risk_incidence: dict[str, float] = field(default_factory=dict)
-    raw_patient: Any = None
+    operating_mode: ScientificMode = ScientificMode.DTR_RESEARCH
+    estimand_contract: EstimandContract | None = None
 
     @property
     def diagnostics_passed(self) -> bool:
@@ -115,6 +121,7 @@ class RegimeEstimate:
     coefficients: dict[str, float] = field(default_factory=dict)
     top_tailoring_variables: list[str] = field(default_factory=list)
     diagnostics: list[LayerDiagnostic] = field(default_factory=list)
+    estimand_fingerprint: str = ""
 
 
 @dataclass(frozen=True)
@@ -144,6 +151,12 @@ class Decision:
     explanation: ExplanationBundle
     confidence_gap: float
     contrast: Any = None  # ContrastTest for the top arm vs the runner-up
+    # Arms the data cannot separate from the leader, leader first. Size 1 means
+    # one arm is defensible; larger means the agent can still rule the rest out.
+    # This is what the agent has to say when it will not name a single arm — it
+    # is not a recommendation, and nothing here has passed the safety layer yet.
+    candidate_arms: tuple[str, ...] = ()
+    candidate_contrasts: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -193,6 +206,7 @@ class Recommendation:
     patient_hash: str
     status: RecommendationStatus
     recommended_arm: str | None
+    top_scored_arm: str
     q_values: dict[str, float]
     clinician_card: str
     patient_summary: str
@@ -214,6 +228,8 @@ class FeedbackReceipt:
     ope_track_enqueued: bool
     retraining_allowed: bool
     message: str
+    full_system_track_enqueued: bool = False
+    policy_value_scopes: tuple[str, ...] = ()
     estimands: list[EstimandResult] = field(default_factory=list)
     validation: ValidationStatus | None = None
     ope: dict[str, Any] = field(default_factory=dict)

@@ -80,10 +80,16 @@ class AgentLayer:
             return self._blocked(context, safe, safety_text)
 
         guideline_text = self._guideline_agent(context)
+        published_arm = (
+            safe.decision.recommended_arm
+            if safe.status is RecommendationStatus.RECOMMEND
+            else None
+        )
         return Recommendation(
             patient_hash=context.patient["patient_id"],
             status=safe.status,
-            recommended_arm=safe.decision.recommended_arm,
+            recommended_arm=published_arm,
+            top_scored_arm=safe.decision.recommended_arm,
             q_values=safe.decision.q_values,
             clinician_card=self.rationale.clinician_card(context, safe, safety_text, guideline_text),
             patient_summary=self.rationale.patient_summary(context, safe),
@@ -112,8 +118,9 @@ class AgentLayer:
             patient_hash=context.patient["patient_id"],
             status=RecommendationStatus.BLOCKED,
             recommended_arm=None,
+            top_scored_arm=safe.decision.recommended_arm,
             q_values=safe.decision.q_values,
-            clinician_card=f"Recommendation blocked pending clinical review. {safety_text}",
+            clinician_card=self.rationale.blocked_card(safe, safety_text),
             patient_summary=(
                 "The care team needs to review a safety or data-quality issue before a treatment "
                 "suggestion is shown."

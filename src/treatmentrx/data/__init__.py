@@ -13,17 +13,20 @@ from dataclasses import replace
 from typing import Any
 
 from treatmentrx.contracts import LayerDiagnostic, PatientState, VersionSet
+from treatmentrx.arms import TREATMENT_ARMS
 from treatmentrx.data.belief import BeliefStateFilter
 from treatmentrx.data.competing_risks import CompetingRiskBuilder
 from treatmentrx.data.contract import DataContractError, RADataContract
+from treatmentrx.data.endpoints import Endpoint
 from treatmentrx.data.dag import CausalDAGRegistry
 from treatmentrx.data.encoders import GRUBaselineEncoder, HandcraftedFeatureEncoder
 from treatmentrx.data.fhir import FHIRAdapter
 from treatmentrx.data.leakage import LeakageError, LeakageTestSuite
-from treatmentrx.data.stages import StageHistoryBuilder, VariableSelector
+from treatmentrx.data.stages import StageHistoryBuilder
 from treatmentrx.data.switching import SwitchingCapture
 from treatmentrx.data.timing import TimingModel
 from treatmentrx.domain import CareGoal, PatientRecord, StageRecord
+from treatmentrx.scientific import EstimandContract, ScientificMode, ra_dtr_estimand
 
 ALT_TOXICITY_THRESHOLD = 120.0
 REMISSION_BELIEF = 0.35
@@ -31,13 +34,18 @@ REMISSION_OUTCOME = 0.7
 
 
 class DataLayer:
-    """Builds the patient state, and refuses to build one that leaks."""
+    """Builds the patient state, and refuses to build one that leaks.
 
-    def __init__(self) -> None:
+    `endpoint` decides what a stage's outcome is — the reward everything
+    downstream optimises. It defaults to the free-text mapping because that is
+    what reproduces this repo's synthetic cohort; a real deployment passes
+    `EULARResponseEndpoint()` or its own. See `data/endpoints.py`.
+    """
+
+    def __init__(self, endpoint: Endpoint | None = None) -> None:
         self.fhir = FHIRAdapter()
         self.contract = RADataContract()
-        self.stage_builder = StageHistoryBuilder()
-        self.variable_selector = VariableSelector()
+        self.stage_builder = StageHistoryBuilder(endpoint)
         self.timing = TimingModel()
         self.switching = SwitchingCapture()
         self.belief = BeliefStateFilter()
@@ -51,9 +59,17 @@ class DataLayer:
         self,
         request: dict[str, Any] | PatientRecord,
         versions: VersionSet | None = None,
+        mode: ScientificMode = ScientificMode.DTR_RESEARCH,
+        estimand_contract: EstimandContract | None = None,
     ) -> PatientState:
         versions = versions or VersionSet()
+        estimand_contract = estimand_contract or ra_dtr_estimand(TREATMENT_ARMS)
+        if estimand_contract.mode is not mode:
+            raise ValueError(
+                "patient-state operating mode does not match the estimand contract"
+            )
         patient = request if isinstance(request, PatientRecord) else self.fhir.parse_bundle(request)
+        patient_hash = self.fhir.patient_hash(patient.patient_id)
 
         contract_report = self.contract.validate(patient)
         # The contract runs first and its errors are fatal *here*, before any
@@ -65,6 +81,9 @@ class DataLayer:
             raise DataContractError(contract_report)
 
         stages = self.stage_builder.build(patient)
+        # The raw identifier is needed only while the record is being assembled.
+        # Replace it before the first cross-layer object is created.
+        stages = [replace(stage, patient_id=patient_hash) for stage in stages]
         stages = self.timing.apply(stages, patient.encounters)
         stages = self.switching.apply(stages, patient)
         stages = self.belief.apply(stages)
@@ -84,7 +103,7 @@ class DataLayer:
         handcrafted = self.handcrafted_encoder.encode(stages)
 
         return PatientState(
-            patient_hash=self.fhir.patient_hash(patient.patient_id),
+            patient_hash=patient_hash,
             disease=patient.disease,
             stage=stages[-1].stage,
             care_goal=care_goal,
@@ -95,14 +114,14 @@ class DataLayer:
             history_summary=self._history_summary(stages),
             allergies=patient.allergies,
             stages=stages,
-            diagnostics=self._diagnostics(contract_report, dag_result, leakage_report),
+            diagnostics=self._diagnostics(contract_report, dag_result, leakage_report, patient),
             versions=replace(versions, dag=dag_result.version),
             data_contract=contract_report,
             dag_validation=dag_result,
             encoded_state=encoded,
-            tailoring_variables=self.variable_selector.select(stages),
             competing_risk_incidence=self.competing_risk.cumulative_incidence(stages),
-            raw_patient=patient,
+            operating_mode=mode,
+            estimand_contract=estimand_contract,
         )
 
     def infer_care_goal(self, stages: list[StageRecord]) -> CareGoal:
@@ -121,12 +140,16 @@ class DataLayer:
             return CareGoal.MAINTENANCE
         return CareGoal.INDUCTION
 
-    def _diagnostics(self, contract_report, dag_result, leakage_report) -> list[LayerDiagnostic]:
+    def _diagnostics(self, contract_report, dag_result, leakage_report, patient) -> list[LayerDiagnostic]:
+        # The contract's severity is carried through rather than collapsed. A
+        # recorded unit conversion is `info` — something happened and you should
+        # be able to see it — and reporting that at the same level as a missing
+        # variable family would make the warnings worth less.
         diagnostics = [
             LayerDiagnostic(
                 name=f"data_contract:{issue.field}",
-                passed=False,
-                severity="error" if issue.severity == "error" else "warning",
+                passed=issue.severity == "info",
+                severity=issue.severity if issue.severity in {"error", "info"} else "warning",
                 message=issue.message,
             )
             for issue in contract_report.issues
@@ -140,6 +163,25 @@ class DataLayer:
                 or f"{dag_result.dag_name} {dag_result.version} identifies the effect.",
             )
         )
+        # Reported for every patient, because it is a property of the model
+        # rather than of the record: these are confounders the DAG asserts and
+        # no estimator basis carries. Silence here is what let the identifiability
+        # verdict read as "adjusted for" when it meant "mentioned somewhere".
+        unmodelled = self.dag.unmodelled_confounders(patient)
+        if unmodelled:
+            diagnostics.append(
+                LayerDiagnostic(
+                    name="unmodelled_confounders",
+                    passed=False,
+                    severity="warning",
+                    message=(
+                        "The effect is not adjusted for "
+                        + ", ".join(unmodelled)
+                        + ": the DAG lists them as confounders and no estimator "
+                        "basis carries them."
+                    ),
+                )
+            )
         diagnostics.append(
             LayerDiagnostic(
                 name="leakage_suite",

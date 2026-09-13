@@ -60,6 +60,41 @@ def model_features(stages: list[StageRecord]) -> dict[str, float]:
     }
 
 
+def top_tailoring_variables(
+    blip_parameters: dict[str, float],
+    features: dict[str, float],
+    limit: int = 4,
+) -> list[str]:
+    """The covariates that actually move this arm's advantage, largest first.
+
+    A tailoring variable is one the *treatment effect* varies over, so the honest
+    ranking is by each term's contribution to the blip, `|psi_k * h_k(X)|` —
+    exactly the decomposition `ModelExplainer` already reports.
+
+    This replaces a Layer 1 heuristic that scored raw features by
+    `sqrt(variance) + abs(latest)`. Unstandardised, that ranked by unit size: on
+    the demo patient it returned `egfr=82, crp=28, das28=5.2, haq_di=1.4`, in
+    descending order of magnitude and nothing else. Worse, it skipped booleans,
+    so `anti_ccp` and `prior_tnf` — the two effect modifiers in the blip basis —
+    could never appear. The card listed four "tailoring drivers" of which one was
+    in the model, contributing -0.003, while the attribution three lines below
+    credited `anti_ccp +0.138`. Two answers to the same question on one page.
+
+    The intercept is excluded: it is the arm's average advantage, not something
+    the effect is tailored on.
+    """
+    from treatmentrx.estimation.basis import BLIP_BASIS, blip_basis
+
+    basis = dict(zip(BLIP_BASIS, blip_basis(features)))
+    contributions = [
+        (abs(coefficient * basis[name]), name, coefficient * basis[name])
+        for name, coefficient in blip_parameters.items()
+        if name in basis and name != "intercept"
+    ]
+    contributions.sort(reverse=True)
+    return [f"{name}={value:+.3f}" for _, name, value in contributions[:limit]]
+
+
 def stage_index(stages: list[StageRecord], n_fitted_stages: int) -> int:
     """Zero-based fitted-stage index for the patient's current decision point.
 

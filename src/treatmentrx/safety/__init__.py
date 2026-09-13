@@ -94,6 +94,52 @@ class SafetyLayer:
                 [SafetyFlag("empty_feasible_set", "block", "No safe treatment arm remains after filtering.")],
             )
         if decision.recommended_arm not in feasible_arms:
+            surviving = [
+                arm for arm in decision.candidate_arms if arm in set(feasible_arms)
+            ]
+            # Blocking on an arm that was never recommended.
+            #
+            # `recommended_arm` is the argmax, and on an equipoise decision Layer 3
+            # has already declared it indistinguishable from the rest of the
+            # candidate set — there is no recommendation for a contraindication to
+            # strike down. Measured over injected scenarios, 12 of 34 blocked
+            # cases were this: the patient was going to be told "these four cannot
+            # be separated", one of the four turned out to be contraindicated, and
+            # the case escalated as though a recommendation had been refused.
+            #
+            # Routing those to REVIEW is not the substitution invariant 2 forbids.
+            # Nothing is re-ranked, nothing is promoted, and `recommended_arm`
+            # stays absent — the set was computed before safety and safety may
+            # only delete from it. Every other path keeps BLOCKED, because BLOCKED
+            # is the only status that stops, and the bug that invariant is about
+            # (a naming mismatch removing an arm) must still halt rather than
+            # produce a tidy list of alternatives.
+            if decision.status is RecommendationStatus.EQUIPOISE and surviving:
+                return (
+                    RecommendationStatus.REVIEW,
+                    [
+                        SafetyFlag(
+                            "contraindication_without_recommendation",
+                            "warn",
+                            (
+                                f"{decision.recommended_arm} scored highest but is not feasible "
+                                "for this patient. No arm had been recommended — the data could "
+                                f"not separate {len(decision.candidate_arms)} arms — so removing "
+                                "it does not overturn a recommendation. No arm has been "
+                                "substituted."
+                            ),
+                            # Deliberately no claim about the resulting status.
+                            # This message said "routed to review, not blocked",
+                            # and `apply()` can still upgrade to BLOCKED when a
+                            # rule raises a block-severity flag — an allergy
+                            # does. The card then read "blocked" in its heading
+                            # and "not blocked" in its body. A flag reports what
+                            # it observed; the status is decided elsewhere and
+                            # says itself.
+                            decision.recommended_arm,
+                        )
+                    ],
+                )
             return (
                 RecommendationStatus.BLOCKED,
                 [

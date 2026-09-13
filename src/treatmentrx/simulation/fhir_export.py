@@ -20,7 +20,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from treatmentrx.simulation.ra_cohort import CohortTrajectory, generate_ra_cohort
+from treatmentrx.simulation.ra_cohort import (
+    CohortShift,
+    CohortTrajectory,
+    generate_ra_cohort,
+)
 
 # How the generator's terminal events read in a medication record.
 _DISCONTINUATION_TEXT = {
@@ -131,9 +135,18 @@ def trajectory_to_bundle(trajectory: CohortTrajectory) -> dict[str, Any]:
     return {"resourceType": "Bundle", "type": "collection", "entry": entries}
 
 
-def simulated_bundles(n: int = 20, seed: int = 991) -> list[dict[str, Any]]:
-    """A batch of ingestible patients, for exercising the pipeline end to end."""
-    return [trajectory_to_bundle(trajectory) for trajectory in generate_ra_cohort(n, seed)]
+def simulated_bundles(
+    n: int = 20, seed: int = 991, shift: CohortShift | None = None
+) -> list[dict[str, Any]]:
+    """A batch of ingestible patients, for exercising the pipeline end to end.
+
+    `shift` describes a structurally different site (`feedback/transfer.py`).
+    Omitted, the batch is byte-identical to what it has always been.
+    """
+    return [
+        trajectory_to_bundle(trajectory)
+        for trajectory in generate_ra_cohort(n, seed, shift=shift)
+    ]
 
 
 __all__ = ["simulated_bundles", "trajectory_to_bundle"]

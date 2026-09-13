@@ -28,12 +28,64 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from statistics import NormalDist
 
 from treatmentrx.estimation import linalg
 
 # Two-sided normal quantiles. Kept explicit rather than pulling in scipy.
 Z_QUANTILE = {0.10: 1.6449, 0.05: 1.9600, 0.01: 2.5758}
 DEFAULT_ALPHA = 0.05
+
+
+def simultaneous_alpha(number_of_arms: int, alpha: float = DEFAULT_ALPHA) -> float:
+    """Bonferroni family-wise alpha over all unordered pairs of `number_of_arms`.
+
+    One definition, because two consumers need it and they must agree: Layer 3
+    emits the candidate set at this level, and `feedback/coverage` measures that
+    set. A study that asks at 0.05 while the agent emits at 0.05/15 reports a
+    rule nobody deploys, and the divergence is invisible — the numbers stay
+    plausible, they just describe a different object.
+
+    **The divisor is all-pairs, and what that costs is measured rather than
+    assumed** (`cli coverage --multiplicity`, 480 patient-draws over 12 refits on
+    fresh patients each time):
+
+        family                          alpha   contains best  misses  set   declines
+        pointwise, no correction        0.0500     99.17%         4    1.61    46.7%
+        leader vs each (5 comparisons)  0.0100     99.17%         4    1.86    55.0%
+        all unordered pairs (15)        0.0033     99.58%         2    1.99    58.8%
+
+    Two things to read off it, and the first was misread once. Containment sits
+    above 99% at every level, but that is **not** over-coverage against the
+    nominal 95%: set containment and interval coverage are different properties.
+    The set always holds the leader, and the leader is the true best arm 91% of
+    the time, so a high containment rate is structural rather than a margin. The
+    *interval* is the calibrated object and it now sits at 95.0% with SE/spread
+    1.04 — since `ArmFit.cross_covariance` was kept, this correction sits on an
+    honest interval instead of stacking on one that ran 1.27x too wide.
+
+    Second, the all-pairs divisor buys **two avoided misses per 480 patients**
+    for **12.1 points of extra abstention**, and the /5 level buys nothing at all
+    over pointwise here while costing eight.
+
+    It is kept at 15 anyway, and the reason is not the measurement: the leader is
+    *selected* by looking at every arm, so the honest family is the one the search
+    ranged over, not the five comparisons that survive into the report. Narrowing
+    it would make the agent recommend more often, which is the direction this
+    repo's notes warn about — do not change it to buy decisiveness without saying
+    that is what you are doing. Note also that these are simulation numbers: the
+    over-coverage is a property of *this* generating process and would not
+    transfer on its own.
+    """
+    comparisons = max(number_of_arms * (number_of_arms - 1) // 2, 1)
+    return alpha / comparisons
+
+
+def normal_critical_value(alpha: float) -> float:
+    """Two-sided normal critical value for arbitrary valid alpha."""
+    if not 0.0 < alpha < 1.0:
+        raise ValueError("alpha must be between 0 and 1")
+    return Z_QUANTILE.get(alpha, NormalDist().inv_cdf(1.0 - alpha / 2.0))
 
 # How much wider an honest interval is than the sandwich's, measured rather than
 # assumed: `cli coverage` puts the sandwich at 0.88 of the estimator's actual
@@ -165,7 +217,7 @@ def contrast_test(
     """Interval for a linear contrast `loading' beta` of the fitted parameters."""
     variance = max(linalg.quadratic_form(loading, covariance), 0.0)
     standard_error = math.sqrt(variance)
-    z = Z_QUANTILE.get(alpha, Z_QUANTILE[DEFAULT_ALPHA])
+    z = normal_critical_value(alpha)
     margin = z * standard_error
     return ContrastTest(
         arm=arm,

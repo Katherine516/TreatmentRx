@@ -49,14 +49,17 @@ class EstimandReporter:
 
     def deviation_profile(self, stages: list[StageRecord]) -> str:
         """How far this patient's own trajectory departed from its assignments."""
-        switched = sum(1 for stage in stages if stage.switching and stage.switching.switched)
+        completed = [stage for stage in stages if stage.end_day is not None]
+        switched = sum(
+            1 for stage in completed if stage.switching and stage.switching.switched
+        )
         adherent = sum(
             1
-            for stage in stages
+            for stage in completed
             if stage.switching is None
             or (not stage.switching.switched and stage.switching.adherence >= 0.8)
         )
-        return f"{adherent}/{len(stages)} adherent stages, {switched} switch event(s)"
+        return f"{adherent}/{len(completed)} adherent completed stages, {switched} switch event(s)"
 
 
 __all__ = ["EstimandReporter"]

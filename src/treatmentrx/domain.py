@@ -74,6 +74,13 @@ class TreatmentEvent:
     stop_day: int | None = None
     response: str | None = None
     discontinuation_reason: str | None = None
+    # What was actually dispensed or administered against this order, from
+    # `MedicationDispense` / `MedicationAdministration`. `None` means the record
+    # carries no such resource — which is different from "nothing was
+    # dispensed", and the two must not be confused: an absent supply chain is a
+    # missing measurement, an empty one is non-adherence.
+    dispensed_name: str | None = None
+    dispensed_days_supply: int | None = None
 
 
 @dataclass(frozen=True)
@@ -236,14 +243,6 @@ class CalibrationReport:
     threshold: float
     passed: bool
     reliability_bins: list[dict[str, float]]
-
-
-@dataclass(frozen=True)
-class RegimeAssignment:
-    regime_type: RegimeType
-    reason: str
-    shared_bic: float
-    stage_specific_bic: float
 
 
 @dataclass(frozen=True)

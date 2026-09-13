@@ -43,6 +43,7 @@ CURRENT_RUNG = ValidationRung.SILENT
 class FeedbackLayer:
     observational_track: list[dict[str, object]] = field(default_factory=list)
     ope_track: list[dict[str, object]] = field(default_factory=list)
+    full_system_track: list[dict[str, object]] = field(default_factory=list)
     estimands: EstimandReporter = field(default_factory=EstimandReporter)
     ope: SwitchingAwareOPE = field(default_factory=SwitchingAwareOPE)
     ladder: ValidationLadder = field(default_factory=ValidationLadder)
@@ -64,10 +65,10 @@ class FeedbackLayer:
             }
         )
 
-        ope_allowed = recommendation.status in {
-            RecommendationStatus.RECOMMEND,
-            RecommendationStatus.EQUIPOISE,
-        }
+        # An abstention has no policy action to evaluate.  Keep it on the
+        # observational track, but do not smuggle the diagnostic top score into
+        # Track B as though it were a recommendation.
+        ope_allowed = recommendation.status is RecommendationStatus.RECOMMEND
         if ope_allowed:
             self.ope_track.append(
                 {
@@ -78,20 +79,38 @@ class FeedbackLayer:
                 }
             )
 
+        # The deployable policy includes abstention. An abstention is referral
+        # to clinician-led usual care, not the diagnostic top-scored arm. This
+        # separate track supports a future full human-agent policy estimand
+        # without contaminating the conditional action-policy cohort above.
+        self.full_system_track.append(
+            {
+                "patient_hash": state.patient_hash,
+                "stage": state.stage,
+                "agent_status": recommendation.status.value,
+                "policy_action": (
+                    recommendation.recommended_arm
+                    if ope_allowed
+                    else "clinician-usual-care"
+                ),
+                "requires_realized_clinician_action": not ope_allowed,
+                "note": (
+                    "Full system track; abstention is clinician-led usual care "
+                    "and never the top-scored diagnostic arm."
+                ),
+            }
+        )
+
         estimand_results = []
         ope_result = None
         if safe is not None:
             estimand_results = self.estimands.report(state.stages, safe.decision.selected)
             ope_result = self.ope.evaluate(state.stages, safe.decision.selected)
 
-        calibration = training.holdout_calibration()
-        validation = self.ladder.assess(
-            CURRENT_RUNG,
-            {
-                "ope_stable": ope_result.effective_sample_size > 0 if ope_result else False,
-                "calibration_passed": calibration.passed,
-            },
-        )
+        # Model-level, and deliberately not derived from `ope_result`: whether
+        # this build may leave silent mode is a property of the policy measured
+        # on held-out patients, not of the trajectory in front of us.
+        validation = self.ladder.assess(CURRENT_RUNG, training.deployment_readiness())
 
         return FeedbackReceipt(
             observational_enqueued=True,
@@ -102,6 +121,11 @@ class FeedbackLayer:
             message=(
                 "Feedback recorded. Retraining remains disabled until outcome validation, "
                 "calibration checks, and OPE gates pass."
+            ),
+            full_system_track_enqueued=True,
+            policy_value_scopes=(
+                "conditional_action_policy",
+                "full_human_agent_policy",
             ),
             estimands=estimand_results,
             validation=validation,

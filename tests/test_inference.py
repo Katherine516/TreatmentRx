@@ -56,18 +56,36 @@ class StandardErrorTests(unittest.TestCase):
     def test_confidence_band_is_derived_from_the_standard_error(self):
         state = _demo_state()
         estimates = EstimationLayer().estimate(state)
-        model = training.fitted().q_shared
         features = model_features(state.stages)
         for estimate in estimates:
             low, high = estimate.confidence_band
             self.assertLess(low, high, msg=estimate.estimator)
             self.assertLess(high - low, 0.5, msg=f"{estimate.estimator}: implausibly wide band")
-        # The band must use the patient's own stage index — the demo patient is
-        # at the terminal stage, where the value-to-go rescaling is a no-op.
-        index = stage_index(state.stages, model.n_stages)
-        expected = 2 * 1.96 * model.blip_standard_error(estimates[0].recommended_arm, features, index)
-        low, high = estimates[0].confidence_band
-        self.assertAlmostEqual(high - low, expected, places=2)
+
+        # Checked against whichever Q-learning model is serving, rather than a
+        # named one: the band must be that estimator's own standard error, and
+        # the pairing is what would break if the two drifted apart.
+        fit = training.fitted()
+        by_name = {
+            training.STAGE_SPECIFIC: fit.stage_specific,
+            training.Q_SHARED: fit.q_shared,
+            training.Q_POOLED: fit.pooled,
+        }
+        checked = 0
+        for estimate in estimates:
+            model = by_name.get(estimate.estimator)
+            if model is None:
+                continue
+            checked += 1
+            # The band uses the patient's own stage index — the demo patient is
+            # at the terminal stage, where the value-to-go rescaling is a no-op.
+            index = stage_index(state.stages, model.n_stages)
+            expected = 2 * 1.96 * model.blip_standard_error(
+                estimate.recommended_arm, features, index
+            )
+            low, high = estimate.confidence_band
+            self.assertAlmostEqual(high - low, expected, places=2, msg=estimate.estimator)
+        self.assertGreater(checked, 0)
 
 
 class ContrastTests(unittest.TestCase):
@@ -169,10 +187,22 @@ class StabilityTests(unittest.TestCase):
         runs = kfold_scores(generate_ra_cohort(120, seed=5), folds=3)
         self.assertEqual(len(runs), 3)
         results = summarise(runs)
-        self.assertEqual(len(results), 3)
+        # One row per estimator the sweep fits, whatever that set currently is —
+        # hard-coding the count is how the serving model got left out of studies
+        # elsewhere in this repo.
+        self.assertEqual({r.estimator for r in results}, set(runs[0]))
         for result in results:
             self.assertEqual(result.policy_value.n, 3)
             self.assertGreater(result.policy_value.mean, 0.0)
+
+    def test_the_sweep_covers_every_serving_estimator(self):
+        from treatmentrx.estimation import training
+
+        runs = kfold_scores(generate_ra_cohort(120, seed=5), folds=2)
+        self.assertTrue(
+            set(training.SERVING_ENSEMBLE) <= set(runs[0]),
+            f"stability does not score {set(training.SERVING_ENSEMBLE) - set(runs[0])}",
+        )
 
     def test_seed_sweep_varies_the_cohort(self):
         runs = seed_sweep(seeds=(3, 9), size=120)
