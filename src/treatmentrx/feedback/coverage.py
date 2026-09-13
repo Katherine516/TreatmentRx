@@ -39,14 +39,32 @@ block is the one stage where both serving estimators target the same quantity
 is the most flattering stage to measure at and it was the only one measured.
 Swept, stage 1 comes in at nominal and stage 0 does not:
 
-    stage       coverage   SE/spread   worst patient
-    0             77.5%      0.64          37.5%
-    1             96.7%      1.07          95.0%
-    terminal      95.0%      1.04          92.5%
+    stage       coverage   worst   SE/spread   SE/within   bias spread
+    0             77.5%    37.5%      0.64        1.13        0.0171
+    1             96.7%    95.0%      1.07        1.19        0.0055
+    terminal      95.0%    92.5%      1.04        1.05        0.0024
 
-Stage 0 is unreachable through the pipeline (`SERVED_STAGE_INDICES`), which is
-why it has never cost anything — but it is unreachable because of how Layer 1
-numbers stages, not because of anything the estimator does.
+**Read the last three columns together, because the first of them misled the
+author of this study.** `se_to_sd_ratio` is the spread about each patient's
+*truth*, so a bias that differs between patients enters its denominator: 0.64 at
+stage 0 reads as an interval a third too narrow. It is not. About their own means
+the same estimates give 1.13 — the interval there is, if anything, slightly wide.
+What fails at stage 0 is **centring**, and patient-specifically: the individual
+biases run -0.031 to +0.015 against a sampling spread near 0.013, and they differ
+in sign, so the pooled bias of -0.009 hides them by cancellation.
+
+The mechanism is the one this module's last paragraph already describes, at a
+stage nobody was measuring. The ensemble averages dWOLS's single-visit blip with
+`Q-Pooled`'s value-to-go divided by the remaining horizon. Those coincide
+*exactly* at a terminal block and nowhere else, so the expected bias is about
+half their gap — predicted -0.029 for the two seronegative patients against -0.027
+and -0.031 measured. The horizon rescaling shrinks that gap as the terminal block
+approaches; it does not close it.
+
+Widening cannot fix this and would be the wrong response. Stage 0 is unreachable
+through the pipeline (`SERVED_STAGE_INDICES`), which is why it has never cost
+anything — but it is unreachable because of how Layer 1 numbers stages, not
+because of anything the estimator does.
 
 **What the sweep found, and it is not small.** The single reference patient was
 the best case for two of the three methods, at 60 replications and n=280:
@@ -226,6 +244,10 @@ class CoverageResult:
     truth: float
     mean_standard_error: float = 0.0
     empirical_sd: float = 0.0
+    # Sampling spread with the per-patient bias taken out. On a single-patient
+    # row this equals `empirical_sd`; on a pooled row it does not, and the gap
+    # between them is the whole diagnosis at a mis-centred stage.
+    within_patient_sd: float = 0.0
     patient: str = ""
     contrast: str = ""
     # Per-patient results, when this row pools a grid sweep.
@@ -247,15 +269,45 @@ class CoverageResult:
 
     @property
     def se_to_sd_ratio(self) -> float:
-        """Reported standard error over the actual spread of the estimates.
+        """Reported standard error over the spread of the estimates *about the truth*.
 
-        The direct measurement of whether a standard error is honest, and far
-        more stable at small replication counts than the coverage count itself:
+        More stable at small replication counts than the coverage count itself —
         coverage is a proportion of a few dozen Bernoulli draws, this is a ratio
-        of two means. A value below 1 means the interval is too narrow no matter
-        what the coverage tally happens to land on.
+        of two means.
+
+        **It is not a pure width diagnostic, and reading it as one is a mistake
+        this study has already caused.** On a pooled row the denominator is the
+        spread about each patient's *truth*, so a bias that differs between
+        patients enters it. The stage sweep reported 0.59 at stage 0, which reads
+        as an interval a third too narrow; the interval is actually slightly
+        *wide* there (`se_to_within_sd_ratio` 1.13) and what fails is centring.
+        Compare the two before concluding anything about width.
         """
         return self.mean_standard_error / self.empirical_sd if self.empirical_sd else 0.0
+
+    @property
+    def se_to_within_sd_ratio(self) -> float:
+        """The same ratio with the per-patient bias removed — width, and only width."""
+        return (
+            self.mean_standard_error / self.within_patient_sd
+            if self.within_patient_sd
+            else 0.0
+        )
+
+    @property
+    def bias_dispersion(self) -> float:
+        """How much the bias itself varies across the grid.
+
+        Zero when every patient is off by the same amount, which a pooled
+        `bias` already reports. Large when the ensemble is mis-centred
+        *patient-specifically*, which a pooled `bias` hides by cancellation: at
+        stage 0 the mean bias is -0.009 while individual patients run -0.031 to
+        +0.015.
+        """
+        if self.empirical_sd <= 0.0 or self.within_patient_sd <= 0.0:
+            return 0.0
+        excess = self.empirical_sd ** 2 - self.within_patient_sd ** 2
+        return math.sqrt(excess) if excess > 0.0 else 0.0
 
     def as_dict(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -270,6 +322,11 @@ class CoverageResult:
             "mean_standard_error": round(self.mean_standard_error, 4),
             "empirical_sd": round(self.empirical_sd, 4),
             "se_to_sd_ratio": round(self.se_to_sd_ratio, 3),
+            # Width on its own, and the part of the spread that is mis-centring.
+            # Reported beside the combined ratio because the combined one reads
+            # as a width failure when it is a centring failure.
+            "se_to_within_sd_ratio": round(self.se_to_within_sd_ratio, 3),
+            "bias_dispersion": round(self.bias_dispersion, 4),
         }
         if self.patient:
             payload["patient"] = self.patient
@@ -386,6 +443,21 @@ def _pool(method: str, tallies: list[_Tally]) -> CoverageResult:
     ]
     mean_bias = sum(centred) / len(centred)
     variance = sum((value - mean_bias) ** 2 for value in centred) / max(len(centred) - 1, 1)
+
+    # The same spread with each patient's own bias removed. The difference
+    # between the two is not cosmetic: a bias that differs *between* patients
+    # lands in `variance` above and reads as an interval that is too narrow.
+    # At stage 0 that is exactly what happens — pooled 0.59 against 1.13 here —
+    # and the honest reading is a centring failure, not a width one.
+    within = 0.0
+    degrees = 0
+    for tally in tallies:
+        if len(tally.estimates) < 2:
+            continue
+        own_mean = sum(tally.estimates) / len(tally.estimates)
+        within += sum((value - own_mean) ** 2 for value in tally.estimates)
+        degrees += len(tally.estimates) - 1
+    within_sd = math.sqrt(within / degrees) if degrees else 0.0
     return CoverageResult(
         method=method,
         replications=replications,
@@ -395,6 +467,7 @@ def _pool(method: str, tallies: list[_Tally]) -> CoverageResult:
         truth=0.0,
         mean_standard_error=sum(errors) / len(errors),
         empirical_sd=math.sqrt(variance),
+        within_patient_sd=within_sd,
         patient=f"pooled over {len(tallies)} patients",
         per_patient=per_patient,
     )
@@ -443,6 +516,9 @@ def _result(
 ) -> CoverageResult:
     mean = sum(estimates) / len(estimates)
     variance = sum((value - mean) ** 2 for value in estimates) / max(len(estimates) - 1, 1)
+    # One patient, one estimand: centring on the truth rather than the mean
+    # shifts every error by the same constant and cannot change the spread, so
+    # the two ratios coincide here by construction.
     return CoverageResult(
         method=method,
         replications=replications,
@@ -452,6 +528,7 @@ def _result(
         truth=truth,
         mean_standard_error=sum(errors) / len(errors),
         empirical_sd=math.sqrt(variance),
+        within_patient_sd=math.sqrt(variance),
         patient=patient,
         contrast=contrast,
     )
@@ -547,18 +624,26 @@ def decision_rule_stage_sweep(
 
     **What the sweep found.** At n=280 over 40 refits of the six-patient grid:
 
-        stage       coverage   SE/spread   bias      worst patient
-        0             77.5%      0.64     -0.009        37.5%
-        1             96.7%      1.07     +0.000        95.0%
-        terminal      95.0%      1.04     +0.000        92.5%
+        stage       coverage   worst   SE/spread   SE/within   bias spread
+        0             77.5%    37.5%      0.64        1.13        0.0171
+        1             96.7%    95.0%      1.07        1.19        0.0055
+        terminal      95.0%    92.5%      1.04        1.05        0.0024
 
     Stage 1 is at nominal and the terminal block is the figure already reported.
-    Stage 0 is not: its interval runs about a third too narrow. The ensemble is
-    not badly *centred* anywhere — each member's bias against its own estimand
-    stays under 0.011 at every stage, and the per-remaining-visit rescaling in
-    `sandwich_contrast` is what keeps a value-to-go blip and a single-visit one
-    comparable — so this is a width failure, not the centring failure that
-    dropping the shared blip fixed.
+    Stage 0 is not — **and the reason is centring, not width.** The two ratios
+    differ because `_pool` measures spread about each patient's *truth*, so a
+    bias that varies between patients lands in the denominator. About their own
+    means the stage-0 estimates give 1.13: that interval is slightly wide. The
+    individual biases run -0.031 to +0.015 against a sampling spread near 0.013
+    and differ in sign, so the pooled -0.009 cancels them away.
+
+    Each member is nearly unbiased *for its own estimand* at every stage, which
+    is precisely the problem: they have different estimands away from the
+    terminal block. The ensemble sits between a single-visit blip and a
+    value-to-go contrast divided by the remaining horizon, so its bias is about
+    half their gap, and that gap is identically zero only where there is no
+    future left. This is the failure dropping the shared blip fixed, recurring
+    at a stage that was never swept.
 
     **Why it has never bitten**, and why that is not a reason to leave it:
     `SERVED_STAGE_INDICES` is `(1, 2)`. Layer 1 appends the pending visit, so
@@ -609,6 +694,9 @@ def decision_rule_stage_sweep(
         result["served"] = stage in SERVED_STAGE_INDICES
         rows.append(result)
 
+    # A stage below nominal *and* mis-centred is the case worth naming: a narrow
+    # interval and a displaced one want opposite fixes, and only one of them is
+    # reachable by changing a variance.
     unserved_misses = [
         row for row in rows if not row["served"] and row["coverage"] < NOMINAL - 0.05
     ]
@@ -621,7 +709,11 @@ def decision_rule_stage_sweep(
         "note": (
             "The truth at each stage is the value-to-go contrast divided by the "
             "remaining horizon, which is the scale `sandwich_contrast` reports "
-            "on. Stages outside `served_stage_indices` are fitted but never used "
+            "on. Compare `se_to_within_sd_ratio` against `se_to_sd_ratio` before "
+            "reading a low ratio as a narrow interval: the second is measured "
+            "about each patient's truth, so patient-specific bias enters it, and "
+            "at stage 0 that is the whole difference between 0.64 and 1.13. "
+            "Stages outside `served_stage_indices` are fitted but never used "
             "to score a patient: Layer 1 appends the pending visit, so "
             "`stage_index` is at least 1 for anyone the pipeline sees."
             + (

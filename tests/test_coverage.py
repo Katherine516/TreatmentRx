@@ -295,6 +295,88 @@ class StageSweepTests(unittest.TestCase):
         scaled = coverage.reported_scale_contrast(features, arm, comparator, 0, 3)
         self.assertAlmostEqual(scaled * 3.0, undivided, places=9)
 
+    def test_a_low_pooled_ratio_is_diagnosed_not_just_reported(self):
+        """`se_to_sd_ratio` is not a width diagnostic, and reading it as one misled me.
+
+        `_pool` centres each patient's estimates on their own *truth*, so a bias
+        that differs between patients lands in the denominator. At stage 0 that
+        reads 0.59 — an interval a third too narrow — while the same estimates
+        about their own means give 1.13. The interval is slightly wide there;
+        what fails is centring, and the two ratios have to be separable or the
+        wrong conclusion is the easy one.
+        """
+        for index, row in self.rows.items():
+            with self.subTest(stage=index):
+                combined = row["se_to_sd_ratio"]
+                width_only = row["se_to_within_sd_ratio"]
+                self.assertGreater(width_only, 0.0)
+                # Removing bias can only shrink the denominator, never grow it.
+                self.assertGreaterEqual(width_only + 1e-9, combined)
+                self.assertGreaterEqual(row["bias_dispersion"], 0.0)
+
+    def test_the_interval_is_wide_enough_at_every_stage(self):
+        """Width and centring fail independently, and only centring fails here.
+
+        If this ever drops below 1 the ensemble really has become too narrow,
+        which is a different defect from the one at stage 0 and wants a different
+        fix — widening cannot repair a centre.
+        """
+        for index, row in self.rows.items():
+            with self.subTest(stage=index):
+                self.assertGreater(
+                    row["se_to_within_sd_ratio"],
+                    0.85,
+                    f"stage {index} interval is genuinely too narrow",
+                )
+
+    def test_mis_centring_concentrates_where_the_estimands_diverge(self):
+        """The bias dispersion has to vanish at the terminal block.
+
+        There is no future left there, so a value-to-go blip *is* a single-visit
+        blip and the two serving members target the same quantity exactly. Away
+        from it they do not, and the horizon rescaling shrinks the gap without
+        closing it — which is why stage 0 carries the most.
+        """
+        terminal = self.sweep["n_stages"] - 1
+        self.assertLess(
+            self.rows[terminal]["bias_dispersion"],
+            self.rows[0]["bias_dispersion"],
+            "stage 0 should be the most mis-centred, not the terminal block",
+        )
+
+    def test_the_predicted_and_measured_mis_centring_agree_in_sign(self):
+        """Averaging two estimands biases by half their gap; check that mechanism.
+
+        The ensemble is the mean of a single-visit blip and a value-to-go
+        contrast divided by the remaining horizon, so its bias should be about
+        `(single_visit - v2go/h) / 2`. At the terminal block that gap is
+        identically zero for every patient, which is the check that matters —
+        anything else there would mean the rescaling is wrong.
+        """
+        terminal = self.sweep["n_stages"] - 1
+        for name, features in coverage.PATIENT_GRID.items():
+            arm, comparator = coverage.top_two(features)
+            with self.subTest(patient=name):
+                scaled = coverage.reported_scale_contrast(
+                    features, arm, comparator, terminal, self.sweep["n_stages"]
+                )
+                single_visit = true_blip(arm, features) - true_blip(comparator, features)
+                self.assertAlmostEqual(scaled, single_visit, places=9)
+
+        gaps = []
+        for name, features in coverage.PATIENT_GRID.items():
+            arm, comparator = coverage.top_two(features)
+            scaled = coverage.reported_scale_contrast(
+                features, arm, comparator, 0, self.sweep["n_stages"]
+            )
+            single_visit = true_blip(arm, features) - true_blip(comparator, features)
+            gaps.append(abs(single_visit - scaled) / 2.0)
+        self.assertGreater(
+            max(gaps),
+            self.rows[terminal]["bias_dispersion"],
+            "the stage-0 estimand gap should dominate the terminal block's",
+        )
+
     def test_the_served_stages_cover_near_nominal(self):
         """The stages a patient can actually land on are the ones that must hold."""
         for index in coverage.SERVED_STAGE_INDICES:

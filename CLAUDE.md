@@ -8,7 +8,7 @@ test fixture, not evidence.
 ## Commands
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests    # 462 tests, ~6 min
+PYTHONPATH=src python3 -m unittest discover -s tests    # 466 tests, ~6 min
 PYTHONPATH=src python3 -m treatmentrx.cli demo          # one patient end to end
 PYTHONPATH=src python3 -m treatmentrx.cli evaluate      # estimator scorecard
 PYTHONPATH=src python3 -m treatmentrx.cli stability     # k-fold + seed sweep (~10s)
@@ -602,14 +602,34 @@ produced a real clinical divergence, and the notes below are the scar tissue.
 
    `coverage.decision_rule_stage_sweep` sweeps it, at n=280 over 40 refits:
 
-   | stage | coverage | SE/spread | bias | worst patient | served |
-   | --- | --- | --- | --- | --- | --- |
-   | 0 | **77.5%** | **0.64** | -0.009 | 37.5% | no |
-   | 1 | 96.7% | 1.07 | +0.000 | 95.0% | yes |
-   | terminal | 95.0% | 1.04 | +0.000 | 92.5% | yes |
+   | stage | coverage | worst | SE/spread | SE/within | bias spread | served |
+   | --- | --- | --- | --- | --- | --- | --- |
+   | 0 | **77.5%** | 37.5% | **0.64** | **1.13** | **0.0171** | no |
+   | 1 | 96.7% | 95.0% | 1.07 | 1.19 | 0.0055 | yes |
+   | terminal | 95.0% | 92.5% | 1.04 | 1.05 | 0.0024 | yes |
 
-   Stage 1 is at nominal; stage 0's interval runs about a third too narrow. It
-   has never cost anything because `SERVED_STAGE_INDICES` is `(1, 2)`:
+   **Stage 0 fails on centring, not width, and an earlier version of this
+   invariant said the opposite.** `se_to_sd_ratio` is measured about each
+   patient's *truth*, so a bias that differs between patients enters its
+   denominator — 0.64 reads as an interval a third too narrow. About their own
+   means the same estimates give **1.13**: that interval is slightly wide. The
+   individual biases run **-0.031 to +0.015** against a sampling spread near
+   0.013 and they differ in sign, so the pooled -0.009 cancels them away.
+   `se_to_within_sd_ratio` and `bias_dispersion` exist so the two cannot be
+   confused again, and a test asserts the width ratio stays above 1 at every
+   stage — if it ever drops, that is a different defect wanting a different fix,
+   because widening cannot repair a centre.
+
+   The mechanism is invariant 18's, at a stage nobody was sweeping. The ensemble
+   averages dWOLS's single-visit blip with `Q-Pooled`'s value-to-go divided by
+   the remaining horizon; those coincide *exactly* at a terminal block and
+   nowhere else, so the expected bias is about half their gap — predicted -0.029
+   for the two seronegative patients against -0.027 and -0.031 measured. The
+   horizon rescaling shrinks the gap toward the terminal block without closing
+   it. Each member is nearly unbiased for its *own* estimand at every stage,
+   which is exactly the problem.
+
+   It has never cost anything because `SERVED_STAGE_INDICES` is `(1, 2)`:
    `DataLayer.build_patient_state` appends the *pending* visit, so `stage_index`
    is at least 1 for anyone the pipeline sees. Measured over 240 audit bundles
    the split is 22 at stage 1 and 218 at the terminal stage, none at stage 0. The
@@ -623,8 +643,10 @@ produced a real clinical divergence, and the notes below are the scar tissue.
    same per-remaining-visit scale as `q_values` and as dWOLS's single-visit blip.
    Scored against the *undivided* value-to-go the sweep reads 0% at stage 0 and
    13% at stage 1 — arithmetic, not an estimator, and it looked like a much
-   larger finding until the scale was checked. Each member's bias against its own
-   estimand stays under 0.011 at every stage, so the rescaling is doing its job.
+   larger finding until the scale was checked. Two scale mistakes in one study,
+   in opposite directions: that one made the defect look catastrophic, and
+   reading `se_to_sd_ratio` as a width ratio then made it look like the wrong
+   kind of defect. Measure the denominator before believing the quotient.
 
 41. **The gate on a sequential regime reads the regime's own effective sample.**
    `deployment_readiness()` reported only `ope_effective_sample_size` — the

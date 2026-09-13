@@ -346,27 +346,47 @@ accident: there is no future left, so a value-to-go blip and a single-visit blip
 are the same number, and the two serving estimators target the same quantity
 exactly. Swept, at n=280 over 40 refits of the six-patient grid:
 
-| stage | coverage | SE/spread | bias | worst patient | served? |
-| --- | --- | --- | --- | --- | --- |
-| 0 | **77.5%** | **0.64** | −0.009 | 37.5% | no |
-| 1 | 96.7% | 1.07 | +0.000 | 95.0% | yes |
-| terminal | 95.0% | 1.04 | +0.000 | 92.5% | yes |
+| stage | coverage | worst | SE/spread | SE/within | bias spread | served? |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0 | **77.5%** | 37.5% | **0.64** | **1.13** | **0.0171** | no |
+| 1 | 96.7% | 95.0% | 1.07 | 1.19 | 0.0055 | yes |
+| terminal | 95.0% | 92.5% | 1.04 | 1.05 | 0.0024 | yes |
 
-Stage 1 is at nominal. Stage 0 is not — its interval runs about a third too
-narrow — and it is fitted, consumed by backward induction, and **never used to
-score anyone**: `DataLayer.build_patient_state` appends the pending visit, so
-`stage_index` is at least 1 for every patient the pipeline sees.
-`coverage.SERVED_STAGE_INDICES` records that, a test checks the pipeline still
-obeys it, and the row is reported rather than dropped, because what keeps stage 0
-out of reach is Layer 1's stage bookkeeping and not anything statistical.
+Stage 1 is at nominal. Stage 0 is not, and it is fitted, consumed by backward
+induction, and **never used to score anyone**: `DataLayer.build_patient_state`
+appends the pending visit, so `stage_index` is at least 1 for every patient the
+pipeline sees. `coverage.SERVED_STAGE_INDICES` records that, a test checks the
+pipeline still obeys it, and the row is reported rather than dropped, because what
+keeps stage 0 out of reach is Layer 1's stage bookkeeping and not anything
+statistical.
 
-One measurement error is worth recording because it looked like a much larger
-finding. Scored against the *undivided* value-to-go contrast, the sweep reads 0%
-at stage 0 and 13% at stage 1. That is arithmetic, not an estimator:
-`sandwich_contrast` divides by the remaining horizon so its numbers sit on the
-same per-remaining-visit scale as `q_values` and as dWOLS's single-visit blip, and
-the truth has to carry the same division. The rescaling is doing its job — each
-member's bias against its own estimand stays under 0.011 at every stage.
+**Stage 0 fails on centring, not width — and the first version of this section
+said the opposite.** `se_to_sd_ratio` is measured about each patient's *truth*,
+so a bias that differs between patients lands in its denominator: 0.64 reads as
+an interval a third too narrow. Measured about their own means the same estimates
+give **1.13**, so that interval is slightly *wide*. The individual biases run
+**−0.031 to +0.015** against a sampling spread near 0.013 and differ in sign, so
+the pooled −0.009 cancels them away. `se_to_within_sd_ratio` and
+`bias_dispersion` now separate the two, and a test asserts the width ratio stays
+above 1 at every stage — because widening cannot repair a centre, and the two
+defects want opposite fixes.
+
+The mechanism is the one that motivated *Only estimators that estimate the same
+quantity may be averaged*, recurring at a stage nobody swept. The ensemble
+averages dWOLS's single-visit blip with Q-Pooled's value-to-go over the remaining
+horizon; those coincide **exactly** at a terminal block and nowhere else, so the
+bias is about half their gap — predicted −0.029 for the two seronegative patients
+against −0.027 and −0.031 measured. The horizon rescaling shrinks the gap toward
+the terminal block without closing it. Each member is nearly unbiased for its
+*own* estimand at every stage, which is exactly the problem.
+
+**Two scale mistakes in one study, in opposite directions.** Scored against the
+*undivided* value-to-go the sweep reads 0% at stage 0 and 13% at stage 1 — pure
+arithmetic, since `sandwich_contrast` divides by the remaining horizon and the
+truth has to carry the same division. That one made the defect look
+catastrophic. Then reading `se_to_sd_ratio` as a width ratio made it look like
+the wrong *kind* of defect. Measure the denominator before believing the
+quotient.
 
 ### The interval has to describe the decision
 
