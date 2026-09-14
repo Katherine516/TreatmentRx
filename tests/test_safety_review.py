@@ -338,5 +338,66 @@ class CardHonestyTests(unittest.TestCase):
                         self.assertIn("removed by the safety layer", block)
 
 
+
+class DelayedToxicitySubjectTests(unittest.TestCase):
+    """A warn flag may not name an arm nobody recommended.
+
+    `_delayed_toxicity` read `decision.recommended_arm` unconditionally and said
+    "before continuing" — but on an equipoise decision that field is the argmax
+    and Layer 3 has already declared it inseparable from the candidate set.
+    Invariant 2's defect, in a rule rather than a status.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from treatmentrx.data.contract import DataContractError
+        from treatmentrx.orchestrator import TreatmentRxOrchestrator
+        from treatmentrx.simulation.fhir_export import simulated_bundles
+
+        orchestrator = TreatmentRxOrchestrator()
+        cls.flagged = []
+        for bundle in simulated_bundles(120, seed=991):
+            try:
+                recommendation = orchestrator.run(bundle)
+            except DataContractError:
+                continue
+            for flag in recommendation.safety_flags:
+                if flag.code == "delayed_toxicity_accumulation":
+                    cls.flagged.append((recommendation, flag))
+
+    def test_the_flag_fires_somewhere(self):
+        self.assertTrue(self.flagged, "no patient triggered the rule; fixture changed")
+
+    def test_a_named_arm_is_always_the_published_one(self):
+        for recommendation, flag in self.flagged:
+            if flag.affected_arm is None:
+                continue
+            with self.subTest(arm=flag.affected_arm):
+                self.assertEqual(flag.affected_arm, recommendation.recommended_arm)
+
+    def test_an_undecided_patient_gets_an_observation_not_an_instruction(self):
+        """"before continuing" asserts an intent that does not exist yet."""
+        for recommendation, flag in self.flagged:
+            if recommendation.recommended_arm is not None:
+                continue
+            with self.subTest(status=recommendation.status.value):
+                self.assertIsNone(flag.affected_arm)
+                self.assertNotIn("before continuing", flag.message)
+                self.assertIn("No arm has been recommended", flag.message)
+
+    def test_the_warning_is_not_suppressed_by_a_benign_argmax(self):
+        """Gating on the argmax lost the warning for a set that still held risk.
+
+        The trajectory evidence — cumulative hepatotoxic exposure plus a rising
+        ALT — does not depend on which arm happens to score highest, so neither
+        should the flag.
+        """
+        undecided = [r for r, f in self.flagged if r.recommended_arm is None]
+        self.assertGreater(
+            len(undecided),
+            1,
+            "the argmax gate should no longer be suppressing these warnings",
+        )
+
 if __name__ == "__main__":
     unittest.main()

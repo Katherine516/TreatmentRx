@@ -15,6 +15,7 @@ with an assertion, not a convention.
 from __future__ import annotations
 
 import copy
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -77,21 +78,69 @@ _KNOWLEDGE_BASE = [
 ]
 
 
+#: Words, not whitespace-delimited blobs. The arm vocabulary is hyphenated
+#: (`TNF-inhibitor`, `JAK-inhibitor`, `methotrexate-optimization`) and the
+#: knowledge-base keys are not, so splitting on whitespace produced a single
+#: token that matched nothing: **four of six arms retrieved zero passages from
+#: their own name**. This is invariant 26's failure with the sign reversed —
+#: there a short token matched too much, here a compound token matched nothing.
+_WORD = re.compile(r"[a-z0-9]+")
+
+
+def _words(text: str) -> set[str]:
+    return set(_WORD.findall(text.lower()))
+
+
 @dataclass
 class SemanticKnowledgeBase:
-    """Tier 3 — shared, read-only RAG over the medical knowledge base."""
+    """Tier 3 — shared, read-only keyword index over the medical knowledge base.
+
+    Still five hard-coded passages and still not a vector store; what changed is
+    that the keyword index now matches keywords.
+
+    **Two defects, and the second only became visible once the first was fixed.**
+    Tokenising on whitespace meant `TNF-inhibitor` never matched the key
+    `tnf inadequate response`, so `continue-current`,
+    `methotrexate-optimization`, `TNF-inhibitor` and `JAK-inhibitor` — four of
+    six arms — retrieved nothing for their own name. Only `IL-6 inhibitor` (it
+    contains a space) and `rituximab` (no hyphen) worked.
+
+    Then the ranking. The query is the recommended arm *plus* the history
+    summary, every match scored one point, and `sort` is stable — so ties fell
+    back to the order passages happen to appear in `_KNOWLEDGE_BASE`. The demo
+    patient is recommended **rituximab**, the knowledge base contains a
+    rituximab passage, and the two retrieved were about TNF response and
+    methotrexate: the arm's own evidence lost to history tokens on insertion
+    order. A card that labels this "Evidence:" under a recommendation was citing
+    passages about something else.
+
+    `subject` is what the passage is supposed to be evidence *for*. A match on it
+    outranks a match on the surrounding history, and the remaining ties break by
+    knowledge-base order, which is arbitrary but deterministic and auditable.
+    """
 
     version: str = "ra-kb-2026Q1"
 
-    def retrieve(self, query: str, k: int = 2) -> list[str]:
-        tokens = set(query.lower().split())
+    #: How much more a subject match is worth than a history match. Only the
+    #: ordering matters, not the value: it has to exceed the largest possible
+    #: history overlap, which is bounded by the longest key.
+    subject_weight: int = 10
+
+    def retrieve(self, query: str, k: int = 2, subject: str = "") -> list[str]:
+        query_words = _words(query)
+        subject_words = _words(subject)
         scored = []
-        for key, passage in _KNOWLEDGE_BASE:
-            overlap = len(tokens & set(key.split()))
-            if overlap:
-                scored.append((overlap, passage))
-        scored.sort(key=lambda kv: kv[0], reverse=True)
-        return [passage for _, passage in scored[:k]]
+        for index, (key, passage) in enumerate(_KNOWLEDGE_BASE):
+            key_words = _words(key)
+            on_subject = len(subject_words & key_words)
+            on_query = len(query_words & key_words)
+            if not on_subject and not on_query:
+                continue
+            # Negative index so the sort stays descending overall and ties keep
+            # knowledge-base order rather than inheriting it by accident.
+            scored.append((self.subject_weight * on_subject + on_query, -index, passage))
+        scored.sort(reverse=True)
+        return [passage for _, _, passage in scored[:k]]
 
 
 # Statistical keys memory is forbidden from touching.
@@ -115,10 +164,12 @@ def apply_memory(bundle: dict[str, Any], memory: EpisodicMemory, kb: SemanticKno
     before = copy.deepcopy(bundle["statistical_output"])
 
     preferences = memory.preferences(patient_hash)
-    rag_query = " ".join(
-        [bundle["statistical_output"]["recommended_arm"], bundle["patient_context"].get("history_summary", "")]
-    )
-    evidence = kb.retrieve(rag_query)
+    # The arm is the *subject* — what the evidence is supposed to be about — and
+    # the history is context around it. Passing them as one string made them
+    # compete, and the history usually won: see `SemanticKnowledgeBase`.
+    recommended = bundle["statistical_output"]["recommended_arm"]
+    rag_query = " ".join([recommended, bundle["patient_context"].get("history_summary", "")])
+    evidence = kb.retrieve(rag_query, subject=recommended)
 
     bundle["memory"] = {
         "framing_hints": preferences,

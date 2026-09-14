@@ -12,7 +12,7 @@ narrative. Nothing downstream may promote or demote either one.
 from __future__ import annotations
 
 from treatmentrx.contracts import Decision, PatientState
-from treatmentrx.domain import SafetyFlag, StageRecord
+from treatmentrx.domain import RecommendationStatus, SafetyFlag, StageRecord
 from treatmentrx.safety.feasible_set import allergy_matches
 
 # Organ-function and pregnancy limits for the drug classes that have them.
@@ -35,7 +35,7 @@ class SafetyRules:
         flags: list[SafetyFlag] = []
         flags.extend(self._diagnostic_flags(state))
         flags.extend(self._allergy_flags(state, decision))
-        delayed = self._delayed_toxicity(state.stages, decision.recommended_arm)
+        delayed = self._delayed_toxicity(state.stages, decision)
         if delayed:
             flags.append(delayed)
         if self._out_of_support(state.latest):
@@ -81,11 +81,27 @@ class SafetyRules:
             if allergy_matches(allergy, recommended)
         ]
 
-    def _delayed_toxicity(self, stages: list[StageRecord], recommended_arm: str) -> SafetyFlag | None:
+    def _delayed_toxicity(self, stages: list[StageRecord], decision: Decision) -> SafetyFlag | None:
         """A sequence safe at every visit can still accumulate toward harm.
 
         Per-visit checks cannot see this: each individual ALT may be acceptable
         while the trend across a hepatotoxic sequence is not.
+
+        **Which arm this is about.** It used to read `decision.recommended_arm`
+        unconditionally and phrase itself as "before continuing" — but on an
+        equipoise decision that field is only the argmax, and Layer 3 has already
+        said it cannot be separated from the rest of the candidate set. So the
+        flag named an arm nobody had recommended and attributed an intent to
+        continue it that did not exist. That is the defect invariant 2 fixed in
+        `SafetyLayer._status`, here in a rule rather than a status.
+
+        The trajectory evidence is the same either way, so the flag still fires;
+        what changes is what it claims. When there is a recommendation it is
+        about that arm. When there is not, it is about whichever arms are still
+        under consideration, and it says so rather than picking one. Gating on
+        the argmax also *suppressed* the warning for an undecided patient whose
+        argmax happened to be non-hepatotoxic while the set still held
+        hepatotoxic options — a warning lost for no reason.
         """
         exposure = sum(
             1 for stage in stages if any(token in stage.treatment.lower() for token in HEPATOTOXIC_TOKENS)
@@ -96,18 +112,37 @@ class SafetyRules:
             if _numeric(stage.features.get("alt")) is not None
         ]
         rising = len(alts) >= 2 and alts[-1] > alts[0] and alts[-1] > RISING_ALT_FLOOR
-        escalating = any(token in recommended_arm.lower() for token in HEPATOTOXIC_TOKENS)
-        if exposure >= CUMULATIVE_EXPOSURE_STAGES and rising and escalating:
-            return SafetyFlag(
-                "delayed_toxicity_accumulation",
-                "warn",
-                (
-                    "Cumulative hepatotoxic exposure with a rising ALT trend across visits; "
-                    "monitor for delayed toxicity within the assessment window before continuing."
-                ),
-                recommended_arm,
+        if not (exposure >= CUMULATIVE_EXPOSURE_STAGES and rising):
+            return None
+
+        committed = decision.status is RecommendationStatus.RECOMMEND
+        under_consideration = (
+            [decision.recommended_arm]
+            if committed
+            else list(decision.candidate_arms) or [decision.recommended_arm]
+        )
+        hepatotoxic = [arm for arm in under_consideration if _is_hepatotoxic(arm)]
+        if not hepatotoxic:
+            return None
+
+        if committed:
+            message = (
+                "Cumulative hepatotoxic exposure with a rising ALT trend across visits; "
+                "monitor for delayed toxicity within the assessment window before continuing."
             )
-        return None
+            subject = decision.recommended_arm
+        else:
+            # No arm was recommended, so nothing is being "continued". The
+            # observation is about the trajectory and the options still open.
+            message = (
+                "Cumulative hepatotoxic exposure with a rising ALT trend across visits. "
+                "No arm has been recommended; "
+                f"{len(hepatotoxic)} of {len(under_consideration)} arms still under "
+                "consideration are hepatotoxic, and delayed toxicity is a "
+                "consideration for those."
+            )
+            subject = None
+        return SafetyFlag("delayed_toxicity_accumulation", "warn", message, subject)
 
     def _out_of_support(self, stage: StageRecord) -> bool:
         """Are the covariates past the edge of the training cohort's support?
@@ -124,6 +159,10 @@ class SafetyRules:
         crp = _numeric_or(stage, "crp", 8.0)
         egfr = _numeric_or(stage, "egfr", 90.0)
         return das28 > DAS28_CEILING or crp > CRP_CEILING or egfr < OOD_EGFR_FLOOR
+
+
+def _is_hepatotoxic(arm: str) -> bool:
+    return any(token in arm.lower() for token in HEPATOTOXIC_TOKENS)
 
 
 def _numeric(value: object) -> float | None:

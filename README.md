@@ -1154,6 +1154,18 @@ learned representation, and it does not claim to be),
 `SemanticKnowledgeBase` (five hard-coded passages, not a real RAG index), and
 `WHY_NOT_REASONS` (hard-coded clinical prose on a model-derived Q-gap).
 
+**The keyword index could not match its own vocabulary.** It split the query on
+whitespace, and the arm names are hyphenated while the knowledge-base keys are
+not — so `TNF-inhibitor` never matched `tnf inadequate response`. Four of six
+arms retrieved **zero** passages for their own name. Behind that sat a second
+defect: the query mixed the recommended arm with the patient's history, every
+match scored one point, and ties fell back to insertion order — so the demo
+patient, recommended rituximab, was cited TNF and methotrexate passages while
+the rituximab passage sat unretrieved. `Recommendation.evidence` is a served
+field and the card prints it under `Evidence:`. Tokenising on words and ranking
+the *subject* above the surrounding history fixes both. It is still five
+hard-coded passages; what changed is that the keyword index matches keywords.
+
 **The E-value used to be on that list and is now real.** It claimed to say how
 strong unmeasured confounding would have to be to overturn a recommendation, and
 computed `q_values[0] / q_values[1]` — a ratio of two nearly-equal bounded means

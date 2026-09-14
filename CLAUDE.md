@@ -8,7 +8,7 @@ test fixture, not evidence.
 ## Commands
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests    # 489 tests, ~6 min
+PYTHONPATH=src python3 -m unittest discover -s tests    # 498 tests, ~6 min
 PYTHONPATH=src python3 -m treatmentrx.cli demo          # one patient end to end
 PYTHONPATH=src python3 -m treatmentrx.cli evaluate      # estimator scorecard
 PYTHONPATH=src python3 -m treatmentrx.cli stability     # k-fold + seed sweep (~10s)
@@ -939,6 +939,56 @@ produced a real clinical divergence, and the notes below are the scar tissue.
    and routes to equipoise. `tests/test_layers.py` allows exactly one such case
    and no clamp artefacts.
 
+47. **A keyword index that cannot match its own vocabulary, on a served field.**
+   Six commits had all come from the statistical core; the first pass over Layer
+   5 found this. `SemanticKnowledgeBase.retrieve` split the query on whitespace,
+   and the arm vocabulary is hyphenated while the knowledge-base keys are not —
+   so `TNF-inhibitor` never matched `tnf inadequate response`. Measured:
+   **`continue-current`, `methotrexate-optimization`, `TNF-inhibitor` and
+   `JAK-inhibitor` retrieved zero passages from their own name**, four of six
+   arms. Only `IL-6 inhibitor` (it contains a space) and `rituximab` (no hyphen)
+   worked. This is invariant 26 with the sign reversed: there a short token
+   matched too much, here a compound token matched nothing.
+
+   The second defect was hidden behind the first. The query is the recommended
+   arm *plus* the history summary, every match scored one point, and `sort` is
+   stable — so ties fell back to the order passages appear in `_KNOWLEDGE_BASE`.
+   The demo patient is recommended **rituximab**, the knowledge base contains a
+   rituximab passage, and the two retrieved were about TNF response and
+   methotrexate. A card printing `Evidence:` under a recommendation was citing
+   passages about something else, and `Recommendation.evidence` is served.
+
+   Tokenise on words, and separate the **subject** — what the evidence is
+   supposed to be *for* — from the history around it. A subject match outranks a
+   history match; remaining ties break by knowledge-base order, arbitrary but
+   deterministic and auditable. Every arm that has a passage now retrieves it,
+   and `continue-current` correctly retrieves none because none exists.
+
+   It is still five hard-coded passages and still not a vector store. What
+   changed is that the keyword index matches keywords — the docstring was honest
+   about the *method* and silent about the fact that it did not work.
+
+48. **A warn flag may not name an arm nobody recommended.**
+   `SafetyRules._delayed_toxicity` read `decision.recommended_arm`
+   unconditionally and phrased itself as "monitor ... before continuing" — but
+   on an equipoise decision that field is only the argmax, and Layer 3 has
+   already declared it inseparable from the candidate set. So the flag named an
+   arm nobody had recommended and attributed an intent to continue it. That is
+   invariant 2's defect in a rule rather than a status, and being a *warn* is
+   why it survived: it stopped nothing, so nothing caught it.
+
+   Gating on the argmax also **suppressed** the warning. The trigger required the
+   argmax to be hepatotoxic, so an undecided patient whose argmax happened to be
+   benign lost the warning even though the candidate set still held hepatotoxic
+   arms — the trajectory evidence is identical either way. Measured over 120
+   patients the flag fired **once**; it now fires **eight** times, all on
+   undecided patients, and names an arm only when one was published.
+
+   The trajectory observation is the same in both cases; what changes is the
+   claim. With a recommendation it is about that arm. Without one it is about the
+   arms still under consideration and says so, with `affected_arm` left `None` —
+   because a name appearing there is how invariant 2 detects a promotion.
+
 ## What is real vs. still a placeholder
 
 Real: the four estimators, the cohort and its known blips, informative-dropout
@@ -967,7 +1017,9 @@ Still deliberately simple, and labelled as such in-module:
 `HandcraftedFeatureEncoder` (nine clinical features normalised and tiled — not a
 learned representation, and it does not claim to be; the `GRUBaselineEncoder`
 that wrapped it is deleted, see invariant 37),
-`SemanticKnowledgeBase` (five hard-coded passages, whitespace-token retrieval),
+`SemanticKnowledgeBase` (five hard-coded passages, word-token keyword retrieval
+— not a vector store, though it does now match its own arm vocabulary, see
+invariant 47),
 `WHY_NOT_REASONS` (hard-coded clinical prose attached to a model-derived Q-gap —
 the one place Layer 5 asserts something the model did not produce). The E-value
 is no longer on this list: it was a heuristic and is now the VanderWeele-Ding

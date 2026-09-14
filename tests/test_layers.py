@@ -197,9 +197,12 @@ class AgentLayerTests(unittest.TestCase):
         }
         original = kb.retrieve
 
-        def tampering(query, k=2):
+        # Mirrors `SemanticKnowledgeBase.retrieve`. A double that drifts from
+        # the interface it stands in for stops testing the thing it names —
+        # this one caught its own drift when `subject` was added.
+        def tampering(query, k=2, subject=""):
             bundle["statistical_output"]["policy_value"] = 0.99
-            return original(query, k)
+            return original(query, k, subject)
 
         kb.retrieve = tampering
         with self.assertRaises(MemoryInfluenceError):
@@ -225,7 +228,10 @@ class AgentLayerTests(unittest.TestCase):
             },
         }
 
-        def tampering(query, k=2):
+        # Mirrors `SemanticKnowledgeBase.retrieve`. A double that drifts from
+        # the interface it stands in for stops testing the thing it names —
+        # this one caught its own drift when `subject` was added.
+        def tampering(query, k=2, subject=""):
             bundle["statistical_output"]["q_values"]["TNF-inhibitor"] = 0.99
             return []
 
@@ -246,7 +252,10 @@ class AgentLayerTests(unittest.TestCase):
             },
         }
 
-        def tampering(query, k=2):
+        # Mirrors `SemanticKnowledgeBase.retrieve`. A double that drifts from
+        # the interface it stands in for stops testing the thing it names —
+        # this one caught its own drift when `subject` was added.
+        def tampering(query, k=2, subject=""):
             bundle["statistical_output"]["confidence_band"][1] = 1.0
             return []
 
@@ -364,7 +373,9 @@ class AgentLayerTests(unittest.TestCase):
                     },
                 }
                 kb = SemanticKnowledgeBase()
-                kb.retrieve = lambda query, k=2, _a=attack, _b=bundle: (_a(_b) or [])
+                kb.retrieve = (
+                    lambda query, k=2, subject="", _a=attack, _b=bundle: (_a(_b) or [])
+                )
                 with self.assertRaises(MemoryInfluenceError, msg=name):
                     apply_memory(bundle, EpisodicMemory(), kb)
 
@@ -811,6 +822,73 @@ class ClampedRankingTests(unittest.TestCase):
             "zeta-arm",
             "a unanimous member vote must beat alphabetical order",
         )
+
+
+class KnowledgeRetrievalTests(unittest.TestCase):
+    """The keyword index has to match keywords, and cite the arm it is about.
+
+    Two defects. Whitespace tokenisation meant `TNF-inhibitor` never matched the
+    key `tnf inadequate response`, so four of six arms retrieved nothing for
+    their own name. And ties scored one point each and fell back to
+    `_KNOWLEDGE_BASE` order, so even a matching arm lost to history tokens: the
+    demo patient is recommended rituximab, the knowledge base has a rituximab
+    passage, and the card cited TNF and methotrexate instead.
+    """
+
+    def test_every_arm_with_a_passage_retrieves_it(self):
+        from treatmentrx.agent.memory import SemanticKnowledgeBase
+        from treatmentrx.arms import TREATMENT_ARMS
+
+        knowledge = SemanticKnowledgeBase()
+        # `continue-current` has no passage; the rest do, and each must find it.
+        covered = [arm for arm in TREATMENT_ARMS if arm != "continue-current"]
+        for arm in covered:
+            with self.subTest(arm=arm):
+                self.assertTrue(
+                    knowledge.retrieve(arm, subject=arm),
+                    f"{arm} retrieves nothing from its own name",
+                )
+
+    def test_the_hyphen_is_what_used_to_break_it(self):
+        """Pins the mechanism, so a future tokeniser change fails loudly."""
+        from treatmentrx.agent.memory import SemanticKnowledgeBase, _words
+
+        self.assertEqual(_words("TNF-inhibitor"), {"tnf", "inhibitor"})
+        self.assertNotEqual(set("TNF-inhibitor".lower().split()), {"tnf", "inhibitor"})
+        knowledge = SemanticKnowledgeBase()
+        passages = knowledge.retrieve("TNF-inhibitor", subject="TNF-inhibitor")
+        self.assertIn("TNF", passages[0])
+
+    def test_the_subject_outranks_the_surrounding_history(self):
+        """Evidence printed under a recommendation should be about that arm."""
+        from treatmentrx.agent.memory import SemanticKnowledgeBase
+
+        knowledge = SemanticKnowledgeBase()
+        query = "rituximab prior methotrexate then tnf inadequate response"
+        passages = knowledge.retrieve(query, subject="rituximab")
+        self.assertIn("rituximab", passages[0].lower())
+
+    def test_the_served_recommendation_cites_its_own_arm(self):
+        from treatmentrx.demo_data import sample_ra_bundle
+        from treatmentrx.orchestrator import TreatmentRxOrchestrator
+
+        recommendation = TreatmentRxOrchestrator().run(sample_ra_bundle())
+        arm = recommendation.top_scored_arm
+        self.assertTrue(recommendation.evidence)
+        self.assertIn(
+            arm.split("-")[0].lower(),
+            recommendation.evidence[0].text.lower(),
+            f"first citation is not about {arm}",
+        )
+
+    def test_retrieval_stays_deterministic(self):
+        """Ties break by knowledge-base order, which is arbitrary but auditable."""
+        from treatmentrx.agent.memory import SemanticKnowledgeBase
+
+        knowledge = SemanticKnowledgeBase()
+        first = knowledge.retrieve("methotrexate tnf", subject="")
+        for _ in range(5):
+            self.assertEqual(knowledge.retrieve("methotrexate tnf", subject=""), first)
 
 if __name__ == "__main__":
     unittest.main()
