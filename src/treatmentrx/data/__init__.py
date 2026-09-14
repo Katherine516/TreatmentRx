@@ -19,7 +19,7 @@ from treatmentrx.data.competing_risks import CompetingRiskBuilder
 from treatmentrx.data.contract import DataContractError, RADataContract
 from treatmentrx.data.endpoints import Endpoint
 from treatmentrx.data.dag import CausalDAGRegistry
-from treatmentrx.data.encoders import GRUBaselineEncoder, HandcraftedFeatureEncoder
+from treatmentrx.data.encoders import HandcraftedFeatureEncoder
 from treatmentrx.data.fhir import FHIRAdapter
 from treatmentrx.data.leakage import LeakageError, LeakageTestSuite
 from treatmentrx.data.stages import StageHistoryBuilder
@@ -51,8 +51,7 @@ class DataLayer:
         self.belief = BeliefStateFilter()
         self.competing_risk = CompetingRiskBuilder()
         self.leakage = LeakageTestSuite()
-        self.handcrafted_encoder = HandcraftedFeatureEncoder()
-        self.encoder = GRUBaselineEncoder()
+        self.encoder = HandcraftedFeatureEncoder()
         self.dag = CausalDAGRegistry()
 
     def build_patient_state(
@@ -99,16 +98,18 @@ class DataLayer:
         stages = [replace(stage, care_goal=care_goal) for stage in stages]
 
         dag_result = self.dag.validate(patient, treatment=stages[-1].treatment)
+        # One encode, one object. There were two: a GRU-shaped wrapper whose
+        # vector nothing read, and the handcrafted encoder it called internally —
+        # so this ran twice per request and the expensive result was discarded.
         encoded = self.encoder.encode(stages)
-        handcrafted = self.handcrafted_encoder.encode(stages)
 
         return PatientState(
             patient_hash=patient_hash,
             disease=patient.disease,
             stage=stages[-1].stage,
             care_goal=care_goal,
-            features=handcrafted.vector,
-            feature_names=sorted(handcrafted.feature_map),
+            features=encoded.vector,
+            feature_names=sorted(encoded.feature_map),
             adjustment_set=dag_result.adjustment_set,
             feasible_arms=sorted(self.contract.treatment_arms),
             history_summary=self._history_summary(stages),

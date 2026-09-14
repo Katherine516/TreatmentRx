@@ -22,7 +22,7 @@ class OrchestratorTests(unittest.TestCase):
         audit = recommendation.audit_event
         self.assertTrue(audit["data_contract_passed"])
         self.assertTrue(audit["dag_identified"])
-        self.assertEqual(audit["encoder_dimension"], 256)
+        self.assertEqual(audit["encoder_dimension"], 32)
         self.assertEqual(audit["calibration"]["measured_on"], "held-out cohort")
         self.assertIn("estimator_scorecard", audit)
         self.assertIn("competing_risk_incidence", audit)

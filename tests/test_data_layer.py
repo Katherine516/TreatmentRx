@@ -8,7 +8,7 @@ from treatmentrx.arms import normalize_arm
 from treatmentrx.data import DataLayer
 from treatmentrx.data.contract import RADataContract
 from treatmentrx.data.dag import CausalDAGRegistry
-from treatmentrx.data.encoders import GRUBaselineEncoder, HandcraftedFeatureEncoder
+from treatmentrx.data.encoders import HandcraftedFeatureEncoder
 from treatmentrx.data.fhir import FHIRAdapter
 from treatmentrx.data.leakage import LeakageError, LeakageTestSuite, TemporalFirewall
 from treatmentrx.data.stages import StageHistoryBuilder
@@ -63,19 +63,24 @@ class IngestionTests(unittest.TestCase):
         self.assertIn("baseline_disease_activity", result.adjustment_set)
         self.assertIn("colliders", result.causal_path_text)
 
-    def test_encoders_produce_stable_state_vectors(self):
+    def test_the_encoder_produces_a_stable_state_vector(self):
         _, stages = _stages()
-        self.assertEqual(len(HandcraftedFeatureEncoder().encode(stages).vector), 32)
-        self.assertEqual(len(GRUBaselineEncoder().encode(stages).vector), 256)
+        encoded = HandcraftedFeatureEncoder().encode(stages)
+        self.assertEqual(len(encoded.vector), 32)
+        self.assertEqual(encoded.vector, HandcraftedFeatureEncoder().encode(stages).vector)
 
-    def test_only_the_handcrafted_prefix_of_the_encoding_is_read(self):
-        """Documented rather than assumed: the recurrent tail holds the shape of
-        the planned `z_t` interface, and no consumer reads it yet. The OOD score
-        slices `vector[:32]`."""
+    def test_everything_the_state_carries_from_the_encoder_is_read(self):
+        """The encoder used to be wrapped by a GRU-shaped one whose 256-entry
+        vector nothing consumed — its tail held seven distinct values and its
+        `feature_map` was a copy of this one's. Both fields here reach
+        `PatientState` and are read, which is what makes keeping them honest.
+        """
         _, stages = _stages()
-        vector = GRUBaselineEncoder().encode(stages).vector
-        handcrafted = HandcraftedFeatureEncoder().encode(stages, dimension=32).vector
-        self.assertEqual(vector[:32], handcrafted)
+        encoded = HandcraftedFeatureEncoder().encode(stages)
+        state = DataLayer().build_patient_state(sample_ra_bundle())
+        self.assertEqual(state.features, state.encoded_state.vector)
+        self.assertEqual(state.feature_names, sorted(state.encoded_state.feature_map))
+        self.assertEqual(len(encoded.feature_map), len(state.feature_names))
 
 
 class ClinicalRealismTests(unittest.TestCase):

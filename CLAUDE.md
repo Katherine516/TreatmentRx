@@ -8,7 +8,7 @@ test fixture, not evidence.
 ## Commands
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests    # 473 tests, ~6 min
+PYTHONPATH=src python3 -m unittest discover -s tests    # 478 tests, ~6 min
 PYTHONPATH=src python3 -m treatmentrx.cli demo          # one patient end to end
 PYTHONPATH=src python3 -m treatmentrx.cli evaluate      # estimator scorecard
 PYTHONPATH=src python3 -m treatmentrx.cli stability     # k-fold + seed sweep (~10s)
@@ -518,10 +518,23 @@ produced a real clinical divergence, and the notes below are the scar tissue.
    `crp >= 140` of 500, `egfr <= 7.5` of 200). `tests/test_workflow.py` fires each
    one in isolation, which is the property invariant 25 is about.
 
-   **Nothing now reads `EncodedState.vector`.** The audit event still reports its
-   name and length. Whether the encoder earns its place at all is an open
-   question, not a settled one — but do not read meaning into the vector's
-   contents in the meantime.
+   **That left nothing reading `EncodedState.vector`,** and the open question of
+   whether the encoder earned its place is now closed: `GRUBaselineEncoder` is
+   deleted. Once the out-of-distribution term went, the only surviving use of its
+   256-entry output was its own name and length in one audit line. Its
+   `feature_map` was a copy of `HandcraftedFeatureEncoder`'s, its 224-entry tail
+   held exactly **7** distinct values by construction, and it re-ran the
+   handcrafted encoder internally — so that ran twice per request. Measured:
+   **177us of the 211us** this layer spent encoding, and encoding was **29% of
+   `build_patient_state`**, which now costs **561us against 723us**.
+
+   The argument for keeping it was that it held the shape of the planned `z_t`
+   interface. It did not: `EncodedState` holds that shape and
+   `HandcraftedFeatureEncoder` already returns one. The wrapper was holding a
+   seat the thing it wrapped was already holding. `PatientState.features` and
+   `feature_names` come from that single encode now, and
+   `tests/test_data_layer.py` asserts both reach the state and are read — which
+   is the property that made deleting the other one correct.
 
 
 38. **Ignoring a covariance you can compute is not conservatism, it is lost
@@ -694,6 +707,30 @@ produced a real clinical divergence, and the notes below are the scar tissue.
    constants are not fitted to this split — but fresh seeds do not give back a
    test set.
 
+   **And a three-way split is not the remedy at this cohort size.**
+   `power.final_test_feasibility` (reported by `cli power`) prices it, and the
+   two quantities disagree:
+
+   | held back | evaluation ESS | final-test ESS | final identifies per-decision | identifies the regime |
+   | --- | --- | --- | --- | --- |
+   | none (today) | 73.0 / 14.0 | — | — | — |
+   | 25% | 52.7 / 10.5 | 20.4 / 5.4 | no | no |
+   | 40% | 42.9 / 8.2 | 30.3 / 6.2 | yes | no |
+   | 50% | 33.8 / 7.4 | 39.4 / 7.5 | yes | no |
+
+   A final test that identifies the *per-decision* value does exist at 40-50%
+   held back — bought by taking the evaluation split from 73 to 43, and the
+   per-decision value is not what the agent deploys. For the **regime's own**
+   value no split works: 5.4 to 7.5 against `MIN_OPE_EFFECTIVE_SAMPLE` of 30, so
+   the confirmation would itself be unidentified, which is the reading
+   `identified` exists to refuse. Keeping today's evaluation precision *and*
+   adding an identified final test needs roughly **565** trajectories for the
+   per-decision value and **1,258** for the regime's — against 400 today, and
+   next to `cli power`'s 1,490 for 30% abstention. Both say the same thing about
+   this cohort. Reported rather than acted on: `COHORT_SIZE` is a stated choice
+   near the low end and raising it moves the headline abstention rate, which is a
+   separate decision.
+
    The same defect in a different place: `BayesianModelAverager.aggregate`'s
    estimand-fingerprint check cannot fire from the serving path, because
    `EstimationLayer.estimate` stamps every result from the *same*
@@ -841,10 +878,10 @@ evidence for `prior_biologic_exposure` is deliberate — "no prior biologic" is 
 value of that variable, not a missing one, and requiring a biologic to appear
 blocked every csDMARD-only patient for having been treated conservatively.
 
-Still deliberately simple, and labelled as such in-module: `GRUBaselineEncoder`
-(a deterministic summariser, not a trained GRU — and since the dead out-of-
-distribution term was removed, **nothing reads its vector at all**; it holds the
-shape of the planned `z_t` interface and nothing else — see invariant 37),
+Still deliberately simple, and labelled as such in-module:
+`HandcraftedFeatureEncoder` (nine clinical features normalised and tiled — not a
+learned representation, and it does not claim to be; the `GRUBaselineEncoder`
+that wrapped it is deleted, see invariant 37),
 `SemanticKnowledgeBase` (five hard-coded passages, whitespace-token retrieval),
 `WHY_NOT_REASONS` (hard-coded clinical prose attached to a model-derived Q-gap —
 the one place Layer 5 asserts something the model did not produce), and the

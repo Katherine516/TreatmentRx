@@ -1102,6 +1102,26 @@ not give back a test set. `EvaluationPartitionContract` used to be exported,
 unit-tested and never constructed, which meant the package advertised a locked
 final test that did not exist; `has_final_test` now says so.
 
+**A three-way split is not the remedy at this cohort size**, and `cli power`
+prices it rather than leaving it to intuition:
+
+| held back | evaluation ESS | final-test ESS | identifies per-decision | identifies the regime |
+| --- | --- | --- | --- | --- |
+| none (today) | 73.0 / 14.0 | — | — | — |
+| 25% | 52.7 / 10.5 | 20.4 / 5.4 | no | no |
+| 40% | 42.9 / 8.2 | 30.3 / 6.2 | **yes** | no |
+| 50% | 33.8 / 7.4 | 39.4 / 7.5 | **yes** | no |
+
+The two quantities disagree, which is why both are reported. A final test that
+identifies the *per-decision* value exists at 40–50% held back — bought by taking
+the evaluation split from 73 to 43, and the per-decision value is not what the
+agent deploys. For the **regime's own** value no split works: 5.4 to 7.5 against
+a threshold of 30, so the confirmation would itself be unidentified. Keeping
+today's evaluation precision *and* adding an identified final test needs roughly
+**565** trajectories for the per-decision value and **1,258** for the regime's —
+against 400 today, and alongside `cli power`'s 1,490 for 30% abstention. Two
+different questions, the same answer about this cohort.
+
 What it is not is production infrastructure: single-process, no TLS, no auth.
 Those gaps are listed in `LIMITATIONS` and returned on `/health` rather than left
 for a reader to infer.
@@ -1117,10 +1137,9 @@ contrast tests, cross-validated stability, blip attributions, the
 backward-induction oracle used for regret, the safety sweep, and the
 specification test with measured false-positive rates.
 
-**Deliberately simple, and labelled as such in-module:** `GRUBaselineEncoder` (a
-deterministic summariser, not a trained GRU — and since the dead
-out-of-distribution term was removed, **nothing reads its vector at all**; it
-holds the shape of a planned interface and nothing else),
+**Deliberately simple, and labelled as such in-module:**
+`HandcraftedFeatureEncoder` (nine clinical features normalised and tiled — not a
+learned representation, and it does not claim to be),
 `SemanticKnowledgeBase` (five hard-coded passages, not a real RAG index), `WHY_NOT_REASONS` (hard-coded clinical prose on a model-derived Q-gap),
 and the E-value in the sensitivity report.
 
@@ -1172,23 +1191,21 @@ a patient.
 
 Next, in order:
 
-1. **Train the GRU baseline** and compare against the handcrafted encoder, now
-   that trajectories have three stages and irregular timing to learn from. Today
-   only the encoder's first 32 entries are read by anything; a trained encoder is
-   what would make the rest worth computing.
-2. **A versioned clinical knowledge base** keyed to `arms.py`, replacing the
+1. **A versioned clinical knowledge base** keyed to `arms.py`, replacing the
    sample contraindication rules and the five hard-coded RAG passages. The
    composite action set is currently a literal in `estimation/actions.py`, and
    its breadth is load-bearing for whether a contraindication blocks a patient.
    `WHY_NOT_REASONS` belongs there too — it is the one place Layer 5 asserts
    something the model did not produce.
-3. **A trained encoder, or an honest one.** `GRUBaselineEncoder` emits 256
-   dimensions; exactly one consumer reads it, and it reads `vector[:32]`. So 224
-   dimensions are computed on every request and never read, while the audit event
-   reports `encoder_dimension: 256`. Train it, shrink it, or drop the tail — but
-   a quantity that names a role it does not have is the pattern this repo keeps
-   removing.
-4. **A clinician-facing view of the card.** The numbers are served
+2. **A learned state representation, if one is ever wanted.** The previous entry
+   here offered three options for `GRUBaselineEncoder` — train it, shrink it, or
+   drop the tail — and the tail is dropped. Once the out-of-distribution term
+   that read `vector[:32]` was removed as unfirable, nothing read the vector at
+   all, and its only surviving use was its own name and length in an audit line:
+   177 µs per request, 29% of Layer 1, for a label. `build_patient_state` now
+   costs 561 µs against 723 µs. Training a real encoder is still a coherent
+   project; keeping an untrained one warm against that day was not.
+3. **A clinician-facing view of the card.** The numbers are served
    (`cli serve`); what is not built is a reading surface for them. The
    interesting question there is not layout — it is whether an interface can
    make `equipoise` on half of patients read as the measured statement it is

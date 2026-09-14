@@ -562,6 +562,68 @@ class RidgeDefaultTests(unittest.TestCase):
         self.assertLess(worst_error(DEFAULT_BLIP_RIDGE), worst_error(0.0))
 
 
+class FinalTestFeasibilityTests(unittest.TestCase):
+    """`evaluation_partition()` reports there is no final test; this prices one.
+
+    The obvious remedy for "no partition held back" is a three-way split, and it
+    is the kind of change that looks like pure discipline until someone measures
+    what it costs the half that is left.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from treatmentrx.feedback.power import final_test_feasibility
+
+        cls.report = final_test_feasibility()
+
+    def test_holding_data_back_costs_the_evaluation_split(self):
+        """Both halves come out of one holdout, so this is a trade, not a free win."""
+        today = self.report["today"]["per_decision_ess"]
+        for split in self.report["splits"]:
+            with self.subTest(held_back=split["held_back_fraction"]):
+                self.assertLess(split["evaluation"]["per_decision_ess"], today)
+
+    def test_no_split_can_confirm_the_regimes_own_value(self):
+        """The finding. The agent deploys a regime, and no final test identifies one.
+
+        A confirmation that is itself unidentified is not a confirmation, and
+        `identified` is the field this repo already uses to refuse that reading.
+        """
+        self.assertFalse(self.report["affordable_for_the_regime"])
+        for split in self.report["splits"]:
+            with self.subTest(held_back=split["held_back_fraction"]):
+                self.assertFalse(split["final_test_identifies_the_regime"])
+
+    def test_the_two_quantities_are_reported_separately(self):
+        """They disagree, and collapsing them would hide which one is affordable.
+
+        A final test large enough for the per-decision value does exist at 40-50%
+        held back. Reporting one boolean would either overclaim or underclaim.
+        """
+        self.assertTrue(self.report["affordable_for_the_per_decision_value"])
+        self.assertNotEqual(
+            self.report["affordable_for_the_per_decision_value"],
+            self.report["affordable_for_the_regime"],
+        )
+
+    def test_the_required_cohort_is_larger_for_the_harder_quantity(self):
+        needed = self.report["cohort_for_identified_final_test"]
+        from treatmentrx.estimation import training
+
+        self.assertGreater(needed["sequential_value"], needed["per_decision_value"])
+        self.assertGreater(needed["per_decision_value"], training.COHORT_SIZE)
+
+    def test_the_verdict_does_not_overstate_the_finding(self):
+        """An earlier verdict string said every split failed on both quantities.
+
+        The measurement says otherwise, and a summary that contradicts the table
+        beneath it is the failure this repo keeps removing.
+        """
+        verdict = self.report["verdict"]
+        self.assertIn("per-decision", verdict)
+        self.assertIn("regime", verdict)
+
+
 class AuditHarnessTests(unittest.TestCase):
     def test_ingestion_recovers_what_was_generated(self):
         metrics = audit_ingestion(n=15).metrics

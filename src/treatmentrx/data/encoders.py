@@ -6,7 +6,25 @@ from treatmentrx.domain import EncodedState, StageRecord
 
 
 class HandcraftedFeatureEncoder:
-    """Transparent baseline encoder for early RA policy validation."""
+    """Transparent baseline encoder for early RA policy validation.
+
+    Nine clinical features, each normalised into [0, 1] and tiled to the
+    requested width. `vector` is `PatientState.features` and `feature_map` names
+    them, so both are read by things that matter.
+
+    **A `GRUBaselineEncoder` used to wrap this one** and is gone. It ran a
+    256-unit recurrence on every request and produced a vector nothing read: its
+    single consumer, the out-of-distribution term that sliced `vector[:32]`, was
+    removed once measurement showed it could never cross its threshold (invariant
+    37), and after that the only surviving use of its output was its own name and
+    length in one audit line. Its `feature_map` was a copy of this encoder's, and
+    its 224-entry tail held exactly `7` distinct values by construction. It cost
+    177us of the 211us this layer spent encoding, 29% of `build_patient_state`.
+
+    The planned `z_t` interface is preserved by `EncodedState` itself, which this
+    encoder already returns — the wrapper was holding a seat that the thing it
+    wrapped was already holding.
+    """
 
     encoder_name = "handcrafted-ra-baseline"
 
@@ -52,67 +70,3 @@ class HandcraftedFeatureEncoder:
                     break
                 vector.append(round(max(min(value, 1.0), -1.0), 6))
         return vector
-
-
-# The hand-rolled bias cycles with this period, which is what makes the
-# recurrent half collapse to a handful of distinct trajectories.
-_BIAS_PERIOD = 7
-
-
-class GRUBaselineEncoder:
-    """Dependency-free GRU-compatible baseline interface.
-
-    This is a deterministic sequence summarizer, not a trained neural GRU. It
-    preserves the planned `z_t` interface so the statistical layer can be tested
-    before PyTorch pretraining is introduced.
-
-    **Nothing reads the vector.** It had one consumer — the out-of-distribution
-    score sliced `vector[:32]` and added `max(rms - 0.85, 0)` — and that term
-    could not fire: the handcrafted prefix is nine features normalised into
-    [0, 1] and tiled, so its root-mean-square is bounded well below the
-    threshold by construction, and over 121 patients it ran 0.374 to 0.664. The
-    term contributed zero to every score ever produced and has been removed.
-
-    What survives is the *shape* of the planned `z_t` interface and the
-    `feature_map`, which the audit event reports. Read the vector as a
-    placeholder holding a seat, not as a state representation: it is a fixed
-    function of nine clinical features, and its 224-entry recurrent tail
-    collapses to `_BIAS_PERIOD` distinct values per patient by construction.
-    """
-
-    encoder_name = "gru-compatible-baseline"
-
-    def __init__(self, hidden_size: int = 256) -> None:
-        self.hidden_size = hidden_size
-        self.handcrafted = HandcraftedFeatureEncoder()
-
-    def encode(self, stages: list[StageRecord]) -> EncodedState:
-        base = self.handcrafted.encode(stages, dimension=min(32, self.hidden_size))
-        hidden = [0.0 for _ in range(self.hidden_size)]
-        for index, value in enumerate(base.vector):
-            hidden[index] = value
-
-        # Every hidden unit past the handcrafted prefix starts at zero and is
-        # driven by the same recurrence, differing only by a bias that depends on
-        # `index % 7`. There are therefore exactly `_BIAS_PERIOD` distinct
-        # trajectories, not `hidden_size - 32` of them: solve those and broadcast.
-        # Bit-identical to updating each unit in turn, at a thirty-second of the
-        # arithmetic.
-        recurrent = range(len(base.vector), self.hidden_size)
-        tracks = [0.0] * _BIAS_PERIOD
-        for stage in stages:
-            stage_signal = stage.outcome / max(stage.stage, 1)
-            for residue in range(_BIAS_PERIOD):
-                tracks[residue] = math.tanh(
-                    0.88 * tracks[residue]
-                    + 0.12 * stage_signal
-                    + (residue - 3) * 0.002
-                )
-        for index in recurrent:
-            hidden[index] = tracks[index % _BIAS_PERIOD]
-
-        return EncodedState(
-            encoder_name=self.encoder_name,
-            vector=[round(value, 6) for value in hidden],
-            feature_map=base.feature_map,
-        )
