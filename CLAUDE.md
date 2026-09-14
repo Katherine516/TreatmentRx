@@ -8,7 +8,7 @@ test fixture, not evidence.
 ## Commands
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests    # 485 tests, ~6 min
+PYTHONPATH=src python3 -m unittest discover -s tests    # 489 tests, ~6 min
 PYTHONPATH=src python3 -m treatmentrx.cli demo          # one patient end to end
 PYTHONPATH=src python3 -m treatmentrx.cli evaluate      # estimator scorecard
 PYTHONPATH=src python3 -m treatmentrx.cli stability     # k-fold + seed sweep (~10s)
@@ -480,12 +480,12 @@ produced a real clinical divergence, and the notes below are the scar tissue.
    There are two questions and they now have two names. `when_it_commits` scores
    the arm the agent published (35 patients, 100%, regret 0.0 — trivially high,
    because it commits only when the gap is large). `if_forced_to_commit` scores
-   `top_scored_arm` over everyone (120 patients, 90.8%, mean regret 0.0011, max
-   0.0406) and is the ranking itself. Both carry `patients`.
+   `top_scored_arm` over everyone (120 patients, 92.5%, mean regret 0.0003, max
+   0.0101) and is the ranking itself. Both carry `patients`.
 
    `abstention_price` then prices the system's defining behaviour instead of
    asserting it, over the 85 declined patients: taking the model's own top arm
-   costs **0.0015** mean, the worst arm in the candidate set **0.0474**, the
+   costs **0.0005** mean, the worst arm in the candidate set **0.0464**, the
    worst arm on the menu **0.2058**. That last pair is the retrospective case for
    the candidate set — handing back a bare status was, in regret terms, roughly
    4.3x worse than handing back the set. That ratio was 6x before the all-pairs
@@ -897,6 +897,47 @@ produced a real clinical divergence, and the notes below are the scar tissue.
    from `q_values`. The caller already had it; reconstructing a worse quantity
    beside the decision is the incoherence invariant 16 removed from the interval,
    one layer over.
+
+46. **The leader was chosen twice, two different ways, and one of them used a
+   display quantity.** `q_values` is clamped to `[Q_FLOOR, Q_CEILING]` and
+   rounded to three decimals before anything downstream sees it. Both steps are
+   many-to-one. A patient whose predicted response saturates the ceiling had two
+   arms collapse to 0.99 — measured, Q-Pooled 0.9897/0.9995 and dWOLS
+   0.9898/1.0013, both ceiling-clipped — `max` fell through to dictionary order,
+   and `DecisionLayer._contrast` then re-sorted the same clamped dict and picked
+   its own top pair. The result was a **negative contrast for the decision's own
+   leader**: the interval printed beside the recommendation saying the runner-up
+   was better. **6 of 120 patients, 5%**, with 8.3% saturating the clamp on at
+   least one arm.
+
+   The information was never lost, only discarded. `QLearningModel.recommend` and
+   `DWOLSModel.recommend` already read the unclamped value-to-go; it was the
+   facades that re-derived a ranking from their own display dict. Three changes,
+   all of them "choose the leader once": the facades take `recommended_arm` from
+   the model, `BayesianModelAverager` breaks a clamped tie by the members'
+   weighted votes rather than by dictionary order, and `DecisionLayer._ranked`
+   puts `selected.recommended_arm` first instead of re-sorting.
+
+   **It improved the ranking without touching the rate**, which is the shape a
+   fix should have here:
+
+   | | before | after |
+   | --- | --- | --- |
+   | status distribution | 35 / 85 | unchanged |
+   | oracle-arm rate, forced | 0.9083 | **0.9250** |
+   | mean regret | 0.0011 | **0.0003** |
+   | max regret | 0.0406 | **0.0101** |
+
+   Max regret falling fourfold is the tell: the agent's worst mistakes *were* the
+   clamp artefacts. Abstention did not move, so this is recommending better
+   rather than recommending more — the direction invariant 32 warns about.
+
+   One case survives and is a different thing. Two members genuinely disagree
+   (Q-Pooled 0.7275 against dWOLS 0.7426 for the same pair), the averaged values
+   tie at 0.736 — mid-range, nowhere near the clamp — and the weighted vote
+   breaks it. The resulting -0.0016 contrast honestly reports that disagreement
+   and routes to equipoise. `tests/test_layers.py` allows exactly one such case
+   and no clamp artefacts.
 
 ## What is real vs. still a placeholder
 

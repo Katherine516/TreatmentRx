@@ -710,6 +710,108 @@ class FeedbackLayerTests(unittest.TestCase):
         self.assertFalse(FeedbackLayer().enqueue(state, recommendation, safe).retraining_allowed)
 
 
+
+class ClampedRankingTests(unittest.TestCase):
+    """The leader must not be chosen by a display quantity.
+
+    `q_values` is clamped to `[Q_FLOOR, Q_CEILING]` and rounded to 3dp before
+    anything downstream sees it, and both steps are many-to-one. A patient whose
+    predicted response saturates the ceiling had two arms collapse to 0.99, the
+    argmax fell through to dictionary order, and the decision then reported a
+    *negative* contrast for its own top pair.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from treatmentrx.data.contract import DataContractError
+        from treatmentrx.orchestrator import TreatmentRxOrchestrator
+        from treatmentrx.simulation.fhir_export import simulated_bundles
+
+        orchestrator = TreatmentRxOrchestrator()
+        cls.rows = []
+        for bundle in simulated_bundles(60, seed=991):
+            try:
+                recommendation = orchestrator.run(bundle)
+            except DataContractError:
+                continue
+            contrast = recommendation.audit_event.get("contrast") or {}
+            if "difference" in contrast:
+                cls.rows.append((recommendation, contrast))
+
+    def test_the_contrast_describes_the_arm_the_decision_named(self):
+        """One leader, chosen once. It used to be chosen twice, two ways."""
+        for recommendation, contrast in self.rows:
+            top = recommendation.top_scored_arm
+            if top is None:
+                continue
+            with self.subTest(patient=recommendation.audit_event.get("patient_hash")):
+                self.assertEqual(contrast["arm"], top)
+
+    def test_a_saturated_patient_does_not_get_a_backwards_contrast(self):
+        """The defect's signature: the interval says the runner-up is better.
+
+        One residual case is expected and is a different thing — a genuine tie
+        at mid-range where the two members disagree and the weighted vote breaks
+        it. That one is honest; a clamp artefact is not.
+        """
+        backwards = [c for _, c in self.rows if c["difference"] < 0]
+        self.assertLessEqual(
+            len(backwards),
+            1,
+            f"{len(backwards)} patients have a contrast pointing away from their leader",
+        )
+
+    def test_the_estimators_rank_on_unclamped_values(self):
+        """The information was never lost, only discarded at the facade."""
+        from treatmentrx.estimation import training
+        from treatmentrx.estimation.q_learning import Q_CEILING
+
+        fit = training.fitted()
+        features = {
+            "das28": 2.0, "crp": 4.0, "anti_ccp": 1.0,
+            "prior_tnf": 0.0, "egfr": 110.0, "alt": 12.0,
+        }
+        terminal = fit.pooled.n_stages - 1
+        raw = {
+            arm: fit.pooled.raw_q(features, arm, terminal) for arm in fit.pooled.arms
+        }
+        clamped = fit.pooled.q_values(features, terminal)
+        self.assertEqual(
+            fit.pooled.recommend(features, terminal), max(raw, key=raw.get)
+        )
+        self.assertTrue(
+            all(value <= Q_CEILING for value in clamped.values()),
+            "q_values is the display quantity and must stay inside the band",
+        )
+
+    def test_a_tie_is_broken_by_the_members_not_by_dict_order(self):
+        """Deterministic, and using information rather than insertion order."""
+        from treatmentrx.decision.bma import BayesianModelAverager
+        from treatmentrx.contracts import RegimeEstimate
+        from treatmentrx.domain import RegimeType
+
+        def estimate(name, recommended):
+            return RegimeEstimate(
+                estimator=name,
+                regime_type=RegimeType.DTR,
+                recommended_arm=recommended,
+                q_values={"zeta-arm": 0.99, "alpha-arm": 0.99},
+                policy_value=0.7,
+                confidence_band=(0.6, 0.8),
+                coefficients={},
+                top_tailoring_variables=[],
+                estimand_fingerprint="same",
+            )
+
+        averaged = BayesianModelAverager().aggregate(
+            [estimate("Q-Pooled", "zeta-arm"), estimate("dWOLS-Shared", "zeta-arm")]
+        )
+        self.assertEqual(
+            averaged.recommended_arm,
+            "zeta-arm",
+            "a unanimous member vote must beat alphabetical order",
+        )
+
 if __name__ == "__main__":
     unittest.main()
 

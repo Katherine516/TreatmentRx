@@ -129,7 +129,7 @@ class DecisionLayer:
         which is fitted and never served because `build_patient_state` appends
         the pending visit.
         """
-        ordered = sorted(selected.q_values, key=selected.q_values.get, reverse=True)
+        ordered = self._ranked(selected)
         if len(ordered) < 2:
             return None
         return self._pair_contrast(
@@ -139,6 +139,30 @@ class DecisionLayer:
             weights,
             alpha=self._simultaneous_alpha(len(ordered)),
         )
+
+    @staticmethod
+    def _ranked(selected: RegimeEstimate) -> list[str]:
+        """Arms worst-to-best with the ensemble's own leader first.
+
+        Sorting `q_values` is not enough, and the failure is not hypothetical.
+        That dict is clamped to `[Q_FLOOR, Q_CEILING]` and rounded to 3dp for
+        display; a patient whose predicted response saturates the ceiling has two
+        arms collapse to 0.99, and a stable sort then returns them in dictionary
+        order. The leader here and `selected.recommended_arm` — which BMA takes
+        from the members' unclamped rankings — could disagree, and when they did
+        the contrast was computed for the wrong pair *in the wrong direction*: the
+        interval beside the recommendation said the runner-up was better.
+        Measured over 120 patients, 6 of them.
+
+        Choosing the leader once, in one place, is the fix. The rest of the menu
+        is ordered by the display values, which is only a presentation question.
+        """
+        ordered = sorted(selected.q_values, key=selected.q_values.get, reverse=True)
+        leader = selected.recommended_arm
+        if leader in ordered:
+            ordered.remove(leader)
+            ordered.insert(0, leader)
+        return ordered
 
     def _candidate_set(
         self, state: PatientState, selected: RegimeEstimate, weights: dict[str, float]
@@ -167,7 +191,7 @@ class DecisionLayer:
         excluded only if the interval that *would* have been reported for it
         excludes zero.
         """
-        arms = sorted(selected.q_values, key=selected.q_values.get, reverse=True)
+        arms = self._ranked(selected)
         if len(arms) < 2:
             return tuple(arms), {}
 

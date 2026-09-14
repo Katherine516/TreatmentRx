@@ -852,11 +852,22 @@ Two questions, two names, both carrying `patients`:
 | | n | oracle-arm rate | mean regret | max regret |
 | --- | --- | --- | --- | --- |
 | `when_it_commits` | 35 | 1.000 | 0.0000 | 0.0000 |
-| `if_forced_to_commit` | 120 | **0.9083** | **0.0011** | **0.0406** |
+| `if_forced_to_commit` | 120 | **0.9250** | **0.0003** | **0.0101** |
+
+Those numbers improved when the leader stopped being chosen by a display
+quantity. `q_values` is clamped to `[0.01, 0.99]` and rounded to 3dp before
+anything downstream sees it; a patient whose predicted response saturates the
+ceiling had two arms collapse to 0.99, the argmax fell through to dictionary
+order, and the contrast was then computed for the wrong pair — printing a
+*negative* separation beside the recommendation. Six of 120 patients. Choosing
+the leader once, from the unclamped value the estimators already rank on, took
+oracle-arm agreement 0.9083 → 0.9250, mean regret 0.0011 → 0.0003 and **max
+regret 0.0406 → 0.0101**, with the recommend/abstain split unchanged. The worst
+mistakes were the artefact.
 
 The second row is the interesting one, and it reframes the abstention story: the
 agent declines on 71% of these patients, and its top-scored arm would have been
-the oracle-optimal one **90.8%** of the time anyway. Its *ranking* is considerably
+the oracle-optimal one **92.5%** of the time anyway. Its *ranking* is considerably
 better than its own (deliberately conservative) intervals let it claim.
 
 That does not argue for abstaining less — the intervals genuinely include zero.
@@ -865,8 +876,8 @@ clinician does next, over the 85 declined patients:
 
 | the clinician takes | mean regret | max |
 | --- | --- | --- |
-| the model's own top arm | 0.0015 | 0.0406 |
-| the worst arm in the candidate set | 0.0474 | 0.2142 |
+| the model's own top arm | 0.0005 | 0.0101 |
+| the worst arm in the candidate set | 0.0464 | 0.2142 |
 | the worst arm on the whole menu | 0.2058 | 0.4093 |
 
 Which is the retrospective case for the section above: handing back a bare

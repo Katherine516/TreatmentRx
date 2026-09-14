@@ -407,7 +407,9 @@ class DWOLSSharedEstimator:
         model = fitted_model()
         features = model_features(stages)
         q_values = model.q_values(features, treatment_menu)
-        recommended = max(q_values, key=q_values.get)
+        # See `_QLearningEstimator.fit_predict`: `q_values` is a display
+        # quantity and ranking on it loses the order at the clamp.
+        recommended = model.recommend(features, treatment_menu)
         best = q_values[recommended]
         # The band widens with the standard error the blip fit is entitled to:
         # arms with few one-vs-reference rows are reported less confidently.

@@ -80,7 +80,7 @@ class BayesianModelAverager:
             )
             for arm in treatment_arms
         }
-        recommended = max(q_values, key=q_values.get)
+        recommended = self._recommended(q_values, results, weights)
         model_variance = sum(
             weights[result.estimator] * (result.q_values.get(recommended, 0.0) - q_values[recommended]) ** 2
             for result in results
@@ -105,6 +105,41 @@ class BayesianModelAverager:
             top_tailoring_variables=dominant.top_tailoring_variables,
             estimand_fingerprint=next(iter(fingerprints), ""),
         )
+
+    def _recommended(
+        self,
+        q_values: dict[str, float],
+        results: list[RegimeEstimate],
+        weights: dict[str, float],
+    ) -> str:
+        """The averaged argmax, with a clamped tie resolved by the members.
+
+        `q_values` is a *display* quantity: each estimator clamps to
+        `[Q_FLOOR, Q_CEILING]` and rounds to three decimals before this sees it,
+        and both steps are many-to-one. A patient whose predicted response
+        saturates the ceiling has two arms collapse to 0.99, `max` falls through
+        to dictionary order, and the decision then reports a **negative** contrast
+        for its own top pair — the interval beside the recommendation saying the
+        runner-up is better. Measured over 120 patients that happened to **6 of
+        them, 5%**, with 8.3% saturating the clamp on at least one arm.
+
+        Each member already ranks correctly — `QLearningModel.recommend` and
+        `DWOLSModel.recommend` read the unclamped value-to-go — so the
+        information is not lost, only discarded here. On a tie the members vote,
+        weighted by the same model-averaging weights used everywhere else. Ties
+        that survive that are broken by name, which is arbitrary but deterministic
+        and cannot depend on dictionary insertion order.
+        """
+        best = max(q_values.values())
+        leaders = sorted(arm for arm, value in q_values.items() if value == best)
+        if len(leaders) == 1:
+            return leaders[0]
+        votes = {arm: 0.0 for arm in leaders}
+        for result in results:
+            if result.recommended_arm in votes:
+                votes[result.recommended_arm] += weights.get(result.estimator, 0.0)
+        top = max(votes.values())
+        return sorted(arm for arm, weight in votes.items() if weight == top)[0]
 
     def _regime_type(self, results: list[RegimeEstimate]) -> RegimeType:
         """What kind of regime the *ensemble* is, not whichever member weighed most.

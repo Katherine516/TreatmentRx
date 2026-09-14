@@ -54,7 +54,12 @@ class _QLearningEstimator:
         features = model_features(stages)
         index = stage_index(stages, model.n_stages)
         q_values = model.q_values(features, index, treatment_menu)
-        recommended = max(q_values, key=q_values.get)
+        # Ranked by the model, not by the dict above. `q_values` is clamped to
+        # [Q_FLOOR, Q_CEILING] and rounded to 3dp for display, and both of those
+        # are many-to-one: a patient whose response saturates the ceiling has two
+        # arms collapse to 0.99 and the argmax then falls through to dict order.
+        # `recommend` reads the unclamped value-to-go.
+        recommended = model.recommend(features, index, treatment_menu)
         best = q_values[recommended]
         # A real interval: the standard error of the recommended arm's blip,
         # from the cluster-robust covariance of the fit.
