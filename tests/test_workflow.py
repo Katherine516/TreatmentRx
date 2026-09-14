@@ -578,5 +578,101 @@ class UncertaintyTests(unittest.TestCase):
         self.assertNotIn("limited_history", flags, "the demo patient has three stages")
 
 
+class EValueTests(unittest.TestCase):
+    """The E-value has to be about confounding, not a re-encoding of the Q-gap.
+
+    It used to be `rr = q_values[0] / q_values[1]` fed into the E-value formula:
+    a ratio of two nearly-equal bounded means, never referencing confounding.
+    Across 60 patients it returned 1.000 to 1.617, with 11 under 1.1 — and a
+    published E-value of 1.0 asserts that *no* unmeasured confounding is needed.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from treatmentrx.orchestrator import TreatmentRxOrchestrator
+        from treatmentrx.demo_data import sample_ra_bundle
+
+        cls.recommendation = TreatmentRxOrchestrator().run(sample_ra_bundle())
+        cls.sensitivity = cls.recommendation.explanation.sensitivity
+
+    def test_a_zero_effect_needs_no_confounding(self):
+        """The anchor of the whole scale, and the old version got it backwards."""
+        from treatmentrx.estimation.explainability import _e_value
+
+        self.assertEqual(_e_value(0.0, 0.15), 1.0)
+        self.assertGreater(_e_value(0.05, 0.15), 1.0)
+
+    def test_it_grows_with_the_effect_and_shrinks_with_the_spread(self):
+        """Both directions, because an E-value is a standardised quantity."""
+        from treatmentrx.estimation.explainability import _e_value
+
+        self.assertGreater(_e_value(0.08, 0.15), _e_value(0.04, 0.15))
+        self.assertGreater(_e_value(0.04, 0.10), _e_value(0.04, 0.20))
+
+    def test_it_is_computed_from_the_contrast_the_decision_reports(self):
+        """Not rebuilt from `q_values`. Invariant 16's principle, one layer over."""
+        contrast = self.recommendation.audit_event.get("contrast") or {}
+        self.assertAlmostEqual(
+            self.sensitivity.contrast, contrast["difference"], places=4
+        )
+
+    def test_the_interval_bound_is_one_exactly_when_zero_is_inside(self):
+        """The number a reader should quote, and the case that makes 1.0 mean something.
+
+        If the interval already contains zero then no confounding is required to
+        reach "no difference" — so 1.0 is the correct answer rather than an
+        artifact of two near-equal numbers, which is what it used to be.
+        """
+        from treatmentrx.data.contract import DataContractError
+        from treatmentrx.orchestrator import TreatmentRxOrchestrator
+        from treatmentrx.simulation.fhir_export import simulated_bundles
+
+        orchestrator = TreatmentRxOrchestrator()
+        checked = 0
+        for bundle in simulated_bundles(25, seed=991):
+            try:
+                recommendation = orchestrator.run(bundle)
+            except DataContractError:
+                continue
+            contrast = recommendation.audit_event.get("contrast") or {}
+            if "interval" not in contrast:
+                continue
+            low, high = contrast["interval"]
+            spans_zero = low <= 0.0 <= high
+            bound = recommendation.explanation.sensitivity.e_value_for_interval
+            with self.subTest(interval=(low, high)):
+                if spans_zero:
+                    self.assertEqual(bound, 1.0)
+                else:
+                    self.assertGreater(bound, 1.0)
+            checked += 1
+        self.assertGreater(checked, 5, "no patient carried a contrast interval")
+
+    def test_the_point_bound_is_never_below_the_interval_bound(self):
+        """The limit nearest the null is closer to zero than the estimate is."""
+        self.assertGreaterEqual(
+            self.sensitivity.e_value, self.sensitivity.e_value_for_interval
+        )
+
+    def test_the_note_says_what_was_assumed(self):
+        """A bound whose approximation is unstated is a number without a method."""
+        note = self.sensitivity.note
+        self.assertIn("VanderWeele", note)
+        self.assertIn("continuous", note)
+        self.assertIn(f"{self.sensitivity.outcome_sd:.4f}", note)
+
+    def test_the_spread_is_a_population_quantity(self):
+        """Invariant 14: one patient's contrast over the cohort's spread is Cohen's d.
+
+        Taking the spread from the patient would make the denominator a
+        patient-level quantity and the ratio meaningless.
+        """
+        from treatmentrx.estimation import training
+
+        self.assertAlmostEqual(
+            self.sensitivity.outcome_sd, round(training.holdout_outcome_sd(), 4), places=4
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

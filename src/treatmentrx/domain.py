@@ -289,10 +289,27 @@ class CounterfactualProbe:
 
 @dataclass(frozen=True)
 class AssumptionSensitivity:
-    """v5.1 #9 — how strong unmeasured confounding would need to be to flip this."""
+    """How strong unmeasured confounding would have to be to explain the contrast away.
+
+    `e_value` is the VanderWeele-Ding bound on the *point estimate*;
+    `e_value_for_interval` is the same bound on the confidence limit nearest the
+    null, which is the one to quote — it answers "could confounding move this to
+    no difference", and it is **1.0 exactly when the interval already contains
+    zero**, because then nothing is needed.
+
+    The previous version of this type carried a number that was none of that:
+    `rr = q_values[0] / q_values[1]`, a ratio of two nearly-equal bounded means
+    fed into the E-value formula. It never referenced confounding, and because
+    the two Q-values are close by construction it returned 1.000 to 1.617 across
+    60 patients, with 11 of them under 1.1. An E-value of 1.0 asserts that *no*
+    unmeasured confounding is required — a strong claim, made by arithmetic on a
+    quantity that could not support it. That is invariant 27's pattern.
+    """
 
     e_value: float
-    tipping_point: str
+    e_value_for_interval: float
+    contrast: float
+    outcome_sd: float
     note: str
 
 

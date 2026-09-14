@@ -19,6 +19,7 @@ lookup. The cohort is seeded, so a given commit always produces the same models.
 
 from __future__ import annotations
 
+import math
 import threading
 from dataclasses import dataclass
 
@@ -379,6 +380,26 @@ def score_for(method_name: str) -> PolicyScore | None:
 
 def holdout_calibration() -> CalibrationReport:
     return fitted().calibration
+
+
+def holdout_outcome_sd() -> float:
+    """Spread of the outcome on held-out rows — the scale a contrast is read against.
+
+    A contrast of 0.04 means nothing until you know what the outcome's own
+    spread is, and standardising by it is what turns an effect into a quantity
+    an E-value can be computed from. Measured on the evaluation split rather
+    than the patient in front of you: this is a **population** property, which
+    is the side of invariant 14 it belongs on. `AssumptionSensitivity` divides
+    one patient's contrast by it, which is Cohen's d and is the intended mixing,
+    not the forbidden one.
+    """
+    key = "holdout:outcome_sd"
+    if key not in _ORACLE_CACHE:
+        outcomes = [stage.outcome for t in fitted().holdout for stage in t.stages]
+        mean = sum(outcomes) / len(outcomes)
+        variance = sum((y - mean) ** 2 for y in outcomes) / max(len(outcomes) - 1, 1)
+        _ORACLE_CACHE[key] = math.sqrt(variance)
+    return _ORACLE_CACHE[key]
 
 
 def evaluation_partition() -> EvaluationPartitionContract:

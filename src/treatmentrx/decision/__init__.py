@@ -68,7 +68,11 @@ class DecisionLayer:
             training.holdout_calibration(),
             contrast,
         )
-        explanation = self.explainer.explain(selected, estimates, state.stages)
+        # The contrast is already computed above; the explainer used to
+        # rebuild a worse quantity from `q_values` rather than be handed it.
+        explanation = self.explainer.explain(
+            selected, estimates, state.stages, contrast=contrast
+        )
 
         candidate_arms, candidate_contrasts = self._candidate_set(state, selected, model_weights)
         status, rationale = self._status(state, uncertainty, goal_decision, contrast)

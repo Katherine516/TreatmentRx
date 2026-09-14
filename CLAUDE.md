@@ -8,7 +8,7 @@ test fixture, not evidence.
 ## Commands
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests    # 478 tests, ~6 min
+PYTHONPATH=src python3 -m unittest discover -s tests    # 485 tests, ~6 min
 PYTHONPATH=src python3 -m treatmentrx.cli demo          # one patient end to end
 PYTHONPATH=src python3 -m treatmentrx.cli evaluate      # estimator scorecard
 PYTHONPATH=src python3 -m treatmentrx.cli stability     # k-fold + seed sweep (~10s)
@@ -854,6 +854,50 @@ produced a real clinical divergence, and the notes below are the scar tissue.
    for the deployed pairing it sits at +0.1. That is invariant 43's borrowing
    cost showing up in a second place.
 
+45. **The E-value was a heuristic wearing a statistic's name, on a served field.**
+   `AssumptionSensitivity` claimed to say how strong unmeasured confounding
+   would have to be to overturn a recommendation. What it computed was
+   `rr = q_values[0] / q_values[1]` — a ratio of two *nearly equal bounded
+   means* — pushed through the E-value formula. It never referenced confounding,
+   the four unadjusted confounders, or anything but the model's own point
+   estimates, and because the top two Q-values are close by construction the
+   ratio was numerically unstable in exactly the regime the agent operates in.
+
+   Measured over 60 patients it returned **1.000 to 1.617, with 11 under 1.1**.
+   A published E-value of 1.0 asserts that *no* unmeasured confounding is needed
+   to explain an effect away — a strong claim, reached by arithmetic that could
+   not support it, and shipped inside the served `Recommendation`. That is
+   invariant 27's pattern in a place nothing rendered, so nothing caught it.
+
+   It now uses VanderWeele and Ding's approximation for continuous outcomes:
+   standardise the contrast by the held-out outcome spread (0.1531),
+   `RR ~ exp(0.91 d)`, `E = RR + sqrt(RR (RR - 1))`. Two numbers are reported and
+   **the second is the one to quote**:
+
+   | status | n | E (point) | E (interval) | interval bound = 1.0 |
+   | --- | --- | --- | --- | --- |
+   | equipoise | 43 | 1.579 | **1.000** | 40/43 |
+   | recommend | 17 | 1.999 | 1.261 | 0/17 |
+
+   `e_value_for_interval` is the bound on the confidence limit nearest the null —
+   "could confounding make this indistinguishable from no difference" — and it is
+   **1.0 exactly when the interval already contains zero**, because then nothing
+   is needed. So 1.0 now carries meaning instead of being an artifact, and it
+   lands on the abstaining patients rather than at random.
+
+   Two things it is not. It is not a statement about the four named unadjusted
+   confounders in particular — it bounds any single one — and on this cohort the
+   generating process has no age, gender, steroid or comorbidity effect, so the
+   question has no bite here and is a property of the basis that would matter on
+   real data. And the spread is a **population** quantity from the held-out
+   split: one patient's contrast over the cohort's spread is Cohen's d, which is
+   the intended side of invariant 14, not the forbidden one.
+
+   The contrast is now **passed in** from the decision layer rather than rebuilt
+   from `q_values`. The caller already had it; reconstructing a worse quantity
+   beside the decision is the incoherence invariant 16 removed from the interval,
+   one layer over.
+
 ## What is real vs. still a placeholder
 
 Real: the four estimators, the cohort and its known blips, informative-dropout
@@ -884,8 +928,10 @@ learned representation, and it does not claim to be; the `GRUBaselineEncoder`
 that wrapped it is deleted, see invariant 37),
 `SemanticKnowledgeBase` (five hard-coded passages, whitespace-token retrieval),
 `WHY_NOT_REASONS` (hard-coded clinical prose attached to a model-derived Q-gap —
-the one place Layer 5 asserts something the model did not produce), and the
-E-value in the sensitivity report.
+the one place Layer 5 asserts something the model did not produce). The E-value
+is no longer on this list: it was a heuristic and is now the VanderWeele-Ding
+bound on the decision's own contrast, with its approximation stated (invariant
+45).
 
 **`SwitchingAwareOPE` no longer reports an estimate, and the reason generalises.**
 It used to publish an `iptw_policy_value`: this patient's observed outcomes

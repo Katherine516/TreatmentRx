@@ -1140,8 +1140,27 @@ specification test with measured false-positive rates.
 **Deliberately simple, and labelled as such in-module:**
 `HandcraftedFeatureEncoder` (nine clinical features normalised and tiled — not a
 learned representation, and it does not claim to be),
-`SemanticKnowledgeBase` (five hard-coded passages, not a real RAG index), `WHY_NOT_REASONS` (hard-coded clinical prose on a model-derived Q-gap),
-and the E-value in the sensitivity report.
+`SemanticKnowledgeBase` (five hard-coded passages, not a real RAG index), and
+`WHY_NOT_REASONS` (hard-coded clinical prose on a model-derived Q-gap).
+
+**The E-value used to be on that list and is now real.** It claimed to say how
+strong unmeasured confounding would have to be to overturn a recommendation, and
+computed `q_values[0] / q_values[1]` — a ratio of two nearly-equal bounded means
+— through the E-value formula. Over 60 patients it returned 1.000 to 1.617 with
+11 under 1.1, and an E-value of 1.0 asserts that *no* confounding is needed. It
+shipped inside the served `Recommendation` where nothing rendered it, so nothing
+caught it. It now uses VanderWeele and Ding's continuous-outcome approximation on
+the contrast the decision actually reports:
+
+| status | n | E (point) | E (interval) | interval bound = 1.0 |
+| --- | --- | --- | --- | --- |
+| equipoise | 43 | 1.579 | **1.000** | 40/43 |
+| recommend | 17 | 1.999 | 1.261 | 0/17 |
+
+The second column is the one to quote — the bound on the confidence limit nearest
+the null — and it is 1.0 exactly when the interval already contains zero, because
+then nothing has to be explained away. So 1.0 now means something, and it lands
+on the patients the agent declines rather than at random.
 
 **Deleted rather than improved:** `SwitchingAwareOPE` used to publish an
 `iptw_policy_value` — one patient's observed outcomes reweighted by `adherence ×
