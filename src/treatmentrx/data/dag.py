@@ -301,38 +301,58 @@ def satisfies_backdoor(
 def minimal_backdoor_set(
     dag: CausalDAG, treatment: str = "treatment", outcome: str = "ra_response"
 ) -> set[str]:
-    """The smallest set of non-descendants that blocks every backdoor path.
+    """An *irreducible* set of non-descendants that blocks every backdoor path.
 
-    Greedy over the nodes that actually appear on a backdoor path, which for this
-    graph is exact: every backdoor path here is a single confounder with arrows
-    into both treatment and outcome, so blocking requires that confounder and
-    nothing substitutes for it.
+    Minimal in the sense the causal literature uses: no proper subset of the
+    result also satisfies the criterion. That is not the same as *minimum*
+    cardinality, which is NP-hard in general; where the two differ this returns
+    an irreducible set and says so rather than claiming the smaller guarantee.
+
+    **The previous version was neither.** It walked the candidates in sorted
+    order and added a node whenever the set so far did not yet block, without
+    ever testing whether *that* node helped — so a redundant node got in simply
+    by sorting first. On `T <- Z -> Y` plus `T <- Z <- W -> Y`, where `{Z}`
+    blocks both paths on its own, it returned `{W, Z}`. It also carried a
+    `without = ...` local that was computed and never read, which is usually what
+    a half-finished condition leaves behind.
+
+    It happened to be right where it is actually used: on the RA graph every
+    backdoor path is a single confounder with arrows into both treatment and
+    outcome, so nothing substitutes for anything and the greedy order cannot
+    matter. The deployed adjustment set never changed. But a function whose name
+    promises minimality has to earn it on graphs other than the one it ships
+    with, because `_split_by_what_the_model_carries` derives
+    `unmodelled_confounders` from this — and a spurious entry there is a
+    confounder the model card claims it failed to adjust for when it never
+    needed to.
+
+    Two passes. Cover: add nodes until every backdoor path is blocked. Prune:
+    try removing each one; drop it if the set still blocks. Both iterate in
+    sorted order, so the result is deterministic and reproducible for audit.
     """
     descendants = _descendants(dag.edges, treatment)
-    candidates = {
-        node
-        for path in backdoor_paths(dag.edges, treatment, outcome)
-        for node in path[1:-1]
-        if node not in descendants and node not in {treatment, outcome}
-    }
+    candidates = sorted(
+        {
+            node
+            for path in backdoor_paths(dag.edges, treatment, outcome)
+            for node in path[1:-1]
+            if node not in descendants and node not in {treatment, outcome}
+        }
+    )
+
     required: set[str] = set()
-    for node in sorted(candidates):
-        without = candidates - {node} if not required else required
-        blocked, _ = satisfies_backdoor(dag, required | {node}, treatment, outcome)
-        remaining, _ = satisfies_backdoor(dag, required, treatment, outcome)
-        if not remaining:
-            required.add(node)
-        if blocked and satisfies_backdoor(dag, required, treatment, outcome)[0]:
+    for node in candidates:
+        if satisfies_backdoor(dag, required, treatment, outcome)[0]:
             break
-    # Verify and repair: anything still open gets added.
-    identified, open_paths = satisfies_backdoor(dag, required, treatment, outcome)
-    while not identified and open_paths:
-        for path in open_paths:
-            for node in path[1:-1]:
-                if node not in descendants:
-                    required.add(node)
-                    break
-        identified, open_paths = satisfies_backdoor(dag, required, treatment, outcome)
+        required.add(node)
+
+    # Prune. A node earns its place only if removing it re-opens a path — which
+    # is exactly the definition of irreducible, and is the step the previous
+    # version was missing.
+    for node in sorted(required):
+        trimmed = required - {node}
+        if satisfies_backdoor(dag, trimmed, treatment, outcome)[0]:
+            required = trimmed
     return required
 
 

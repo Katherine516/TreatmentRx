@@ -260,6 +260,139 @@ class SimulatedIngestionTests(unittest.TestCase):
             DataLayer().build_patient_state(bundle)  # raises LeakageError if it did
 
 
+
+class BackdoorCriterionTests(unittest.TestCase):
+    """The DAG licenses calling any of this causal, so check it against graphs
+    with known answers rather than against the one it ships with.
+
+    M-bias and descendant-of-collider are the two cases implementations get
+    wrong, and getting them right is what `path_is_blocked` is claiming.
+    """
+
+    @staticmethod
+    def _graph(edges):
+        from treatmentrx.data.dag import CausalDAG
+
+        return CausalDAG(
+            "test", "v", tuple({n for e in edges for n in e}), tuple(edges), (), (), ()
+        )
+
+    @staticmethod
+    def _brute_force(graph, treatment="T", outcome="Y"):
+        """Smallest satisfying subset, found by exhaustion — the reference."""
+        import itertools
+
+        from treatmentrx.data.dag import _descendants, satisfies_backdoor
+
+        descendants = _descendants(graph.edges, treatment)
+        candidates = sorted(
+            node
+            for node in graph.nodes
+            if node not in descendants and node not in {treatment, outcome}
+        )
+        for size in range(len(candidates) + 1):
+            for combination in itertools.combinations(candidates, size):
+                if satisfies_backdoor(graph, set(combination), treatment, outcome)[0]:
+                    return set(combination)
+        return None
+
+    def test_a_plain_confounder_must_be_adjusted(self):
+        from treatmentrx.data.dag import minimal_backdoor_set, satisfies_backdoor
+
+        graph = self._graph([("Z", "T"), ("Z", "Y")])
+        self.assertFalse(satisfies_backdoor(graph, set(), "T", "Y")[0])
+        self.assertEqual(minimal_backdoor_set(graph, "T", "Y"), {"Z"})
+
+    def test_a_mediator_is_a_descendant_and_is_refused(self):
+        """Adjusting a descendant of treatment is the first backdoor condition."""
+        from treatmentrx.data.dag import minimal_backdoor_set, satisfies_backdoor
+
+        graph = self._graph([("T", "M"), ("M", "Y")])
+        self.assertTrue(satisfies_backdoor(graph, set(), "T", "Y")[0])
+        self.assertFalse(satisfies_backdoor(graph, {"M"}, "T", "Y")[0])
+        self.assertEqual(minimal_backdoor_set(graph, "T", "Y"), set())
+
+    def test_m_bias_conditioning_opens_a_path_that_was_closed(self):
+        """The case that separates a real implementation from a plausible one.
+
+        `T <- U1 -> M <- U2 -> Y` is blocked at the collider M with no
+        adjustment at all. Conditioning on M *opens* it — so the empty set is
+        valid and `{M}` is not, which is the opposite of the "adjust for
+        everything you measured" instinct.
+        """
+        from treatmentrx.data.dag import minimal_backdoor_set, satisfies_backdoor
+
+        graph = self._graph([("U1", "T"), ("U1", "M"), ("U2", "M"), ("U2", "Y")])
+        self.assertTrue(satisfies_backdoor(graph, set(), "T", "Y")[0])
+        self.assertFalse(satisfies_backdoor(graph, {"M"}, "T", "Y")[0])
+        self.assertEqual(minimal_backdoor_set(graph, "T", "Y"), set())
+
+    def test_a_descendant_of_a_collider_opens_it_too(self):
+        """Conditioning on a collider's child is conditioning on the collider."""
+        from treatmentrx.data.dag import satisfies_backdoor
+
+        graph = self._graph(
+            [("U1", "T"), ("U1", "M"), ("U2", "M"), ("U2", "Y"), ("M", "D")]
+        )
+        self.assertTrue(satisfies_backdoor(graph, set(), "T", "Y")[0])
+        self.assertFalse(satisfies_backdoor(graph, {"D"}, "T", "Y")[0])
+
+    def test_the_result_is_irreducible(self):
+        """No proper subset may also satisfy the criterion.
+
+        The previous implementation walked candidates in sorted order and added
+        one whenever the set so far did not yet block, without testing whether
+        that node helped — so on this graph, where `{Z}` blocks both paths, it
+        returned `{W, Z}`.
+        """
+        from treatmentrx.data.dag import minimal_backdoor_set, satisfies_backdoor
+
+        graph = self._graph([("Z", "T"), ("Z", "Y"), ("W", "Z"), ("W", "Y")])
+        required = minimal_backdoor_set(graph, "T", "Y")
+        self.assertEqual(required, {"Z"})
+        for node in sorted(required):
+            with self.subTest(drop=node):
+                self.assertFalse(
+                    satisfies_backdoor(graph, required - {node}, "T", "Y")[0],
+                    f"{node} is redundant, so the set is not irreducible",
+                )
+
+    def test_the_deployed_graph_matches_brute_force(self):
+        """The shipped adjustment set is the reference answer, not a coincidence."""
+        from treatmentrx.data.dag import CausalDAGRegistry, minimal_backdoor_set
+
+        graph = CausalDAGRegistry()._ra_v1()
+        self.assertEqual(
+            minimal_backdoor_set(graph, "treatment", "ra_response"),
+            self._brute_force(graph, "treatment", "ra_response"),
+        )
+
+    def test_the_split_by_basis_covers_the_whole_required_set(self):
+        """Every required adjuster lands in exactly one of the two lists.
+
+        `unmodelled_confounders` is what the model card reports as unadjusted, so
+        a spurious entry there claims a failure that never happened.
+        """
+        from treatmentrx.data.dag import CausalDAGRegistry, minimal_backdoor_set
+
+        graph = CausalDAGRegistry()._ra_v1()
+        required = minimal_backdoor_set(graph, "treatment", "ra_response")
+        self.assertEqual(
+            set(graph.adjustment_set) | set(graph.unmodelled_confounders), required
+        )
+        self.assertFalse(
+            set(graph.adjustment_set) & set(graph.unmodelled_confounders)
+        )
+
+    def test_the_colliders_are_kept_out_of_the_adjustment_set(self):
+        from treatmentrx.data.dag import CausalDAGRegistry
+
+        graph = CausalDAGRegistry()._ra_v1()
+        for collider in graph.colliders:
+            with self.subTest(collider=collider):
+                self.assertNotIn(collider, graph.adjustment_set)
+                self.assertNotIn(collider, graph.unmodelled_confounders)
+
 if __name__ == "__main__":
     unittest.main()
 

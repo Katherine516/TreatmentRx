@@ -1191,6 +1191,25 @@ artifact declaring none leaves the question *unjudged* rather than asserting
 safety, and `out_of_range_features` names the covariate instead of returning a
 bare False.
 
+**The causal DAG was checked against graphs with known answers.** It is what
+licenses calling any of this causal, so it was tested against textbook cases
+rather than the one it ships with. `satisfies_backdoor` gets all of them —
+plain confounder, mediator (a descendant, correctly refused), **M-bias**
+(`T ← U1 → M ← U2 → Y`, where the empty set is valid and `{M}` is not, because
+conditioning on the collider *opens* a closed path), and a descendant of a
+collider, which opens it the same way. Those last two are what separate a real
+implementation from a plausible one.
+
+`minimal_backdoor_set` was the one that did not hold up. It added candidates in
+*alphabetical* order whenever the set so far did not yet block, never testing
+whether the node helped — on a graph where `{Z}` blocks both paths it returned
+`{W, Z}`. It was right where it is used, because every backdoor path in the RA
+graph is a single confounder, and **the deployed adjustment set did not change**.
+It matters anyway: `unmodelled_confounders` is derived from it and is what the
+model card reports as unadjusted residual confounding, so a spurious entry claims
+a failure that never happened. It now covers and then **prunes**, which is what
+irreducible means.
+
 **Deliberately simple, and labelled as such in-module:**
 `HandcraftedFeatureEncoder` (nine clinical features normalised and tiled — not a
 learned representation, and it does not claim to be),

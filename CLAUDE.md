@@ -8,7 +8,7 @@ test fixture, not evidence.
 ## Commands
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests    # 515 tests, ~6 min
+PYTHONPATH=src python3 -m unittest discover -s tests    # 523 tests, ~6 min
 PYTHONPATH=src python3 -m treatmentrx.cli demo          # one patient end to end
 PYTHONPATH=src python3 -m treatmentrx.cli evaluate      # estimator scorecard
 PYTHONPATH=src python3 -m treatmentrx.cli stability     # k-fold + seed sweep (~10s)
@@ -1088,6 +1088,43 @@ produced a real clinical divergence, and the notes below are the scar tissue.
    asserting safety — `capability()["declares_validated_ranges"]` says which,
    because "does not know" and "is fine" must not read the same.
 
+52. **`satisfies_backdoor` is right; `minimal_backdoor_set` was not minimal.**
+   The DAG is what licenses calling any of this causal, so it was checked
+   against graphs with known answers rather than against the one it ships with.
+
+   **The criterion holds.** Plain confounder, mediator (a descendant, correctly
+   refused), **M-bias** — `T <- U1 -> M <- U2 -> Y`, where the empty set is valid
+   and `{M}` is not, because conditioning on the collider *opens* a path that was
+   closed — and a **descendant of a collider**, which opens it just the same.
+   Those last two are what separate a real implementation from a plausible one,
+   and `path_is_blocked` gets both. The claim in this file was earned.
+
+   **The minimiser was not.** It walked candidates in sorted order and added one
+   whenever the set so far did not yet block, without ever testing whether *that
+   node* helped — so a redundant node got in by sorting first. On `T <- Z -> Y`
+   plus `T <- Z <- W -> Y`, where `{Z}` blocks both paths alone, it returned
+   `{W, Z}`. It also carried a `without = ...` local computed and never read,
+   which is what a half-finished condition leaves behind.
+
+   It happened to be right where it is used: every backdoor path in the RA graph
+   is a single confounder with arrows into both treatment and outcome, so nothing
+   substitutes for anything and the greedy order cannot matter. **The deployed
+   adjustment set did not change** — `minimal_backdoor_set` still agrees with
+   brute force on the RA graph, and a test asserts that rather than assuming it.
+
+   It matters anyway, because `_split_by_what_the_model_carries` derives
+   `unmodelled_confounders` from this, and that list is what the model card
+   reports as *unadjusted residual confounding*. A spurious entry there claims a
+   failure that never happened — the mirror of invariant 25, a check reporting a
+   problem it does not have rather than missing one it does.
+
+   Now two passes: cover until every path is blocked, then **prune** — drop any
+   node whose removal still leaves the set blocking, which is the definition of
+   irreducible and the step that was missing. Both iterate in sorted order so the
+   result stays deterministic. *Irreducible*, not *minimum* cardinality: the
+   latter is NP-hard in general and the docstring says which one is on offer
+   rather than implying the stronger guarantee.
+
 ## What is real vs. still a placeholder
 
 Real: the four estimators, the cohort and its known blips, informative-dropout
@@ -1099,9 +1136,11 @@ contrast tests, cross-validated stability, blip attributions, the
 backward-induction oracle used for regret, the safety sweep (20 labelled cases,
 recall *and* precision), and the causal DAG's identifiability check —
 `minimal_backdoor_set` derives the adjustment set from the edge list rather than
-declaring it, `satisfies_backdoor` implements the backdoor criterion with
-descendant exclusion and collider handling, and `_ra_v1` passes
-`adjustment_set=()` so the graph is the only thing that fills it.
+declaring it and returns an *irreducible* set, `satisfies_backdoor` implements
+the backdoor criterion with descendant exclusion and collider handling — checked
+against M-bias and descendant-of-collider graphs, not just the one it ships with
+(invariant 52) — and `_ra_v1` passes `adjustment_set=()` so the graph is the
+only thing that fills it.
 
 `identified` reads True for every patient the pipeline actually sees, and that is
 not a check that cannot fail: strip the observations and it returns False naming
