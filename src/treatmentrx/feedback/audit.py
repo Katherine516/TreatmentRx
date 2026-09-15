@@ -23,7 +23,7 @@ import copy
 import time
 from dataclasses import dataclass, field
 
-from treatmentrx.arms import TREATMENT_ARMS
+from treatmentrx.arms import TREATMENT_ARMS, normalize_arm
 from treatmentrx.data import DataContractError, DataLayer
 from treatmentrx.demo_data import sample_ra_bundle
 from treatmentrx.domain import RecommendationStatus
@@ -59,12 +59,41 @@ class Section:
 # ---------------------------------------------------------------- Layer 1
 
 def audit_ingestion(n: int = 40, seed: int = AUDIT_SEED) -> Section:
-    """Does Layer 1 recover what the generator wrote into the record?"""
+    """Does Layer 1 recover what the generator wrote into the record?
+
+    **`switch_detection_recall` used to be the headline here and it could not
+    fail.** It asked whether any stage was flagged for a patient whose arm
+    changed — and `SwitchingCapture`'s third condition *is* "the arm changed", so
+    the metric tested the same predicate it used as truth. It read 1.0 because it
+    is 1.0 by construction, which is invariant 25's defect wearing an accuracy
+    figure. It also used `any()`, so flagging the wrong stage counted as a hit,
+    and its denominator excluded every patient who never switched — the only
+    patients where a false positive could appear.
+
+    `switched` is the union of four conditions: a recorded discontinuation
+    reason, a dispensed name that differs from the order, an arm change, and a
+    loss-of-response note. Only the third has ground truth in the simulator. So
+    this now reports what is actually knowable — how much of the flag rests on
+    the condition that can be checked, and how much on the three that cannot —
+    rather than one number that cannot move.
+
+    Measured over 120 trajectories: 277 of 443 stages flagged, **246 of them
+    (89%) by the arm-change condition**, 31 by the others. And two conditions are
+    dead on this fixture, reported as zeros the way `SwitchingAwareOPE` reports
+    its own: no stage has a dispensed name differing from the order, so
+    `realized` always echoes `assigned` and the ITT / per-protocol / as-treated
+    seam has no input (`FHIRAdapter._supply_records` says the same); and
+    `adherence` takes exactly one distinct value, so the days-covered path never
+    runs.
+    """
     trajectories = generate_ra_cohort(n, seed=seed)
     layer = DataLayer()
     stage_matches = interval_matches = interval_total = 0
-    switch_recall = switch_total = 0
     ingested = 0
+    flagged = definitional = stages_seen = 0
+    realized_differs = 0
+    adherence_values: set[float] = set()
+    arm_change_stages = arm_change_flagged = 0
 
     for trajectory in trajectories:
         try:
@@ -81,23 +110,70 @@ def audit_ingestion(n: int = 40, seed: int = AUDIT_SEED) -> Section:
             interval_total += 1
             if recovered.timing.time_since_last_treatment == generated.interval_days:
                 interval_matches += 1
-        arms = [stage.arm for stage in trajectory.stages]
-        if len(set(arms)) > 1:
-            switch_total += 1
-            if any(stage.switching and stage.switching.switched for stage in state.stages):
-                switch_recall += 1
+
+        for index, stage in enumerate(state.stages):
+            switching = stage.switching
+            if switching is None:
+                continue
+            stages_seen += 1
+            adherence_values.add(switching.adherence)
+            if normalize_arm(switching.realized) != normalize_arm(switching.assigned):
+                realized_differs += 1
+            previous = state.stages[index - 1] if index else None
+            arm_changed = previous is not None and normalize_arm(
+                previous.treatment
+            ) != normalize_arm(stage.treatment)
+            if arm_changed:
+                arm_change_stages += 1
+                arm_change_flagged += bool(switching.switched)
+            if switching.switched:
+                flagged += 1
+                definitional += bool(arm_changed)
 
     section = Section("1 data")
     section.metrics = {
         "patients_ingested": f"{ingested}/{n}",
         "stage_count_exact": _rate(stage_matches, ingested),
         "visit_interval_exact": _rate(interval_matches, interval_total),
-        "switch_detection_recall": _rate(switch_recall, switch_total),
+        "stages_flagged_switched": f"{flagged}/{stages_seen}",
+        # Per *stage*, not per patient, and it is 1.0 by construction: the
+        # detector's third condition is this predicate. Kept so a wiring
+        # regression is visible, labelled so nobody reads it as accuracy.
+        "arm_change_always_flagged": _rate(arm_change_flagged, arm_change_stages),
+        # The part of the flag that rests on conditions the simulator cannot
+        # check — a free-text discontinuation reason or a loss-of-response note.
+        "switches_beyond_arm_change": _rate(flagged - definitional, flagged),
+        # Dead seams, stated rather than left to be inferred from a silent field.
+        "stages_where_realized_differs": realized_differs,
+        "distinct_adherence_values": len(adherence_values),
     }
     section.notes.append(
         "Timing and stage structure are reconstructed from dates and drug names, "
         "not read back from the generator."
     )
+    section.notes.append(
+        f"`arm_change_always_flagged` is 1.0 by construction and is a wiring "
+        f"check, not an accuracy figure: `SwitchingCapture`'s third condition is "
+        f"the same predicate this uses as truth. It replaced a "
+        f"`switch_detection_recall` that read 1.0 for the same reason without "
+        f"saying so. Of {flagged} flagged stages, "
+        f"{flagged - definitional} rest on conditions the simulator carries no "
+        f"ground truth for."
+    )
+    if realized_differs == 0:
+        section.notes.append(
+            "No stage has a dispensed name differing from the order, so "
+            "`SwitchingRecord.realized` only echoes `assigned` and the "
+            "ITT / per-protocol / as-treated distinction has no input from this "
+            "field on this fixture. A bundle carrying MedicationDispense "
+            "resources would supply one."
+        )
+    if len(adherence_values) <= 1:
+        section.notes.append(
+            f"`adherence` takes {len(adherence_values)} distinct value(s) across "
+            f"{stages_seen} stages, so the days-covered path never runs and the "
+            "default is the only thing being read."
+        )
     return section
 
 

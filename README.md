@@ -1148,6 +1148,26 @@ contrast tests, cross-validated stability, blip attributions, the
 backward-induction oracle used for regret, the safety sweep, and the
 specification test with measured false-positive rates.
 
+**Layer 1's headline metric measured the predicate it used as truth.** Reading
+every layer's audit side by side, Layer 1 was the only one whose metrics all sat
+at their ceiling. Three are round-trip identities and honest; the fourth,
+`switch_detection_recall`, asked whether any stage was flagged for a patient
+whose arm changed — and `SwitchingCapture`'s third condition *is* "the arm
+changed". It read 1.0 by construction, used `any()` so the wrong stage counted,
+and excluded from its denominator every patient where a false positive could
+appear.
+
+The near-miss is worth recording. Per-stage precision against "the arm changed"
+is 0.836 with 15 of 18 never-switching patients flagged — which reads as a badly
+over-firing detector and is not. `switched` is the union of four conditions and
+only one has ground truth here, so that precision measures the wrong thing. The
+audit now reports what is knowable: the structural check *labelled as one*, the
+share of the flag resting on unverifiable conditions (11%), and two dead seams as
+explicit zeros — no stage has a dispensed name differing from the order, so
+`SwitchingRecord.realized` only echoes `assigned`, and `adherence` takes one
+distinct value across 153 stages. Both are properties of the fixture, not the
+code.
+
 **Deliberately simple, and labelled as such in-module:**
 `HandcraftedFeatureEncoder` (nine clinical features normalised and tiled — not a
 learned representation, and it does not claim to be),

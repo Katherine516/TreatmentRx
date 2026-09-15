@@ -8,7 +8,7 @@ test fixture, not evidence.
 ## Commands
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests    # 498 tests, ~6 min
+PYTHONPATH=src python3 -m unittest discover -s tests    # 503 tests, ~6 min
 PYTHONPATH=src python3 -m treatmentrx.cli demo          # one patient end to end
 PYTHONPATH=src python3 -m treatmentrx.cli evaluate      # estimator scorecard
 PYTHONPATH=src python3 -m treatmentrx.cli stability     # k-fold + seed sweep (~10s)
@@ -988,6 +988,45 @@ produced a real clinical divergence, and the notes below are the scar tissue.
    claim. With a recommendation it is about that arm. Without one it is about the
    arms still under consideration and says so, with `affected_arm` left `None` —
    because a name appearing there is how invariant 2 detects a promotion.
+
+49. **Layer 1's headline metric measured the predicate it used as truth.**
+   Running the whole workflow and reading each layer's audit side by side, Layer
+   1 was the only one whose every metric sat at its ceiling — 40/40, 1.0, 1.0,
+   1.0. Three of those are round-trip identities and honest. The fourth was not.
+
+   `switch_detection_recall` asked whether *any* stage was flagged for a patient
+   whose arm changed. `SwitchingCapture`'s third condition **is** "the arm
+   changed", so the metric tested the same predicate it used as ground truth and
+   read 1.0 by construction — invariant 25's defect wearing an accuracy figure.
+   It compounded that three ways: `any()` meant flagging the *wrong* stage
+   counted as a hit; the denominator counted patients rather than stages; and it
+   excluded every patient who never switched, which is the only place a false
+   positive could appear.
+
+   **The near-miss is worth recording.** Measuring per-stage precision against
+   "the arm changed" gives 0.836, with 15 of 18 never-switching patients
+   flagged — which reads as a badly over-firing detector. It is not.
+   `switched` is the union of four conditions: a recorded discontinuation
+   reason, a dispensed name differing from the order, an arm change, and a
+   loss-of-response note. Only the third has ground truth here, so precision
+   against it measures the wrong thing. That was the fourth time in this sitting
+   that a plausible number turned out to be answering a different question, and
+   the check that caught it was reading the detector before believing the metric.
+
+   What the audit reports now is what is knowable: `arm_change_always_flagged`
+   (1.0, **labelled a wiring check rather than an accuracy figure**),
+   `switches_beyond_arm_change` (the share resting on conditions the simulator
+   cannot verify — 11%, 10 of 92 stages), and the two dead seams as explicit
+   zeros the way `SwitchingAwareOPE` reports its own: **no stage has a dispensed
+   name differing from the order**, so `SwitchingRecord.realized` only ever
+   echoes `assigned` and the ITT / per-protocol / as-treated distinction has no
+   input from that field (`FHIRAdapter._supply_records` already said so); and
+   `adherence` takes **one** distinct value across 153 stages, so the
+   days-covered path never runs.
+
+   Both zeros are properties of the fixture rather than of the code — a bundle
+   carrying `MedicationDispense` resources would move them — and saying which is
+   the difference between a gap and a defect.
 
 ## What is real vs. still a placeholder
 

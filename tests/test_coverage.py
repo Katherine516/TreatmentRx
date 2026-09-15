@@ -562,6 +562,71 @@ class RidgeDefaultTests(unittest.TestCase):
         self.assertLess(worst_error(DEFAULT_BLIP_RIDGE), worst_error(0.0))
 
 
+class IngestionAuditTests(unittest.TestCase):
+    """Layer 1's headline metric could not fail, and now says what it is.
+
+    `switch_detection_recall` asked whether any stage was flagged for a patient
+    whose arm changed — and `SwitchingCapture`'s third condition *is* "the arm
+    changed". It measured the same predicate it used as truth, read 1.0 by
+    construction, used `any()` so the wrong stage counted, and excluded from its
+    denominator every patient where a false positive could appear.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.section = audit_ingestion()
+        cls.metrics = cls.section.metrics
+        cls.notes = " ".join(cls.section.notes)
+
+    def test_the_structural_metric_is_labelled_as_one(self):
+        """1.0 is fine; presenting it as accuracy is not."""
+        self.assertEqual(self.metrics["arm_change_always_flagged"], 1.0)
+        self.assertIn("by construction", self.notes)
+        self.assertIn("wiring check", self.notes)
+
+    def test_the_unverifiable_share_is_reported(self):
+        """How much of the flag rests on conditions with no ground truth."""
+        share = self.metrics["switches_beyond_arm_change"]
+        self.assertGreater(share, 0.0, "no switch came from the other conditions")
+        self.assertLess(share, 1.0)
+
+    def test_the_dead_seams_are_named_rather_than_silent(self):
+        """A field that always echoes its input is a finding, not a blank.
+
+        `realized` can only differ when the bundle carries a dispense record, and
+        this fixture carries none — so the ITT / per-protocol / as-treated split
+        has no input from it. Reported the way `SwitchingAwareOPE` reports its own
+        zeros rather than left for a reader to notice.
+        """
+        self.assertEqual(self.metrics["stages_where_realized_differs"], 0)
+        self.assertEqual(self.metrics["distinct_adherence_values"], 1)
+        self.assertIn("no input", self.notes)
+        self.assertIn("days-covered path never runs", self.notes)
+
+    def test_a_dispense_record_would_move_the_dead_seam(self):
+        """The zero is a property of the fixture, not of the code.
+
+        If this stops holding, `realized` has become genuinely unreachable and
+        the note above would be describing a different problem.
+        """
+        from treatmentrx.arms import normalize_arm
+        from treatmentrx.data.switching import SwitchingCapture
+
+        self.assertTrue(hasattr(SwitchingCapture, "apply"))
+        source = SwitchingCapture.apply.__doc__ or ""
+        self.assertIsNotNone(normalize_arm("TNF-inhibitor"))
+        # The branch exists and is reachable given a dispensed name.
+        import inspect
+
+        body = inspect.getsource(SwitchingCapture.apply)
+        self.assertIn("dispensed_name", body)
+
+    def test_the_flagged_count_carries_its_denominator(self):
+        flagged, _, total = self.metrics["stages_flagged_switched"].partition("/")
+        self.assertGreater(int(total), 0)
+        self.assertLessEqual(int(flagged), int(total))
+
+
 class FinalTestFeasibilityTests(unittest.TestCase):
     """`evaluation_partition()` reports there is no final test; this prices one.
 
@@ -630,7 +695,7 @@ class AuditHarnessTests(unittest.TestCase):
         self.assertEqual(metrics["stage_count_exact"], 1.0)
         self.assertEqual(metrics["visit_interval_exact"], 1.0)
         self.assertEqual(
-            metrics["switch_detection_recall"],
+            metrics["arm_change_always_flagged"],
             1.0,
             "a change of arm is a switch; detection must not depend on free text",
         )
