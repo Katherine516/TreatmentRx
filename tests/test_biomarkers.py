@@ -104,5 +104,80 @@ class FrozenBiomarkerTests(unittest.TestCase):
             registry.get("unknown")
 
 
+
+class ValidatedRangeTests(unittest.TestCase):
+    """`within_validated_domain` was hard-coded True and could not be anything else.
+
+    Categorical domain mismatches *raise*, so the field was a restatement of
+    "you got a score at all" and any consumer branching on it wrote dead code.
+    The numeric half — is the patient inside the range the artifact was fit on —
+    was missing, and that is the classic way an external biomarker fails.
+    """
+
+    @staticmethod
+    def _domain(ranges=()):
+        return BiomarkerDomain(
+            "rheumatoid_arthritis", "serum", "stage response", 90,
+            "continue-current", ("site-a",), ("platform-x",),
+            validated_ranges=ranges,
+        )
+
+    @staticmethod
+    def _request():
+        return BiomarkerRequest(
+            "rheumatoid_arthritis", "serum", "stage response", 90,
+            "continue-current", "site-a", "platform-x", 30,
+        )
+
+    def _model(self, ranges=()):
+        return FrozenPrognosticModel(
+            "ra-crp-v1", "1", "derivation cohort", self._domain(ranges),
+            0.1, (("crp", 0.01),),
+        )
+
+    def test_an_in_range_patient_is_inside_the_domain(self):
+        score = self._model((("crp", (0.0, 50.0)),)).score(
+            {"crp": 20.0}, {"crp": 10}, self._request()
+        )
+        self.assertTrue(score.within_validated_domain)
+        self.assertEqual(score.out_of_range_features, ())
+
+    def test_an_out_of_range_patient_is_flagged_and_named(self):
+        """A bare False would not tell a reader which feature left the range."""
+        score = self._model((("crp", (0.0, 50.0)),)).score(
+            {"crp": 400.0}, {"crp": 10}, self._request()
+        )
+        self.assertFalse(score.within_validated_domain)
+        self.assertEqual(score.out_of_range_features, ("crp",))
+
+    def test_the_field_can_take_both_values(self):
+        """The property the old hard-coded True could not have."""
+        model = self._model((("crp", (0.0, 50.0)),))
+        inside = model.score({"crp": 20.0}, {"crp": 10}, self._request())
+        outside = model.score({"crp": 400.0}, {"crp": 10}, self._request())
+        self.assertNotEqual(
+            inside.within_validated_domain, outside.within_validated_domain
+        )
+
+    def test_an_undeclared_range_is_unjudged_rather_than_asserted(self):
+        """No declared range means the artifact does not know, not that it is safe."""
+        score = self._model().score({"crp": 400.0}, {"crp": 10}, self._request())
+        self.assertTrue(score.within_validated_domain)
+        self.assertEqual(score.out_of_range_features, ())
+        self.assertFalse(self._model().capability()["declares_validated_ranges"])
+
+    def test_a_categorical_mismatch_still_raises(self):
+        """Wrong artifact entirely is a gate, not a caveat — the two-tier split."""
+        wrong = BiomarkerRequest(
+            "rheumatoid_arthritis", "imaging", "stage response", 90,
+            "continue-current", "site-a", "platform-x", 30,
+        )
+        with self.assertRaises(BiomarkerDomainError):
+            self._model((("crp", (0.0, 50.0)),)).score({"crp": 20.0}, {"crp": 10}, wrong)
+
+    def test_an_inverted_range_is_refused(self):
+        with self.assertRaises(BiomarkerDomainError):
+            self._domain((("crp", (50.0, 0.0)),))
+
 if __name__ == "__main__":
     unittest.main()

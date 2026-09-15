@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass
 from statistics import NormalDist
 
 from treatmentrx.estimation import linalg
+from treatmentrx.estimation.inference import student_t_critical_value
 from treatmentrx.scientific import (
     EstimandContract,
     EstimandContractError,
@@ -119,9 +120,13 @@ class PrecisionComparison:
                 "prognostic_adjusted": self.required_sample_size_adjusted,
             },
             "planning_assumptions": (
-                "Approximate normal-theory calculation with 1:1 allocation, "
-                "the supplied effect on the outcome scale, and residual variance "
-                "estimated from these records. It is not a final trial design."
+                "1:1 allocation, the supplied effect on the outcome scale, and "
+                "residual variance estimated from these records. The critical "
+                "value is the Student-t the analysis itself uses, solved by "
+                "substitution so the planner and the test agree at small N — a "
+                "normal-theory plan promised power the t test does not deliver "
+                "there. It is still not a final trial design: the variance is "
+                "estimated from this sample rather than assumed."
             ),
             "can_recommend_individual_treatment": False,
             "biomarker_promotion_eligible": self.prognostic_contract.externally_validated,
@@ -297,11 +302,21 @@ class RandomizedTrialPrecisionAnalyzer:
                     meat[i][j] += scale * left * right
         covariance = linalg.sandwich_product(bread, meat)
         standard_error = math.sqrt(max(covariance[1][1], 0.0))
-        critical = NormalDist().inv_cdf(1.0 - self.alpha / 2.0)
+        # Student-t on the residual degrees of freedom, not a normal quantile.
+        # The standard error is estimated from the same small sample as the
+        # effect, and ignoring that inflated type I error to 0.101 unadjusted
+        # and 0.138 adjusted at n=8 — this module's own accepted minimum —
+        # against a nominal 0.05. The adjusted fit was the *worse* of the two
+        # because it spends a further degree of freedom the normal quantile
+        # cannot see. `degrees` was already computed and reported here and then
+        # not used for the interval.
+        critical = student_t_critical_value(self.alpha, degrees)
         margin = critical * standard_error
         return LinearTrialEstimate(
             model="outcome ~ treatment + prognostic_score" if adjusted else "outcome ~ treatment",
-            standard_error_method="HC2 sandwich with normal critical value",
+            standard_error_method=(
+                f"HC2 sandwich with Student-t({degrees}) critical value"
+            ),
             treatment_effect=beta[1],
             standard_error=standard_error,
             lower=beta[1] - margin,
@@ -313,12 +328,36 @@ class RandomizedTrialPrecisionAnalyzer:
         )
 
     def _required_sample_size(self, effect: float, variance: float) -> int:
-        z_alpha = NormalDist().inv_cdf(1.0 - self.alpha / 2.0)
+        """Total N for `target_power` at 1:1 allocation, on the analyzer's own test.
+
+        `N = 4 sigma^2 (z_alpha + z_power)^2 / delta^2` is the textbook form and
+        it plans for a *normal* test. This module's analysis uses a Student-t
+        critical value on the residual degrees of freedom, so at small N the
+        planner was promising power the test would not deliver: validated
+        against `simulate_precision_power` at the N it returned, measured power
+        ran 0.747 to 0.834 against a target of 0.80, and the miss was at the
+        smallest N — 46, where t(43) is 2.017 against z of 1.960.
+
+        Solved by substitution instead: start from the normal answer and
+        recompute with the t critical value at the degrees of freedom that N
+        implies, until it stops moving. Two or three passes, always upward, so
+        it cannot under-plan.
+        """
         z_power = NormalDist().inv_cdf(self.target_power)
-        total = 4.0 * variance * (z_alpha + z_power) ** 2 / (effect * effect)
-        # Balanced allocation requires an even total.
-        result = max(8, int(math.ceil(total)))
-        return result if result % 2 == 0 else result + 1
+        total = 8
+        for _ in range(12):
+            # Three parameters at most (intercept, treatment, score), so this is
+            # the conservative df for either fit.
+            degrees = max(int(total) - 3, 1)
+            critical = student_t_critical_value(self.alpha, degrees)
+            candidate = 4.0 * variance * (critical + z_power) ** 2 / (effect * effect)
+            candidate = max(8, int(math.ceil(candidate)))
+            if candidate % 2:
+                candidate += 1
+            if candidate == total:
+                break
+            total = candidate
+        return total
 
 
 def simulate_precision_power(

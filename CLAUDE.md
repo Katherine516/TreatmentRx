@@ -8,7 +8,7 @@ test fixture, not evidence.
 ## Commands
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests    # 503 tests, ~6 min
+PYTHONPATH=src python3 -m unittest discover -s tests    # 515 tests, ~6 min
 PYTHONPATH=src python3 -m treatmentrx.cli demo          # one patient end to end
 PYTHONPATH=src python3 -m treatmentrx.cli evaluate      # estimator scorecard
 PYTHONPATH=src python3 -m treatmentrx.cli stability     # k-fold + seed sweep (~10s)
@@ -1027,6 +1027,66 @@ produced a real clinical divergence, and the notes below are the scar tissue.
    Both zeros are properties of the fixture rather than of the code — a bundle
    carrying `MedicationDispense` resources would move them — and saying which is
    the difference between a gap and a defect.
+
+50. **The randomized-trial module's 95% interval was an 86% one at small n.**
+   `RandomizedTrialPrecisionAnalyzer._fit` computes HC2 standard errors — the
+   right choice for a randomized contrast — then took a **normal** critical
+   value, while computing, storing and reporting `residual_degrees_of_freedom`
+   and not using them. A standard error estimated from the same small sample as
+   the effect is itself uncertain, and the normal quantile ignores that.
+
+   Measured with the module's own `simulate_precision_power` under the null:
+
+   | n | unadjusted | adjusted | after the fix |
+   | --- | --- | --- | --- |
+   | **8** (its accepted minimum) | **0.101** | **0.138** | 0.053 / 0.064 |
+   | 12 | 0.060 | 0.086 | 0.045 / 0.049 |
+   | 40 | 0.058 | 0.058 | 0.048 / 0.052 |
+
+   The *adjusted* analysis was the worse of the two, which is the tell: it
+   spends a further degree of freedom that a normal quantile cannot see, so the
+   precision feature the module exists to demonstrate was the one paying most.
+
+   `inference.student_t_critical_value` is the fix, solved by bisection on the
+   exact t CDF through a regularized incomplete beta written out in full — this
+   package has no third-party dependencies and a Cornish-Fisher expansion is
+   0.25% low at five degrees of freedom, which is the end of the range this is
+   for. It matches published tables to four decimals from df=1 to df=1000 and
+   `tests/test_inference.py` pins it there.
+
+   **`_required_sample_size` had the same inconsistency from the other side.**
+   It planned with a normal quantile for a test that now uses t, so at small N it
+   promised power the test would not deliver. Validated against
+   `simulate_precision_power` at the N it returns, measured power ran 0.747 to
+   0.834 against a target of 0.80 with the miss at the smallest N — 46, where
+   t(43) is 2.017 against z of 1.960. It now solves by substitution with the
+   analyzer's own critical value. The correction is properly df-dependent — 4% of
+   N at N≈50, 0.3% at N≈675 — and too small for a 1200-replicate simulation to
+   resolve against the noise a variance estimated from the pilot introduces, so
+   the claim is internal consistency rather than a measured power gain.
+
+51. **A field that cannot take its other value is not a check.**
+   `PrognosticScore.within_validated_domain` was assigned `True` at the only
+   place a score is constructed and could be nothing else, because
+   `FrozenPrognosticModel._validate_domain` **raises** on a categorical
+   mismatch. So it restated "you got a score at all", and a consumer branching
+   on it wrote dead code — invariant 25 on a public contract field.
+
+   What was missing is the numeric half. The domain constrained disease,
+   modality, endpoint, horizon, site and platform, and said nothing about the
+   *range of feature values* the artifact was fit on. A frozen linear score
+   applied to a CRP of 400 when it was derived on 0-50 is extrapolating, and
+   that is the classic way an external biomarker fails.
+
+   `BiomarkerDomain.validated_ranges` supplies it, and the split mirrors what
+   the main model already does: a categorical mismatch raises the way
+   `data/contract.PLAUSIBLE_RANGES` raises on an impossible value, while an
+   extreme-but-admissible patient is flagged the way
+   `safety/rules._out_of_support` flags one. `out_of_range_features` names which
+   covariate left the range rather than handing back a bare False, and an
+   artifact declaring **no** ranges leaves the question unjudged rather than
+   asserting safety — `capability()["declares_validated_ranges"]` says which,
+   because "does not know" and "is fine" must not read the same.
 
 ## What is real vs. still a placeholder
 

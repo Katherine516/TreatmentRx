@@ -1168,6 +1168,29 @@ explicit zeros — no stage has a dispensed name differing from the order, so
 distinct value across 153 stages. Both are properties of the fixture, not the
 code.
 
+**The randomized-trial module's 95% interval was an 86% one at small n.** It
+computes HC2 standard errors — right for a randomized contrast — then took a
+*normal* critical value while computing, reporting and ignoring the residual
+degrees of freedom. Under the null its own simulator rejected at **0.101
+unadjusted and 0.138 adjusted at n=8**, its accepted minimum, against a nominal
+0.05 — and the adjusted fit was worse, because it spends a further degree of
+freedom a normal quantile cannot see. With an exact Student-t critical value
+(bisection on a regularized incomplete beta, written out because this package has
+no dependencies) those become 0.053 and 0.064. `_required_sample_size` had the
+same inconsistency from the other side and now plans with the critical value the
+test actually uses.
+
+**A biomarker field that could not take its other value.**
+`PrognosticScore.within_validated_domain` was hard-coded `True` at the only place
+a score is built, because categorical domain mismatches *raise* — so it restated
+"you got a score at all" and any consumer branching on it wrote dead code. The
+missing half was numeric: the domain said nothing about the range of feature
+values the artifact was fit on, and a frozen linear score applied to a CRP of 400
+when it was derived on 0–50 is extrapolating. `validated_ranges` supplies it, an
+artifact declaring none leaves the question *unjudged* rather than asserting
+safety, and `out_of_range_features` names the covariate instead of returning a
+bare False.
+
 **Deliberately simple, and labelled as such in-module:**
 `HandcraftedFeatureEncoder` (nine clinical features normalised and tiled — not a
 learned representation, and it does not claim to be),

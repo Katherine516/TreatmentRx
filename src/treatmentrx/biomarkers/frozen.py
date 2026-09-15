@@ -106,6 +106,15 @@ class FrozenPrognosticModel:
             coefficient * values[name] for name, coefficient in self.coefficients
         )
         calibrated = self.calibration_intercept + self.calibration_slope * raw
+
+        # The numeric half of "is this artifact valid here". The categorical
+        # half already raised above, so this cannot be a restatement of it:
+        # `within_validated_domain` was previously hard-coded True at this one
+        # construction site and could not take any other value, which made every
+        # consumer branch on it dead code. A frozen linear score applied outside
+        # the range it was fit on is extrapolating, and that is the classic way
+        # an external biomarker fails.
+        outside = self.domain.out_of_range(values)
         return PrognosticScore(
             value=calibrated,
             artifact_id=self.artifact_id,
@@ -114,8 +123,9 @@ class FrozenPrognosticModel:
             endpoint=self.domain.endpoint,
             horizon_days=self.domain.horizon_days,
             reference_treatment=self.domain.reference_treatment,
-            within_validated_domain=True,
+            within_validated_domain=not outside,
             feature_days={name: feature_days[name] for name in required},
+            out_of_range_features=outside,
         )
 
     def capability(self) -> dict[str, object]:
@@ -127,9 +137,24 @@ class FrozenPrognosticModel:
             "may_modify_treatment_effect": False,
             "domain": self.domain.as_dict(),
             "required_features": [name for name, _ in self.coefficients],
+            # An artifact that declares no ranges is saying it does not know
+            # where it was validated, which a consumer should be able to see
+            # without inspecting the domain.
+            "declares_validated_ranges": bool(self.domain.validated_ranges),
         }
 
     def _validate_domain(self, request: BiomarkerRequest) -> None:
+        """Categorical domain membership — a mismatch here raises.
+
+        Scoring a lung-CT artifact against a rheumatology record is not a
+        borderline case, so this is a gate rather than a flag. The *numeric*
+        question — are the feature values inside the range the artifact was fit
+        on — is answered in `score` and reported through
+        `PrognosticScore.within_validated_domain`, because an extreme but
+        admissible patient is a caveat rather than a wrong artifact. Same
+        two-tier split the main model uses between `data/contract` and
+        `safety/rules._out_of_support`.
+        """
         expected = self.domain
         mismatches = []
         for name in (

@@ -87,6 +87,111 @@ def normal_critical_value(alpha: float) -> float:
         raise ValueError("alpha must be between 0 and 1")
     return Z_QUANTILE.get(alpha, NormalDist().inv_cdf(1.0 - alpha / 2.0))
 
+
+def _log_beta(a: float, b: float) -> float:
+    return math.lgamma(a) + math.lgamma(b) - math.lgamma(a + b)
+
+
+def _beta_continued_fraction(a: float, b: float, x: float) -> float:
+    """Lentz's modified continued fraction for the incomplete beta.
+
+    Standard, and written out rather than imported because this package has no
+    third-party dependencies and a Student-t quantile needs an exact incomplete
+    beta. `tests/test_inference.py` pins it against published t tables.
+    """
+    tiny = 1e-300
+    qab, qap, qam = a + b, a + 1.0, a - 1.0
+    c = 1.0
+    d = 1.0 - qab * x / qap
+    if abs(d) < tiny:
+        d = tiny
+    d = 1.0 / d
+    result = d
+    for m in range(1, 400):
+        m2 = 2 * m
+        numerator = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + numerator * d
+        if abs(d) < tiny:
+            d = tiny
+        c = 1.0 + numerator / c
+        if abs(c) < tiny:
+            c = tiny
+        d = 1.0 / d
+        result *= d * c
+        numerator = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + numerator * d
+        if abs(d) < tiny:
+            d = tiny
+        c = 1.0 + numerator / c
+        if abs(c) < tiny:
+            c = tiny
+        d = 1.0 / d
+        step = d * c
+        result *= step
+        if abs(step - 1.0) < 1e-15:
+            break
+    return result
+
+
+def regularized_incomplete_beta(a: float, b: float, x: float) -> float:
+    """`I_x(a, b)` — the regularized incomplete beta function."""
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    front = math.exp(
+        a * math.log(x) + b * math.log1p(-x) - _log_beta(a, b)
+    )
+    if x < (a + 1.0) / (a + b + 2.0):
+        return front * _beta_continued_fraction(a, b, x) / a
+    return 1.0 - front * _beta_continued_fraction(b, a, 1.0 - x) / b
+
+
+def student_t_critical_value(alpha: float, degrees_of_freedom: int) -> float:
+    """Two-sided Student-t critical value.
+
+    **Why this is not a normal quantile.** A standard error estimated from the
+    same small sample as the effect is itself uncertain, and the normal
+    approximation ignores that. Measured on
+    `trials.simulate_precision_power` under the null, the randomized precision
+    module rejected at **0.101 unadjusted and 0.138 adjusted** at n=8 — its own
+    accepted minimum — against a nominal 0.05, and the *adjusted* analysis was
+    worse because it spends a further degree of freedom the normal quantile
+    cannot see. Those are 95% intervals behaving like 86-90% ones.
+
+    The degrees of freedom were already being computed and reported and then not
+    used. This closes that.
+
+    Solved by bisection on the exact t CDF, `P(T <= t) = 1 - I_{nu/(nu+t^2)}(nu/2,
+    1/2) / 2` for `t >= 0`, rather than by a Cornish-Fisher expansion — that
+    expansion is 0.25% low at five degrees of freedom, which is the end of the
+    range this is for.
+    """
+    if not 0.0 < alpha < 1.0:
+        raise ValueError("alpha must be between 0 and 1")
+    if degrees_of_freedom < 1:
+        raise ValueError("degrees_of_freedom must be at least 1")
+    target = 1.0 - alpha / 2.0
+    nu = float(degrees_of_freedom)
+
+    def cdf(t: float) -> float:
+        x = nu / (nu + t * t)
+        tail = 0.5 * regularized_incomplete_beta(nu / 2.0, 0.5, x)
+        return 1.0 - tail if t >= 0.0 else tail
+
+    low, high = 0.0, 1.0
+    while cdf(high) < target and high < 1e6:
+        high *= 2.0
+    for _ in range(200):
+        middle = (low + high) / 2.0
+        if cdf(middle) < target:
+            low = middle
+        else:
+            high = middle
+        if high - low < 1e-12:
+            break
+    return (low + high) / 2.0
+
 # How much wider an honest interval is than the sandwich's, measured rather than
 # assumed: `cli coverage` puts the sandwich at 0.88 of the estimator's actual
 # spread, so a correct interval is about 1/0.88 = 1.14x wider, and the bootstrap

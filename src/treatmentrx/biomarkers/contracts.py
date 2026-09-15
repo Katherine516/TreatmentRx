@@ -29,6 +29,27 @@ class BiomarkerLeakageError(BiomarkerError):
 
 @dataclass(frozen=True)
 class BiomarkerDomain:
+    """Where a frozen artifact was validated — categorically *and* numerically.
+
+    The categorical half (disease, modality, endpoint, horizon, site, platform)
+    decides whether this is the right artifact at all, and a mismatch there
+    **raises**: scoring a lung-CT model on a rheumatology record is not a
+    borderline case.
+
+    `validated_ranges` is the other half and it was missing. A frozen linear
+    score applied to a CRP of 400 when it was fit on 0-50 is extrapolating, and
+    nothing noticed — `PrognosticScore.within_validated_domain` was assigned
+    `True` at its only construction site and could not take any other value, so
+    a consumer branching on it was writing dead code.
+
+    Ranges are optional per feature: an artifact that declares none for a
+    covariate is saying it does not know, which is different from saying the
+    covariate is unbounded, and `within_validated_domain` stays True for the
+    ones it cannot judge. That mirrors the two-tier split the main model already
+    uses — `data/contract.PLAUSIBLE_RANGES` raises on impossible values while
+    `safety/rules._out_of_support` warns on extreme-but-possible ones.
+    """
+
     disease_id: str
     modality: str
     endpoint: str
@@ -36,6 +57,9 @@ class BiomarkerDomain:
     reference_treatment: str
     eligible_sites: tuple[str, ...]
     eligible_platforms: tuple[str, ...]
+    #: feature name -> (low, high) the artifact was validated over. Declaring
+    #: none leaves the numeric half unjudged rather than asserted.
+    validated_ranges: tuple[tuple[str, tuple[float, float]], ...] = ()
 
     def __post_init__(self) -> None:
         string_fields = (
@@ -52,11 +76,40 @@ class BiomarkerDomain:
             raise BiomarkerDomainError(
                 "eligible_sites and eligible_platforms must be explicit"
             )
+        names = [name for name, _ in self.validated_ranges]
+        if len(names) != len(set(names)):
+            raise BiomarkerDomainError("validated_ranges names must be unique")
+        for name, bounds in self.validated_ranges:
+            if not name.strip():
+                raise BiomarkerDomainError("validated_ranges names may not be blank")
+            low, high = bounds
+            if not (low < high):
+                raise BiomarkerDomainError(
+                    f"validated range for {name!r} must have low < high"
+                )
+
+    def out_of_range(self, values: dict[str, float]) -> tuple[str, ...]:
+        """Features whose value falls outside the artifact's validated range.
+
+        Silent about features with no declared range — an absent range is a
+        missing measurement, not a guarantee.
+        """
+        outside = []
+        for name, (low, high) in self.validated_ranges:
+            value = values.get(name)
+            if value is None:
+                continue
+            if value < low or value > high:
+                outside.append(name)
+        return tuple(sorted(outside))
 
     def as_dict(self) -> dict[str, object]:
         payload = asdict(self)
         payload["eligible_sites"] = list(self.eligible_sites)
         payload["eligible_platforms"] = list(self.eligible_platforms)
+        payload["validated_ranges"] = {
+            name: list(bounds) for name, bounds in self.validated_ranges
+        }
         return payload
 
 
@@ -81,8 +134,15 @@ class PrognosticScore:
     endpoint: str
     horizon_days: int
     reference_treatment: str
+    #: True only when every feature carrying a declared range fell inside it.
+    #: Categorical domain mismatches raise instead of landing here, so this is
+    #: the *numeric* half of the question and nothing else. It used to be
+    #: hard-coded True at the only place a score is built.
     within_validated_domain: bool
     feature_days: dict[str, int]
+    #: Named so a consumer can say which feature left the range, rather than
+    #: being handed a bare False.
+    out_of_range_features: tuple[str, ...] = ()
 
     @property
     def may_modify_treatment_effect(self) -> bool:
@@ -92,6 +152,7 @@ class PrognosticScore:
         payload = asdict(self)
         payload["role"] = self.role.value
         payload["may_modify_treatment_effect"] = self.may_modify_treatment_effect
+        payload["out_of_range_features"] = list(self.out_of_range_features)
         return payload
 
 

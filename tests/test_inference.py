@@ -222,5 +222,85 @@ class StabilityTests(unittest.TestCase):
             self.assertIn("keep averaging", verdict)
 
 
+
+class StudentTCriticalValueTests(unittest.TestCase):
+    """An exact t quantile, because a normal one is not honest at small n.
+
+    The randomized precision module rejected at 0.101 unadjusted and 0.138
+    adjusted at n=8 — its own accepted minimum — against a nominal 0.05, and the
+    *adjusted* fit was worse because it spends a further degree of freedom the
+    normal quantile cannot see. The degrees of freedom were already computed and
+    reported there and then not used.
+    """
+
+    #: Published two-sided 0.05 critical values.
+    KNOWN = {1: 12.706, 2: 4.303, 5: 2.571, 10: 2.228, 30: 2.042, 100: 1.984}
+
+    def test_it_matches_published_tables(self):
+        from treatmentrx.estimation.inference import student_t_critical_value
+
+        for degrees, published in self.KNOWN.items():
+            with self.subTest(df=degrees):
+                self.assertAlmostEqual(
+                    student_t_critical_value(0.05, degrees), published, places=3
+                )
+
+    def test_other_alphas_match_too(self):
+        from treatmentrx.estimation.inference import student_t_critical_value
+
+        self.assertAlmostEqual(student_t_critical_value(0.01, 5), 4.032, places=3)
+        self.assertAlmostEqual(student_t_critical_value(0.10, 20), 1.725, places=3)
+
+    def test_it_converges_to_the_normal_quantile(self):
+        from treatmentrx.estimation.inference import (
+            normal_critical_value,
+            student_t_critical_value,
+        )
+
+        self.assertAlmostEqual(
+            student_t_critical_value(0.05, 100_000),
+            normal_critical_value(0.05),
+            places=4,
+        )
+
+    def test_it_is_always_wider_than_the_normal_one(self):
+        """The whole point: the standard error is itself estimated."""
+        from treatmentrx.estimation.inference import (
+            normal_critical_value,
+            student_t_critical_value,
+        )
+
+        normal = normal_critical_value(0.05)
+        for degrees in (1, 3, 8, 25, 200):
+            with self.subTest(df=degrees):
+                self.assertGreater(student_t_critical_value(0.05, degrees), normal)
+
+    def test_the_incomplete_beta_is_exact_at_known_points(self):
+        """`I_x(a,b)` underpins the quantile; pinned against closed forms."""
+        from treatmentrx.estimation.inference import regularized_incomplete_beta
+
+        # I_x(1,1) = x, and I_x(a,b) = 1 - I_{1-x}(b,a).
+        for x in (0.1, 0.35, 0.5, 0.9):
+            with self.subTest(x=x):
+                self.assertAlmostEqual(regularized_incomplete_beta(1.0, 1.0, x), x, places=12)
+                self.assertAlmostEqual(
+                    regularized_incomplete_beta(2.5, 3.5, x),
+                    1.0 - regularized_incomplete_beta(3.5, 2.5, 1.0 - x),
+                    places=12,
+                )
+        self.assertEqual(regularized_incomplete_beta(2.0, 3.0, 0.0), 0.0)
+        self.assertEqual(regularized_incomplete_beta(2.0, 3.0, 1.0), 1.0)
+
+    def test_the_trial_module_uses_it(self):
+        """A 95% interval that behaves like an 86% one is the defect this closes."""
+        from treatmentrx.trials.precision import simulate_precision_power
+
+        result = simulate_precision_power(8, 0.0, 1.0, 1.0, replicates=1500, seed=7)
+        for arm, rate in result["rejection_rate"].items():
+            with self.subTest(arm=arm):
+                self.assertLess(
+                    rate, 0.085, f"{arm} type I error {rate:.3f} at the accepted minimum n"
+                )
+
 if __name__ == "__main__":
     unittest.main()
