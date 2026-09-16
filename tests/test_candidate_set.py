@@ -285,5 +285,143 @@ class MultiplicityTests(unittest.TestCase):
         self.assertGreater(self.levels[1]["contains_optimal_arm"], 0.95)
 
 
+class WhyNotIsModelDerivedTests(unittest.TestCase):
+    """The why-not reason is the gap's own decomposition, not prose about the arm.
+
+    `WHY_NOT_REASONS` was keyed on the arm alone, so every patient read the same
+    sentence for a given arm while the gap printed beside it varied correctly —
+    and `JAK-inhibitor`'s named organ function, which `BLIP_BASIS` does not
+    contain. These pin the three properties that replace it: the reason names a
+    term the model actually used, the decomposition reconstructs the gap it
+    annotates, and the answer moves with the patient.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from treatmentrx.estimation import training
+        from treatmentrx.estimation.features import stage_index
+
+        data, estimation, decision = DataLayer(), EstimationLayer(), DecisionLayer()
+        n_stages = training.fitted().pooled.n_stages
+        cls.entries = []
+        cls.stages_covered = set()
+        for bundle in simulated_bundles(60, seed=606):
+            try:
+                state = data.build_patient_state(bundle)
+            except DataContractError:
+                continue
+            made = decision.decide(state, estimation.estimate(state))
+            cls.stages_covered.add(stage_index(state.stages, n_stages))
+            for entry in (made.explanation.why_not if made.explanation else []):
+                cls.entries.append((made, entry))
+        assert cls.entries
+
+    def test_the_language_map_covers_the_blip_basis(self):
+        """A basis term with no phrase reaches a clinician card as a bare
+        variable name. The map is keyed on the covariate, so adding a modifier
+        to `BLIP_BASIS` without a word for it is the failure to catch."""
+        from treatmentrx.estimation.basis import BLIP_BASIS
+        from treatmentrx.estimation.explainability import BLIP_TERM_LANGUAGE
+
+        for name in BLIP_BASIS:
+            with self.subTest(covariate=name):
+                self.assertIn(name, BLIP_TERM_LANGUAGE)
+
+    def test_the_reason_names_the_term_that_most_moves_the_gap(self):
+        """Not the largest absolute term — the largest one working *for* the
+        leader, because the question the card answers is why this arm lost."""
+        from treatmentrx.estimation.explainability import BLIP_TERM_LANGUAGE
+
+        checked = 0
+        for _, entry in self.entries:
+            positive = {k: v for k, v in entry.contributions.items() if v > 0}
+            if not positive:
+                continue
+            checked += 1
+            leading = max(positive.items(), key=lambda kv: kv[1])[0]
+            with self.subTest(arm=entry.action):
+                self.assertIn(
+                    BLIP_TERM_LANGUAGE[leading],
+                    entry.dominant_reason,
+                    "the reason names a term other than the one driving the gap",
+                )
+        self.assertGreater(checked, 100)
+
+    def test_the_contributions_reconstruct_the_gap_at_every_served_stage(self):
+        """The scale guard, and it is the one that can fail loudly.
+
+        `q_gap` is the model-averaged contrast and the decomposition is the
+        dominant member's, so they differ by the members' disagreement — measured
+        max 0.0575 over 600 entries. They must not differ by a *horizon*:
+        `Q-Pooled` publishes an undivided value-to-go stage psi, so a
+        decomposition sourced from it runs 1.54x to 3.49x the gap at
+        `stage_index` 1. `attribution_source` is dWOLS-Shared on the deployed fit
+        and the margin deciding that is 0.003, so this is asserted rather than
+        assumed — and asserted at every stage the pipeline actually serves, since
+        the two members coincide only at the terminal block.
+        """
+        worst = 0.0
+        for _, entry in self.entries:
+            residual = abs(sum(entry.contributions.values()) - entry.q_gap)
+            worst = max(worst, residual)
+            with self.subTest(arm=entry.action):
+                self.assertLess(
+                    residual,
+                    0.1,
+                    "the decomposition is not on the same scale as the gap it explains",
+                )
+        # The two members coincide only at the terminal block, so a sweep that
+        # reached one stage would not be testing the scale at all.
+        self.assertGreater(
+            len(self.stages_covered),
+            1,
+            f"only stage {self.stages_covered} reached; the horizon is 1 there",
+        )
+        self.assertLess(worst, 0.1)
+
+    def test_the_reason_moves_with_the_patient(self):
+        """The property the replaced prose structurally could not have.
+
+        `WHY_NOT_REASONS` held exactly one sentence per arm. If a change ever
+        collapses this back toward a constant, the card is asserting something
+        about the arm rather than about the patient in front of it.
+        """
+        from collections import defaultdict
+
+        per_arm = defaultdict(set)
+        for _, entry in self.entries:
+            per_arm[entry.action].add(entry.dominant_reason)
+        self.assertTrue(per_arm)
+        for arm, reasons in per_arm.items():
+            with self.subTest(arm=arm):
+                self.assertGreater(
+                    len(reasons),
+                    1,
+                    "every patient reads the same reason for this arm",
+                )
+
+    def test_the_reference_arm_gap_is_the_leaders_own_blip(self):
+        """`continue-current` is the reference, so the gap over it *is* the
+        leader's blip — the quantity the attribution block already publishes.
+        The two blocks are computed by different code from the same
+        coefficients, and they agree exactly; if they ever stop, one of them has
+        picked up a different source or a different basis."""
+        checked = 0
+        for decision, entry in self.entries:
+            if entry.action != "continue-current":
+                continue
+            attribution = decision.explanation.attributions[0]
+            if attribution.action != decision.selected.recommended_arm:
+                continue
+            checked += 1
+            with self.subTest(patient=checked):
+                self.assertAlmostEqual(
+                    sum(entry.contributions.values()),
+                    attribution.total_advantage,
+                    places=3,
+                )
+        self.assertGreater(checked, 20)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -22,14 +22,29 @@ from treatmentrx.domain import (
 )
 
 
-WHY_NOT_REASONS = {
-    "continue-current": "current regime is failing to control disease activity",
-    "methotrexate-optimization": "csDMARD optimization is lower-yield after prior failure",
-    "TNF-inhibitor": "prior TNF exposure / loss of response lowers expected benefit",
-    "IL-6 inhibitor": "expected advantage did not exceed the recommended arm",
-    "JAK-inhibitor": "organ-function / safety profile reduces net benefit",
-    "rituximab": "reserved for seropositive or multi-failure context",
+#: Clinical language for each blip-basis term, keyed on the **covariate** and not
+#: on the arm. That swap is the whole point. The replaced `WHY_NOT_REASONS` was
+#: keyed on the arm alone, so every patient got the same sentence for a given arm
+#: while the gap beside it varied correctly — and one of those sentences, "organ-
+#: function / safety profile reduces net benefit" for `JAK-inhibitor`, named a
+#: quantity `BLIP_BASIS` does not contain. Here the model chooses which term
+#: dominates and with what sign; this map only supplies the words.
+#:
+#: A covariate with no entry falls back to its own identifier rather than
+#: borrowing a neighbour's sentence, and `tests/test_candidate_set.py` asserts the
+#: map covers `BLIP_BASIS` — a basis term added without a phrase would otherwise
+#: reach a clinician card as a bare variable name.
+BLIP_TERM_LANGUAGE = {
+    "intercept": "this arm's baseline effect",
+    "das28_std": "disease activity",
+    "anti_ccp": "anti-CCP status",
+    "prior_tnf": "prior TNF exposure",
 }
+
+#: A negative term is shown as an offset only when it is worth a reader's
+#: attention next to the leading one. Purely presentational — `contributions`
+#: always carries every term.
+_OFFSET_SHARE = 0.2
 
 
 def _e_value(effect: float, outcome_sd: float) -> float:
@@ -68,7 +83,7 @@ class ModelExplainer:
         """
         return ExplanationBundle(
             attributions=self._attributions(selected, stages),
-            why_not=self._why_not(selected, arm_contrasts),
+            why_not=self._why_not(selected, stages, arm_contrasts),
             counterfactuals=self._counterfactuals(selected, stages),
             sensitivity=self._sensitivity(contrast),
         )
@@ -101,48 +116,142 @@ class ModelExplainer:
             )
         ]
 
-    def _why_not(self, selected: RegimeEstimate, arm_contrasts=None) -> list[WhyNotEntry]:
-        """How far behind each non-recommended arm is, on the decision's scale.
+    def _why_not(
+        self,
+        selected: RegimeEstimate,
+        stages: list[StageRecord],
+        arm_contrasts=None,
+    ) -> list[WhyNotEntry]:
+        """Why each non-recommended arm lost, decomposed from the model that ranked it.
 
-        The gap was `q_values[best] - q_values[action]`, and `q_values` is a
-        **display** quantity — clamped to `[Q_FLOOR, Q_CEILING]` and rounded to
-        three decimals, both many-to-one. That is invariant 46's defect in a
-        fifth place, and the card is where it showed: for a patient whose
-        predicted response saturates the ceiling, three arms collapse to 0.99
-        and the card printed "TNF-inhibitor (gap 0.000)" one line under
-        "Separation: methotrexate-optimization over TNF-inhibitor is +0.051 —
-        separable at this sample size". Measured over 120 patients, 4 printed a
-        gap of exactly 0.000 under a separable verdict and 29 disagreed with the
-        separation line by any amount, by up to 0.065.
+        **The reason used to be prose keyed on the arm, and it could not vary
+        with the patient.** `WHY_NOT_REASONS` held one sentence per arm, so two
+        patients with opposite covariates read the same explanation while the gap
+        printed beside it moved correctly. The module docstring above calls this
+        table model-derived and says Layer 5 never invents it; the gap was, the
+        sentence was not. Measured over 120 patients, **every** card carried one.
 
-        `arm_contrasts` is the decision layer's own model-averaged contrast of
-        the leader against each arm — the same quantity the separation line
-        reports, so for the runner-up the two now agree by construction rather
-        than by luck. The fallback is the old difference, for callers that build
-        an estimate without a decision behind it.
+        One of those sentences was worse than generic. `JAK-inhibitor` printed
+        "organ-function / safety profile reduces net benefit" — on **20 of 120**
+        cards — and `BLIP_BASIS` is `(intercept, das28_std, anti_ccp, prior_tnf)`,
+        which contains no organ-function term at all. The card asserted a
+        mechanism the model has no parameter for. Worse, once the entries were
+        restricted to arms the safety layer did *not* remove, that safety-flavoured
+        sentence printed only for patients whose organ function had cleared every
+        rule on the same card.
 
-        Ordered by that gap rather than by the display value: the renderer shows
-        the first two, and "the two closest arms the model ruled out" has to be
-        decided by the number it prints.
+        What replaces it is the gap's own decomposition. Each arm's blip is
+        one-vs-reference over `BLIP_BASIS`, so the contrast between the leader and
+        any arm is `(psi_leader - psi_arm) . h(X)` and splits term by term. Those
+        terms are read from `selected.coefficients` — the same place
+        `_attributions` reads them, so both blocks on the card describe the same
+        member, the one `attribution_source` names. The reference arm carries no
+        psi and needs none: the gap over continuing current therapy *is* the
+        leader's blip, and the two blocks agree to the last decimal there.
+
+        `q_gap` stays the decision's own model-averaged contrast (invariant 54),
+        so it still matches the separation line. The decomposition is one
+        member's, so it reconstructs that gap to within the two members'
+        disagreement rather than exactly: over 600 entries from 120 patients the
+        residual runs mean **0.0100**, median 0.0072, max **0.0575**, against
+        gaps that reach 0.306. Reporting the decomposed total instead would make
+        the two numbers on the card disagree, which is the defect invariant 54
+        removed.
+
+        **That residual is a disagreement, not a scale error, and only because
+        the source is dWOLS.** `Q-Pooled` publishes a stage psi from a
+        value-to-go fit and does not divide it by the remaining horizon, while
+        `q_gap` is per-remaining-visit — so a decomposition sourced from it would
+        be off by that horizon wherever the horizon is not 1. Measured at
+        `stage_index` 1, Q-Pooled's decomposition runs **1.54x to 3.49x** the gap
+        it claims to explain, against dWOLS tracking it closely; at the terminal
+        block, where the horizon is 1, both agree. `attribution_source` is
+        dWOLS-Shared for all 120 patients on the deployed fit, so nothing served
+        crosses scales today — but the BMA margin that decides it is 0.003
+        (invariant 56), so `tests/test_candidate_set.py` asserts the
+        reconstruction at every served stage rather than trusting that margin.
+        That is a guard, not a repair: the repair belongs where the scale is
+        known, in what `coefficient_summary` publishes.
+
+        Ordered by the gap printed, because the renderer shows the first two.
         """
         arm_contrasts = arm_contrasts or {}
-        best = selected.q_values[selected.recommended_arm]
-        gaps: list[tuple[float, str]] = []
+        basis = dict(zip(BLIP_BASIS, blip_basis(model_features(stages))))
+        leader = selected.recommended_arm
+        leader_psi = self._blip_parameters(selected, leader)
+        best = selected.q_values[leader]
+
+        ranked: list[tuple[float, str, dict[str, float]]] = []
         for action, value in selected.q_values.items():
-            if action == selected.recommended_arm:
+            if action == leader:
                 continue
             test = arm_contrasts.get(action)
-            gaps.append((test.difference if test is not None else best - value, action))
+            gap = test.difference if test is not None else best - value
+            arm_psi = self._blip_parameters(selected, action)
+            contributions = {
+                name: round((leader_psi.get(name, 0.0) - arm_psi.get(name, 0.0)) * weight, 4)
+                for name, weight in basis.items()
+            }
+            ranked.append((gap, action, contributions))
+
         return [
             WhyNotEntry(
                 action=action,
                 q_gap=round(gap, 3),
-                dominant_reason=WHY_NOT_REASONS.get(
-                    action, "lower estimated Q-value in this stage context"
+                dominant_reason=self._dominant_reason(contributions),
+                contributions=dict(
+                    sorted(contributions.items(), key=lambda kv: abs(kv[1]), reverse=True)
                 ),
             )
-            for gap, action in sorted(gaps)
+            for gap, action, contributions in sorted(ranked)
         ]
+
+    @staticmethod
+    def _blip_parameters(selected: RegimeEstimate, action: str) -> dict[str, float]:
+        """This arm's psi, as the estimate carries it.
+
+        Empty for the reference arm, which has no blip by construction rather
+        than by omission — subtracting nothing is the right answer there.
+        """
+        prefix = f"psi:{action}:"
+        return {
+            key[len(prefix):]: value
+            for key, value in selected.coefficients.items()
+            if key.startswith(prefix)
+            and isinstance(value, (int, float))
+            and not isinstance(value, bool)
+        }
+
+    @staticmethod
+    def _dominant_reason(contributions: dict[str, float]) -> str:
+        """The term that most moves the gap toward the leader, named and signed.
+
+        The largest *positive* term, not the largest absolute one: the question
+        the card is answering is why this arm lost, and a term working in the
+        arm's favour does not answer it. It is shown as an offset instead, when
+        it is big enough next to the leading term to change how that term reads —
+        a leading contribution of +0.136 against a gap of 0.086 is confusing
+        until the -0.079 pulling the other way is named too.
+
+        Falls back to the largest absolute term when nothing is positive, which
+        the served path does not reach — `_why_not` entries are printed only for
+        arms an interval excluded, so the gap is positive — but a caller
+        constructing an estimate by hand can.
+        """
+        terms = {name: value for name, value in contributions.items() if value}
+        if not terms:
+            return "no blip term separates these arms for this patient"
+
+        name, value = max(terms.items(), key=lambda kv: kv[1])
+        if value <= 0:
+            name, value = max(terms.items(), key=lambda kv: abs(kv[1]))
+            return f"{BLIP_TERM_LANGUAGE.get(name, name)} {value:+.3f}, and none favours the leader"
+
+        reason = f"{BLIP_TERM_LANGUAGE.get(name, name)} {value:+.3f}"
+        offset, offset_value = min(terms.items(), key=lambda kv: kv[1])
+        if offset_value < 0 and abs(offset_value) >= _OFFSET_SHARE * value:
+            reason += f", partly offset by {BLIP_TERM_LANGUAGE.get(offset, offset)} {offset_value:+.3f}"
+        return reason
 
     def _counterfactuals(self, selected: RegimeEstimate, stages: list[StageRecord]) -> list[CounterfactualProbe]:
         latest = stages[-1]

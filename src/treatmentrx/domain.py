@@ -270,11 +270,20 @@ class BlipAttribution:
 
 @dataclass(frozen=True)
 class WhyNotEntry:
-    """v5.1 #9 — for a non-recommended action: the Q-gap and dominant reason."""
+    """v5.1 #9 — for a non-recommended action: the gap and why the model says so.
+
+    `contributions` is that gap decomposed over the blip basis, term by term, so
+    `dominant_reason` can be checked against the numbers it claims to summarise
+    rather than taken on trust. It is the same decomposition `BlipAttribution`
+    carries for the recommended arm, applied to a contrast instead of a blip —
+    and for the reference arm the two coincide exactly, because the gap over
+    continuing current therapy *is* the leader's blip.
+    """
 
     action: str
     q_gap: float
     dominant_reason: str
+    contributions: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

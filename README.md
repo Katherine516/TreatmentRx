@@ -1339,12 +1339,63 @@ model reason — *"why not JAK-inhibitor — organ-function / safety profile red
 net benefit"* for an arm the same card reports as contraindicated in pregnancy,
 on 79 of 240 cards.
 
+### Why an arm was ruled out, from the model that ruled it out
+
+`explainability.py` opens by calling its explanations "faithful, model-derived"
+and saying Layer 5 "never invents them". The *gap* was — the previous change made
+it the decision's own averaged contrast. The sentence beside it was not.
+
+`WHY_NOT_REASONS` held one string per arm, so the explanation could not vary with
+the patient while the number next to it varied correctly. It printed on **120 of
+120** cards. One entry was worse than generic: `JAK-inhibitor` read *"organ-
+function / safety profile reduces net benefit"* on **20 of 120** cards, and
+`BLIP_BASIS` is `(intercept, das28_std, anti_ccp, prior_tnf)` — **no organ-
+function term exists**. The card named a mechanism the model has no parameter
+for. Restricting these entries to arms the safety layer had *not* removed
+sharpened it: that safety-flavoured sentence printed only for patients whose
+organ function had cleared every rule on the same card.
+
+Every blip is one-vs-reference over `BLIP_BASIS`, so the leader-versus-arm
+contrast is `(psi_leader − psi_arm) · h(X)` and splits term by term. The card now
+prints that:
+
+> Why not the alternatives: IL-6 inhibitor (gap 0.086) — anti-CCP status +0.136,
+> partly offset by this arm's baseline effect −0.079; JAK-inhibitor (gap 0.108) —
+> anti-CCP status +0.131, partly offset by this arm's baseline effect −0.068.
+
+`BLIP_TERM_LANGUAGE` is keyed on the **covariate**, not the arm — the model picks
+which term dominates and with what sign, and the map supplies only words. Over
+120 patients and 600 entries the reason takes **19 to 55 distinct values per arm**
+where the old table had exactly one, and all four terms get named (anti-CCP 41%,
+baseline 32%, disease activity 18%, prior TNF 9%).
+
+`q_gap` stays the averaged contrast, so it still matches the separation line; the
+decomposition is one member's, so it reconstructs that gap to within the members'
+disagreement — mean **0.0100**, max **0.0575**, against gaps reaching 0.306. For
+the reference arm the two agree **exactly** (0.000000 over 120), because the gap
+over continuing current therapy *is* the leader's blip, which the attribution
+block already publishes.
+
+**One latent exposure, recorded rather than bundled in.** `Q-Pooled` publishes a
+stage psi from a value-to-go fit *undivided by the remaining horizon*, while the
+gap is per-remaining-visit. Measured at `stage_index` 1, a Q-Pooled-sourced
+decomposition runs **1.54× to 3.49×** the gap it claims to explain; at the
+terminal block, horizon 1, both members agree. The source is dWOLS-Shared for all
+120 patients on the deployed fit, so nothing served crosses scales today — but
+the BMA margin deciding it is **0.003**. So the reconstruction is asserted at
+every served stage, and the guard closes: forced onto Q-Pooled it fires at stage
+1 (0.1434 against a 0.1 bar) and stays quiet at the terminal block. The repair
+belongs in what `coefficient_summary` publishes, and applies to the attribution
+block too.
+
 **Deliberately simple, and labelled as such in-module:**
 `HandcraftedFeatureEncoder` (nine clinical features normalised and tiled — not a
 learned representation, and it does not claim to be),
 `SemanticKnowledgeBase` (five hard-coded passages, not a real RAG index), and
-`WHY_NOT_REASONS` (hard-coded clinical prose, now on the decision's own contrast
-rather than a difference of display values).
+`BLIP_TERM_LANGUAGE` (four clinical phrases, one per blip-basis term — all that
+survives of `WHY_NOT_REASONS`; the reason itself is now the gap's own
+decomposition, see *[Why an arm was ruled out, from the model that ruled it
+out](#why-an-arm-was-ruled-out-from-the-model-that-ruled-it-out)*).
 
 **The keyword index could not match its own vocabulary.** It split the query on
 whitespace, and the arm names are hyphenated while the knowledge-base keys are
@@ -1429,8 +1480,9 @@ Next, in order:
    sample contraindication rules and the five hard-coded RAG passages. The
    composite action set is currently a literal in `estimation/actions.py`, and
    its breadth is load-bearing for whether a contraindication blocks a patient.
-   `WHY_NOT_REASONS` belongs there too — it is the one place Layer 5 asserts
-   something the model did not produce.
+   `WHY_NOT_REASONS` used to be on this list as the one place Layer 5 asserted
+   something the model did not produce; it is gone, replaced by the gap's own
+   per-covariate decomposition.
 2. **A learned state representation, if one is ever wanted.** The previous entry
    here offered three options for `GRUBaselineEncoder` — train it, shrink it, or
    drop the tail — and the tail is dropped. Once the out-of-distribution term

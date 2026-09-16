@@ -8,7 +8,7 @@ test fixture, not evidence.
 ## Commands
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests    # 551 tests, ~6 min
+PYTHONPATH=src python3 -m unittest discover -s tests    # 556 tests, ~6 min
 PYTHONPATH=src python3 -m treatmentrx.cli demo          # one patient end to end
 PYTHONPATH=src python3 -m treatmentrx.cli evaluate      # estimator scorecard
 PYTHONPATH=src python3 -m treatmentrx.cli stability     # k-fold + seed sweep (~10s)
@@ -1350,6 +1350,67 @@ produced a real clinical divergence, and the notes below are the scar tissue.
    one magnitude that shows the check is a wiring check, so it is reported to
    three significant digits instead.
 
+57. **The card's reason for ruling an arm out was prose keyed to the arm, and it
+   named a parameter the model does not have.** `explainability.py` opens by
+   calling its explanations "faithful, model-derived" and saying Layer 5 "never
+   invents them". The *gap* was model-derived — invariant 54 made it the
+   decision's own averaged contrast. The sentence beside it was not.
+
+   `WHY_NOT_REASONS` held one string per arm, so the explanation could not vary
+   with the patient while the number beside it varied correctly. It printed on
+   **120 of 120** cards. And one entry was worse than generic: `JAK-inhibitor`
+   read "organ-function / safety profile reduces net benefit" on **20 of 120**
+   cards, while `BLIP_BASIS` is `(intercept, das28_std, anti_ccp, prior_tnf)` —
+   **there is no organ-function term**, so the card asserted a mechanism the
+   model has no parameter for. Invariant 54 had already stopped these entries
+   printing for arms Layer 4 removed, which sharpened it: that safety-flavoured
+   sentence printed *only* for patients whose organ function cleared every rule
+   on the same card.
+
+   The replacement is the gap's own decomposition. Every blip is one-vs-reference
+   over `BLIP_BASIS`, so the leader-versus-arm contrast is
+   `(psi_leader - psi_arm) . h(X)` and splits term by term. `BLIP_TERM_LANGUAGE`
+   is keyed on the **covariate**, not the arm: the model picks which term
+   dominates and with what sign, and the map only supplies words. The reason
+   names the largest term working *for* the leader — not the largest absolute
+   one, since a term in the arm's favour does not explain why it lost — and names
+   the offsetting term when one is large enough to change how the first reads.
+
+   Measured over 120 patients, 600 entries: the dominant reason takes **19 to 55
+   distinct values per arm** where the old table had exactly one, and all four
+   basis terms get named (anti-CCP 41%, baseline 32%, disease activity 18%, prior
+   TNF 9%). The terms are read from `selected.coefficients`, the same place
+   `_attributions` reads them, so both blocks describe the member
+   `attribution_source` names — and for the reference arm they agree **exactly**
+   (max difference 0.000000 over 120), because the gap over continuing current
+   therapy *is* the leader's blip.
+
+   **`q_gap` stays the averaged contrast**, so it still matches the separation
+   line (invariant 54). The decomposition is one member's, so it reconstructs
+   that gap only to within the members' disagreement: mean **0.0100**, max
+   **0.0575**, against gaps reaching 0.306.
+
+   **That residual is a disagreement, and it would be a scale error if the source
+   flipped.** `Q-Pooled` publishes a stage psi from a value-to-go fit *undivided
+   by the remaining horizon*, while `q_gap` is per-remaining-visit — invariant 9's
+   two scales. Measured at `stage_index` 1, a Q-Pooled-sourced decomposition runs
+   **1.54x to 3.49x** the gap it claims to explain; at the terminal block, horizon
+   1, both members agree. `attribution_source` is dWOLS-Shared for all 120
+   patients on the deployed fit, so nothing served crosses scales today — but the
+   BMA margin deciding it is **0.003** (invariant 56). So the reconstruction is
+   asserted at every served stage rather than assumed, and the guard closes:
+   forced onto Q-Pooled it fires at stage 1 (0.1434 against a 0.1 bar) and stays
+   quiet at the terminal block, which is the right discrimination.
+
+   **That guard is not the repair.** The repair belongs where the scale is known —
+   in what `QLearningModel.coefficient_summary` publishes — and it applies to
+   `_attributions` too, which has carried the same latent exposure since
+   invariant 56. It is recorded here rather than bundled into this change.
+
+   What remains hand-written is a four-entry vocabulary of clinical words for the
+   four basis terms, and a test asserts it covers `BLIP_BASIS` so a new modifier
+   cannot reach a card as a bare variable name.
+
 ## What is real vs. still a placeholder
 
 Real: the four estimators, the cohort and its known blips, informative-dropout
@@ -1383,11 +1444,10 @@ that wrapped it is deleted, see invariant 37),
 `SemanticKnowledgeBase` (five hard-coded passages, word-token keyword retrieval
 — not a vector store, though it does now match its own arm vocabulary, see
 invariant 47),
-`WHY_NOT_REASONS` (hard-coded clinical prose attached to a gap that is now the
-decision's own model-averaged contrast rather than a difference of clamped
-display values, and printed only for arms neither the intervals nor Layer 4 left
-open — see invariant 54; the prose itself is still the one place Layer 5 asserts
-something the model did not produce). The E-value
+`BLIP_TERM_LANGUAGE` (four clinical phrases, one per blip-basis term — all that
+is left of `WHY_NOT_REASONS`, which is gone: the reason an arm was ruled out is
+now the gap's own per-covariate decomposition, keyed on the covariate the model
+chose rather than on the arm, see invariant 57). The E-value
 is no longer on this list: it was a heuristic and is now the VanderWeele-Ding
 bound on the decision's own contrast, with its approximation stated (invariant
 45).

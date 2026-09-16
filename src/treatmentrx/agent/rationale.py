@@ -401,8 +401,14 @@ class RationaleGenerator:
     def _why_not(self, safe: SafeDecision) -> str:
         """Why the *statistically* ruled-out arms were ruled out — and only those.
 
-        `WHY_NOT_REASONS` is hard-coded clinical prose hung on a model-derived
-        gap, and it used to be printed for the top two runners-up regardless of
+        `WHY_NOT_REASONS` *was* hard-coded clinical prose hung on a model-derived
+        gap — it is gone, and `WhyNotEntry.dominant_reason` is now that gap's own
+        per-covariate decomposition (invariant 57). The filtering below is what
+        survives of two earlier fixes, and both still matter, because deciding
+        *which* arms may be explained at all is a separate question from whether
+        the explanation is the model's.
+
+        It used to be printed for the top two runners-up regardless of
         whether the model could actually separate them. Beside the candidate set
         that produced a flat contradiction: the card said "cannot separate: IL-6,
         rituximab, methotrexate" and then, two lines down, "why not rituximab —
@@ -426,9 +432,10 @@ class RationaleGenerator:
         `arm_removed` flag for every arm it removes, so each one is already named
         on this card with the reason that actually applies.
 
-        Restricting it this way also makes the prose honest about its own role:
-        these arms were excluded *statistically*, and the sentence attached is
-        colour, not the reason.
+        Restricting it this way also keeps the block honest about its own scope:
+        these arms were excluded *statistically*, so the decomposition attached
+        is why the model ranked them below the leader — not a clinical argument
+        against them, and not a safety finding, which is a different block.
         """
         decision = safe.decision
         entries = decision.explanation.why_not if decision.explanation else []
