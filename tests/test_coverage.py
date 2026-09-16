@@ -771,9 +771,31 @@ class AuditHarnessTests(unittest.TestCase):
         self.assertGreaterEqual(metrics["labelled_removals_expected"], 12)
 
     def test_explanations_decompose_the_model_exactly(self):
+        """The faithfulness figure is the round-trip against the fitted model.
+
+        This used to read `attribution_sums_to_advantage`, which compared the
+        reported total against its own parts — both rounded to 4dp, so an
+        identity that measured 5.6e-17. The identity is still reported, and
+        still asserted below, but as the wiring check it is.
+        """
         metrics = audit_explanation(n=10).metrics
-        self.assertEqual(metrics["attribution_sums_to_advantage"], 1.0)
-        self.assertEqual(metrics["phi_leaks_into_narrative"], 0)
+        self.assertEqual(metrics["attribution_parts_sum_to_total"]["rate"], 1.0)
+
+        faithful = metrics["attribution_matches_its_source_model"]
+        self.assertGreater(faithful["patients"], 0)
+        self.assertEqual(faithful["rate"], 1.0)
+        self.assertTrue(faithful["sources"], "the card must name the model it decomposed")
+
+        phi = metrics["phi_leaks_into_narrative"]
+        self.assertEqual(phi["leaks"], 0)
+        self.assertGreater(
+            phi["cards_carrying_episodic_text"],
+            0,
+            "the guard is being scored where its channel does not run",
+        )
+        # `leaks` is counted over the fixture card too, so the denominator has
+        # to cover it — and it must not be only the fixture.
+        self.assertGreater(phi["cards_scanned"], phi["cards_carrying_episodic_text"])
         self.assertFalse(metrics["memory_changed_q_values"])
         self.assertTrue(metrics["memory_changed_narrative"])
 

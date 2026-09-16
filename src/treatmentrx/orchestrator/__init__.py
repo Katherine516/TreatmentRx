@@ -223,6 +223,9 @@ class TreatmentRxOrchestrator:
             "top_scored_arm": recommendation.top_scored_arm,
             "q_values": decision.q_values,
             "model_weights": decision.model_weights,
+            # Which member's blip the explanation decomposes. The q_values are
+            # averaged and psi is not, so the audit trail has to say which.
+            "attribution_source": decision.selected.coefficients.get("attribution_source"),
             "confidence_band": list(decision.selected.confidence_band),
             "confidence_gap": decision.confidence_gap,
             "contrast": decision.contrast.as_dict() if decision.contrast else None,

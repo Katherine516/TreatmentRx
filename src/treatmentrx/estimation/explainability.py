@@ -52,6 +52,7 @@ class ModelExplainer:
         candidates: list[RegimeEstimate],
         stages: list[StageRecord],
         contrast=None,
+        arm_contrasts=None,
     ) -> ExplanationBundle:
         """`contrast` is the decision's own top-two interval, passed in.
 
@@ -60,10 +61,14 @@ class ModelExplainer:
         from the interval itself, where a number beside the decision described
         something the decision did not use. The caller already has the contrast
         when it calls this; there was never a reason to reconstruct a worse one.
+
+        `arm_contrasts` is the same argument for the why-not table: the decision
+        layer already holds a model-averaged interval for the leader against
+        *every* arm, because that is what the candidate set is built from.
         """
         return ExplanationBundle(
             attributions=self._attributions(selected, stages),
-            why_not=self._why_not(selected),
+            why_not=self._why_not(selected, arm_contrasts),
             counterfactuals=self._counterfactuals(selected, stages),
             sensitivity=self._sensitivity(contrast),
         )
@@ -96,20 +101,48 @@ class ModelExplainer:
             )
         ]
 
-    def _why_not(self, selected: RegimeEstimate) -> list[WhyNotEntry]:
+    def _why_not(self, selected: RegimeEstimate, arm_contrasts=None) -> list[WhyNotEntry]:
+        """How far behind each non-recommended arm is, on the decision's scale.
+
+        The gap was `q_values[best] - q_values[action]`, and `q_values` is a
+        **display** quantity — clamped to `[Q_FLOOR, Q_CEILING]` and rounded to
+        three decimals, both many-to-one. That is invariant 46's defect in a
+        fifth place, and the card is where it showed: for a patient whose
+        predicted response saturates the ceiling, three arms collapse to 0.99
+        and the card printed "TNF-inhibitor (gap 0.000)" one line under
+        "Separation: methotrexate-optimization over TNF-inhibitor is +0.051 —
+        separable at this sample size". Measured over 120 patients, 4 printed a
+        gap of exactly 0.000 under a separable verdict and 29 disagreed with the
+        separation line by any amount, by up to 0.065.
+
+        `arm_contrasts` is the decision layer's own model-averaged contrast of
+        the leader against each arm — the same quantity the separation line
+        reports, so for the runner-up the two now agree by construction rather
+        than by luck. The fallback is the old difference, for callers that build
+        an estimate without a decision behind it.
+
+        Ordered by that gap rather than by the display value: the renderer shows
+        the first two, and "the two closest arms the model ruled out" has to be
+        decided by the number it prints.
+        """
+        arm_contrasts = arm_contrasts or {}
         best = selected.q_values[selected.recommended_arm]
-        entries: list[WhyNotEntry] = []
-        for action, value in sorted(selected.q_values.items(), key=lambda kv: kv[1], reverse=True):
+        gaps: list[tuple[float, str]] = []
+        for action, value in selected.q_values.items():
             if action == selected.recommended_arm:
                 continue
-            entries.append(
-                WhyNotEntry(
-                    action=action,
-                    q_gap=round(best - value, 3),
-                    dominant_reason=WHY_NOT_REASONS.get(action, "lower estimated Q-value in this stage context"),
-                )
+            test = arm_contrasts.get(action)
+            gaps.append((test.difference if test is not None else best - value, action))
+        return [
+            WhyNotEntry(
+                action=action,
+                q_gap=round(gap, 3),
+                dominant_reason=WHY_NOT_REASONS.get(
+                    action, "lower estimated Q-value in this stage context"
+                ),
             )
-        return entries
+            for gap, action in sorted(gaps)
+        ]
 
     def _counterfactuals(self, selected: RegimeEstimate, stages: list[StageRecord]) -> list[CounterfactualProbe]:
         latest = stages[-1]

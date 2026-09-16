@@ -167,9 +167,19 @@ class ContrastTests(unittest.TestCase):
             for name, value in selected.coefficients.items()
             if name.startswith("bma_weight:")
         }
-        chosen = layer._contrast(state, selected, weights)
+        # The pair is no longer built here: `_candidate_set` computes the
+        # leader's interval against every arm and `_contrast` takes the nearest.
+        _, arm_contrasts = layer._candidate_set(state, selected, weights)
+        chosen = layer._contrast(arm_contrasts)
+        self.assertEqual(
+            chosen.difference,
+            min(test.difference for test in arm_contrasts.values()),
+            "the comparator must be the closest arm, not whichever sorted first",
+        )
         components = [
-            estimator.contrast(state.stages, chosen.arm, chosen.comparator)
+            estimator.contrast(
+                state.stages, chosen.arm, chosen.comparator, chosen.alpha
+            )
             for estimator in layer.estimators
         ]
 

@@ -7,6 +7,10 @@ holding: `CLAUDE.md` was updated after the dWOLS cross-arm covariance was kept a
 coverage 95% against 98%, abstention 67% against 78%, transfer 57-89% against
 70-95% — and ten source docstrings still carried the pre-fix figures.
 
+The abstention rate has since moved again (invariant 55), which is why the check
+below compares the served card against the prose rather than against a literal:
+a figure pinned in four places is four places to forget.
+
 Most of those numbers are Monte Carlo outputs and cannot be asserted in a fast
 test. These are the ones that can: the command list, the test count, and the
 constants the prose quotes by value.
@@ -132,9 +136,34 @@ class StaleFigureTests(unittest.TestCase):
         from treatmentrx.service import RecommendationService
 
         card = RecommendationService().model_card()
-        rendered = repr(card)
-        self.assertIn("0.67", rendered)
-        self.assertNotIn("0.78,", rendered)
+        self.assertNotIn("0.78,", repr(card))
+
+    def test_the_model_card_and_the_docs_quote_the_same_abstention(self):
+        """The motivating bug was two documents disagreeing, so assert agreement
+        rather than a value.
+
+        Pinning the literal here is what this test used to do, and it made the
+        rate a number to remember in four places instead of one. The rate is a
+        Monte Carlo output and moves whenever the decision rule does; what must
+        never drift is the served card disagreeing with the prose beside it.
+        """
+        from treatmentrx.service import RecommendationService
+
+        served = RecommendationService().model_card()["known_limitations"][
+            "abstention"
+        ]["pooled_rate"]
+        self.assertIsInstance(served, float)
+        for document in (CLAUDE_MD, README):
+            quoted = re.search(r"abstains on ~(\d+)% of patients", document.read_text())
+            with self.subTest(document=document.name):
+                self.assertIsNotNone(
+                    quoted, f"{document.name} no longer quotes an abstention rate"
+                )
+                self.assertEqual(
+                    int(quoted.group(1)),
+                    round(served * 100),
+                    f"{document.name} and the served model card disagree",
+                )
 
     def test_the_readme_quotes_the_current_abstention_rate(self):
         text = README.read_text()

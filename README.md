@@ -604,16 +604,16 @@ refit at each training size:
 
 | train n | abstains | mean contrast SE | mean \|contrast\| | mean z |
 | --- | --- | --- | --- | --- |
-| 98 | 80% | 0.0261 | 0.045 | 1.73 |
-| 196 | 86% | 0.0200 | 0.037 | 1.87 |
-| **280 (deployed)** | **67%** | 0.0174 | 0.040 | 2.29 |
-| 560 | 40% | 0.0124 | 0.044 | 3.54 |
-| 1120 | 33% | 0.0092 | 0.045 | 4.86 |
+| 98 | 79% | 0.0260 | 0.045 | 1.73 |
+| 196 | 85% | 0.0200 | 0.037 | 1.86 |
+| **280 (deployed)** | **66%** | 0.0174 | 0.039 | 2.27 |
+| 560 | 40% | 0.0124 | 0.044 | 3.53 |
+| 1120 | 33% | 0.0092 | 0.044 | 4.84 |
 
 The contrast itself is flat across the sweep — the effect is not changing, the
 precision is. The standard error shrinks at **n^-0.43** against the n^-0.50 a
 correctly specified estimator earns. With simultaneous all-pairs inference, the
-current extrapolated estimate is about **1,490 training trajectories** to bring
+current extrapolated estimate is about **1,430 training trajectories** to bring
 abstention to 30%.
 
 The n=196 row sitting *above* n=98 is not a reversal of the trend — it is the
@@ -851,7 +851,7 @@ Two questions, two names, both carrying `patients`:
 
 | | n | oracle-arm rate | mean regret | max regret |
 | --- | --- | --- | --- | --- |
-| `when_it_commits` | 35 | 1.000 | 0.0000 | 0.0000 |
+| `when_it_commits` | 41 | 1.000 | 0.0000 | 0.0000 |
 | `if_forced_to_commit` | 120 | **0.9250** | **0.0003** | **0.0101** |
 
 Those numbers improved when the leader stopped being chosen by a display
@@ -889,7 +889,7 @@ to choose within, and both halves of that show up here.
 ### What the agent says when it will not recommend
 
 The most consequential measured fact about this agent is that it declines to name
-one arm for **most** patients it sees — 67% at the training population, 57–89%
+one arm for **most** patients it sees — 66% at the training population, 54–89%
 across the sites above, 97% for seronegative patients. That abstention is earned
 (`cli subgroups` checks it stratum by stratum). But until recently it produced a
 status and a paragraph, and the clinician, who still has to prescribe something,
@@ -946,10 +946,12 @@ quietly collapse the set toward a single arm and call it an improvement. An arm
 inside the set has not been recommended.
 
 It also caught a contradiction on the card. `WHY_NOT_REASONS` is hard-coded
-clinical prose hung on a model-derived Q-gap, and it was printed for the top two
+clinical prose hung on a model-derived gap, and it was printed for the top two
 runners-up regardless of whether the model could separate them — so the card said
 *"cannot separate these four"* and then explained why two of them were wrong.
-It now reports only arms outside the set.
+It now reports only arms outside the set, and outside what the safety layer
+removed — see *[The card blocks that did not know the set could be
+non-empty](#the-card-blocks-that-did-not-know-the-set-could-be-non-empty)*.
 
 ### When a contraindication lands on an arm nobody recommended
 
@@ -1009,14 +1011,14 @@ change, which is the shift a real deployment meets.
 
 | site | abstains | coverage | SE/spread | ECE | IPW | local practice | rollout gain |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| baseline (same process) | 68% | 97% | 1.11 | 0.004 | 0.734 | 0.639 | +0.386 |
+| baseline (same process) | 67% | 97% | 1.11 | 0.004 | 0.734 | 0.639 | +0.386 |
 | sicker, more seronegative | **89%** | 95% | 1.04 | 0.004 | 0.600 | 0.527 | +0.372 |
-| milder, mostly seropositive | **57%** | 96% | 1.03 | 0.003 | 0.846 | 0.753 | +0.437 |
-| TNF-first, rituximab-averse | 65% | 95% | 1.04 | 0.004 | 0.726 | 0.647 | +0.386 |
-| heavy attrition | 75% | 97% | 1.10 | 0.005 | 0.748 | 0.669 | +0.469 |
+| milder, mostly seropositive | **54%** | 96% | 1.03 | 0.003 | 0.846 | 0.753 | +0.437 |
+| TNF-first, rituximab-averse | 63% | 95% | 1.04 | 0.004 | 0.726 | 0.647 | +0.386 |
+| heavy attrition | 73% | 97% | 1.10 | 0.005 | 0.748 | 0.669 | +0.469 |
 | near-complete follow-up | 74% | 95% | 0.99 | 0.006 | 0.720 | 0.621 | +0.395 |
 | combined: all three | 84% | 95% | 1.08 | 0.002 | 0.617 | 0.555 | +0.346 |
-| **estimand shifted: blips 1.5×** | 70% | — | — | **0.051** | 0.824 | 0.695 | +0.538 |
+| **estimand shifted: blips 1.5×** | 69% | — | — | **0.051** | 0.824 | 0.695 | +0.538 |
 
 **Three of the four headline claims transfer.** The policy beats local practice
 at 7/7 estimand-preserving sites (+0.346 to +0.469) — including the site where
@@ -1069,7 +1071,7 @@ loopback and warns if told not to — an unauthenticated decision-support endpoi
 on `0.0.0.0` is a different class of mistake from a wrong standard error.
 
 `GET /model` is the route that matters. A consumer holding one `equipoise`
-response cannot see that the agent abstains on ~67% of patients by
+response cannot see that the agent abstains on ~66% of patients by
 design, so the card says it, alongside the measured interval coverage, the four
 confounders nothing adjusts for, that six covariates reach the estimators at all,
 that there is no held-back final test partition, and that the selection between
@@ -1130,7 +1132,7 @@ agent deploys. For the **regime's own** value no split works: 5.4 to 7.5 against
 a threshold of 30, so the confirmation would itself be unidentified. Keeping
 today's evaluation precision *and* adding an identified final test needs roughly
 **565** trajectories for the per-decision value and **1,258** for the regime's —
-against 400 today, and alongside `cli power`'s 1,490 for 30% abstention. Two
+against 400 today, and alongside `cli power`'s 1,430 for 30% abstention. Two
 different questions, the same answer about this cohort.
 
 What it is not is production infrastructure: single-process, no TLS, no auth.
@@ -1210,11 +1212,139 @@ model card reports as unadjusted residual confounding, so a spurious entry claim
 a failure that never happened. It now covers and then **prunes**, which is what
 irreducible means.
 
+**The leader was being re-derived from a display quantity in a fourth place.**
+Three were fixed earlier; `GoalConditionedThresholds.decide` was missed. It
+sorted `q_values` — clamped and rounded for display — and took the top-two
+difference, so **every one of the nine patients whose response saturated the
+ceiling had a Q-gap of exactly 0.0000**: arms the model distinguishes, printed on
+the card as identical and failing the care-goal bar for an arithmetic reason. The
+decision layer now builds the contrast first and hands the bar its own
+difference, which also makes the two halves of the equipoise rule read one number
+instead of two.
+
+This one moves the rate, so the check matters: abstention fell 71% → 66% on the
+audit fixture, and **all six recovered commitments are the oracle-optimal arm at
+zero regret** (`when_it_commits` 35 → 41 patients, rate still 1.000, max regret
+still 0.0000). The gap between the recommended and declined groups narrows from
+3.2× to 2.6× while staying clearly separated — recovering suppressed decisions,
+not lowering a bar.
+
+### The card blocks that did not know the set could be non-empty
+
+Found the way the blocked card was — rendering all four statuses side by side
+rather than reading the code.
+
+Status is decided on the top-two contrast alone, so a *lower-scoring* arm with a
+wider interval can survive the candidate set's exclusion test while the runner-up
+fails it. **6 of 120 patients** were recommended with a two-arm set, and their
+cards read *"recommend methotrexate-optimization"* in the headline and, four
+paragraphs down, *"Cannot separate: methotrexate-optimization, rituximab … **This
+is not a recommendation**"*.
+
+The information is right and only the framing was wrong, which the oracle
+settles: on all four of the clearest cases the leader and the surviving arm have
+a **true value of 1.0000 each** — genuinely tied at the optimum — while the
+comparator the separation line names is worth 0.96–0.99. So the block is
+re-worded per status as `Not excluded:` rather than suppressed; hiding it would
+make the card more confident than the evidence. The rate does not move: 41
+commit / 79 decline, every `cli audit` decision metric unchanged.
+
+### The arm the recommendation was justified against
+
+The residue of the block above, and the last place the clamped display dict
+reached a clinical output. The comparator came from `_ranked()[1]` — the argmax
+over the *clamped, rounded* non-leader `q_values` — so on a patient with three
+arms at the 0.99 ceiling, **dictionary order chose the arm the recommendation was
+justified against**. Five of 120 had a tied comparator; for four of them the arm
+dictionary order picked was separable (+0.051) while the genuinely closest arm
+was not (+0.018).
+
+It is now the minimum of the contrasts the candidate set already computes — and
+the pair is not built here at all, since computing the runner-up's interval twice
+was how the separation line and the set could disagree about the same arms.
+
+**It moves the rate, and every check says the right way:**
+
+| | before | after |
+| --- | --- | --- |
+| status distribution | 41 / 79 | **37 / 83** |
+| oracle-arm rate when it commits | 1.000 | 1.000 |
+| max regret when it commits | 0.0000 | 0.0000 |
+| `if_forced_to_commit` (the ranking) | 0.925 / 0.0003 / 0.0101 | unchanged |
+| true gap, recommended | 0.0700 | **0.0775** |
+| true gap, declined | 0.0273 | **0.0260** |
+
+The separation between the two groups widens from 2.56× to 2.98×, and the four
+patients it now declines are the ones whose alternative is **truly tied at the
+optimum** — both arms worth 1.0000 — so abstaining costs no regret and the set
+handed back holds two optimal arms. The ranking does not move a digit, so this is
+recommending less often about larger gaps, not ranking differently.
+
+It does *not* make a recommendation mean "separated from every arm": the smallest
+difference is not the smallest z, and 3 of 71 recommendations still carry an arm
+that is further away but less precisely estimated. That is what `Not excluded:`
+reports.
+
+### A number attributed to "the model", under a line naming two
+
+`q_values` are averaged and psi is not — it cannot be, since dWOLS's is a
+single-visit blip and Q-Pooled's a stage psi from a value-to-go fit. So the
+ensemble carries the **dominant member's** coefficients, and the card renders
+that decomposition directly under "model-averaged over 2 estimators (weights
+Q-Pooled 0.50, dWOLS-Shared 0.50)". Which member is dominant turns on a weight
+margin of **0.003**, while the two members' blips for the same patient differ by
+up to **0.041** — the size of the contrast the decision reports.
+
+The scales forbid averaging it, so it is recorded and named instead:
+*"+0.244 (dWOLS-Shared's blip, not the ensemble average)"*.
+
+That is also what Layer 5's audit should have been measuring. It read 1.0 / 0.0 /
+0 on every metric and two of the three could not have read anything else. The
+attribution check tested its own arithmetic — both sides rounded to 4dp, residual
+**5.6e-17** — and is now labelled a wiring check, with the real round-trip
+against the fitted model asked separately; that one discriminates **261×**,
+0.000158 against the member it names and 0.041182 against the other.
+
+And the PHI guard scanned 30 cards for the patient hash while the only sections
+carrying patient free text were empty for all of them, because they are fed from
+episodic memory and the loop scores fresh patients — **0 of 30**, now measured
+and printed rather than argued. The guard works: record one episodic item whose
+text carries the hash and it fires. Three things make that a fix rather than the
+look of one. There are **two** free-text routes, not one — `preference` renders
+under *Recorded patient preferences:* and `outcome_summary` is interpolated into
+*Continuity:*, while `override_reason` is stored and never rendered — and the
+fixture fills both, so a route that stops rendering drops the denominator and
+fails a test instead of quietly halving the scan. `cards_scanned` counts the
+fixture card, because `leaks` is summed over it; a count and a denominator taken
+over different populations is the defect being fixed, one level in. And the
+identity's residual was printed as `round(…, 12)`, which renders 5.6e-17 as an
+exact **0.0** — an identity the arithmetic does not have, and the one magnitude
+that shows the check is a wiring check.
+
+The obvious suspect turned out to be innocent, which is worth recording:
+`history_summary` does **not** reach the card. Layer 1 builds it from the stage
+list and it reaches Layer 5 through `provenance`, but its only consumer is the
+retrieval query — the card renders `care_goal` and `top_tailoring_vars` from the
+patient context and nothing else.
+
+Two more blocks from the same pass. `WhyNotEntry.q_gap` was a difference of
+clamped display values — the fifth place the leader's scale was re-derived — and
+printed *"TNF-inhibitor (gap 0.000)"* one line under *"Separation: … over
+TNF-inhibitor is +0.051 — separable at this sample size"*: 4 of 120 exactly
+0.000 under a separable verdict, 29 disagreeing by up to 0.065. The decision
+layer already holds a model-averaged interval against every arm, so it is handed
+over and the two now agree by construction. And `_why_not` filtered on the
+candidate set alone, so an arm **the safety layer removed** still collected a
+model reason — *"why not JAK-inhibitor — organ-function / safety profile reduces
+net benefit"* for an arm the same card reports as contraindicated in pregnancy,
+on 79 of 240 cards.
+
 **Deliberately simple, and labelled as such in-module:**
 `HandcraftedFeatureEncoder` (nine clinical features normalised and tiled — not a
 learned representation, and it does not claim to be),
 `SemanticKnowledgeBase` (five hard-coded passages, not a real RAG index), and
-`WHY_NOT_REASONS` (hard-coded clinical prose on a model-derived Q-gap).
+`WHY_NOT_REASONS` (hard-coded clinical prose, now on the decision's own contrast
+rather than a difference of display values).
 
 **The keyword index could not match its own vocabulary.** It split the query on
 whitespace, and the arm names are hyphenated while the knowledge-base keys are

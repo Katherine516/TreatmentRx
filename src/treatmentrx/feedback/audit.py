@@ -28,6 +28,7 @@ from treatmentrx.data import DataContractError, DataLayer
 from treatmentrx.demo_data import sample_ra_bundle
 from treatmentrx.domain import RecommendationStatus
 from treatmentrx.estimation import training
+from treatmentrx.estimation.basis import BLIP_BASIS, blip_basis
 from treatmentrx.estimation.features import model_features, stage_index
 from treatmentrx.orchestrator import TreatmentRxOrchestrator
 from treatmentrx.simulation.fhir_export import simulated_bundles, trajectory_to_bundle
@@ -676,11 +677,49 @@ def _feasible_actions(bundle) -> list[str]:
 # ---------------------------------------------------------------- Layer 5
 
 def audit_explanation(n: int = 30, seed: int = AUDIT_SEED) -> Section:
-    """Do the explanations decompose the model, and does memory stay out?"""
+    """Do the explanations decompose the model, and does memory stay out?
+
+    Every metric here used to sit at its ceiling — 1.0, 0.0, 0 — and two of the
+    three could not have done anything else. That is invariant 49's defect, in
+    the layer whose output a clinician reads.
+
+    *The attribution check tested its own arithmetic.* `_attributions` sets
+    `total = round(sum(contributions.values()), 4)` from contributions that are
+    themselves rounded to 4dp, so `sum(parts) == total` is an identity: measured,
+    the residual is **5.6e-17**, which is float noise and not evidence. It is
+    kept — a rounding change would break it and that is worth catching — but it
+    is labelled a wiring check, and the question it was standing in for is now
+    asked separately: does the decomposition match the *fitted model* it claims
+    to come from? That is a real round-trip, and it discriminates: against the
+    serving member it names, the residual is **1.6e-4** (the 4dp rounding);
+    against the other serving member it is **0.041**.
+
+    *The PHI check was measured where the channel it guards does not run.* It
+    scans the card for the patient hash, and the card carries patient free text
+    in exactly two places, both fed from episodic memory: `preference` renders
+    under `Recorded patient preferences:`, and `outcome_summary` is interpolated
+    into `Continuity:`. Memory is empty for the fresh simulated patients this
+    loop scores, so **0 of 30** cards could hold what the guard looked for. That
+    zero is measured and reported rather than left implicit — invariant 49
+    reports its dead seams the same way — and the guard is additionally scored on
+    a card built to carry *both* routes, so a route that stops rendering shows up
+    as a falling denominator rather than as a quietly narrower scan.
+
+    *What does not reach the card is `history_summary`*, which is the obvious
+    suspect and worth naming as a negative. Layer 1 builds it from the stage
+    list, it reaches Layer 5 through `provenance`, and the only thing that reads
+    it is the retrieval query. The card renders `care_goal` and
+    `top_tailoring_vars` from the patient context and nothing else. It *is*
+    returned in the served provenance block, which is a different question from
+    this one: that block is addressed to the caller who supplied the record.
+    """
     orchestrator = TreatmentRxOrchestrator()
     faithful = checked = 0
     worst_residual = 0.0
-    leaked = 0
+    matched_source = source_checked = 0
+    worst_source_residual = 0.0
+    sources: set[str] = set()
+    leaked = scanned = carrying = 0
 
     for bundle in simulated_bundles(n, seed=seed):
         try:
@@ -697,8 +736,22 @@ def audit_explanation(n: int = 30, seed: int = AUDIT_SEED) -> Section:
         worst_residual = max(worst_residual, residual)
         if residual < 1e-6:
             faithful += 1
-        rendered = f"{recommendation.clinician_card}{recommendation.patient_summary}"
-        if "sim-" in rendered or recommendation.patient_hash in rendered:
+
+        source, model_residual = _attribution_against_its_model(bundle, recommendation)
+        if source is not None:
+            sources.add(source)
+            source_checked += 1
+            worst_source_residual = max(worst_source_residual, model_residual)
+            # 4dp rounding on every published coefficient sets the floor.
+            matched_source += model_residual < 1e-3
+
+        scanned += 1
+        # Measured rather than asserted in prose: this is the denominator the
+        # guard could actually have failed on, and for a patient with no
+        # recorded history it is zero.
+        if _episodic_sections(recommendation.clinician_card):
+            carrying += 1
+        if _identifiers_in_narrative(recommendation):
             leaked += 1
 
     # Memory must not be able to move a statistical quantity, by assertion.
@@ -706,11 +759,42 @@ def audit_explanation(n: int = 30, seed: int = AUDIT_SEED) -> Section:
     orchestrator.submit_override(first, "JAK-inhibitor", "local protocol prefers JAK")
     second = orchestrator.run(sample_ra_bundle())
 
+    # The PHI scan, on a card that actually carries the narrative channel. The
+    # preference is free text a clinician typed, which is the only place on this
+    # card an identifier could realistically arrive.
+    with_memory, memory_leaked = _narrative_with_memory()
+
     section = Section("5 agent")
     section.metrics = {
-        "attribution_sums_to_advantage": _rate(faithful, checked),
-        "worst_attribution_residual": round(worst_residual, 9),
-        "phi_leaks_into_narrative": leaked,
+        "attribution_parts_sum_to_total": {
+            "rate": _rate(faithful, checked),
+            # Significant digits, not decimal places. The residual is float
+            # noise at 5.6e-17 and `round(x, 12)` renders that as an exact 0.0,
+            # which asserts an identity the arithmetic does not have and hides
+            # the one magnitude that shows this is a wiring check.
+            "worst_residual": float(f"{worst_residual:.3g}"),
+            "note": "wiring check, not an accuracy figure: both sides are rounded to 4dp",
+        },
+        "attribution_matches_its_source_model": {
+            "patients": source_checked,
+            "rate": _rate(matched_source, source_checked),
+            "worst_residual": round(worst_source_residual, 6),
+            "sources": sorted(sources),
+        },
+        "phi_leaks_into_narrative": {
+            # `leaks` is counted over every card scanned, the fixture included,
+            # so the denominator has to say so — reporting the cohort loop alone
+            # beside a count taken over one more card is invariant 36 inside the
+            # fix for it.
+            "cards_scanned": scanned + with_memory,
+            "cards_carrying_episodic_text": carrying + with_memory,
+            "leaks": leaked + memory_leaked,
+            "note": (
+                f"{carrying} of {scanned} cohort cards carry an episodic section: "
+                "the channel is empty for a patient with no recorded history, so "
+                f"the guard is also scored on {with_memory} card built to carry it."
+            ),
+        },
         "memory_changed_recommendation": second.recommended_arm != first.recommended_arm,
         "memory_changed_q_values": second.q_values != first.q_values,
         "memory_changed_narrative": second.clinician_card != first.clinician_card,
@@ -719,7 +803,112 @@ def audit_explanation(n: int = 30, seed: int = AUDIT_SEED) -> Section:
         "Memory is expected to change the narrative and nothing else; that asymmetry "
         "is the whole boundary."
     )
+    section.notes.append(
+        "`attribution_matches_its_source_model` is the faithfulness figure. psi cannot "
+        "be averaged across members that parameterise it differently, so the card "
+        "decomposes one member's blip and names it; `sources` is which. On the "
+        "deployed fit that choice turns on a BMA weight margin of 0.003 while the two "
+        "members' blips differ by up to 0.041 for the same patient."
+    )
     return section
+
+
+def _attribution_against_its_model(bundle, recommendation) -> tuple[str | None, float]:
+    """Recompute psi . h(X) from the fitted model the estimate names.
+
+    Independent of the coefficients the estimate carries, which is the point: the
+    identity check reads those back to themselves.
+    """
+    source = (recommendation.audit_event or {}).get("attribution_source")
+    if not source:
+        return None, 0.0
+    attribution = recommendation.explanation.attributions[0]
+    fit = training.fitted()
+    state = DataLayer().build_patient_state(bundle)
+    features = model_features(state.stages)
+    basis = dict(zip(BLIP_BASIS, blip_basis(features)))
+    if source == training.Q_POOLED:
+        psi = fit.pooled.blip_parameters(
+            attribution.action, stage_index(state.stages, fit.pooled.n_stages)
+        )
+    elif source == training.DWOLS_SHARED:
+        psi = fit.dwols.blip_parameters(attribution.action)
+    else:
+        return None, 0.0
+    value = sum(psi[name] * basis[name] for name in BLIP_BASIS if name in psi)
+    return source, abs(value - attribution.total_advantage)
+
+
+def _identifiers_in_narrative(recommendation) -> bool:
+    rendered = f"{recommendation.clinician_card}{recommendation.patient_summary}"
+    return "sim-" in rendered or recommendation.patient_hash in rendered
+
+
+#: The card sections fed from episodic memory. Everything else on the card is a
+#: number, an arm name, or fixed prose, so these are the only place a string a
+#: human typed about this patient can arrive.
+_EPISODIC_SECTIONS = ("Continuity:", "Recorded patient preferences:")
+
+#: One benign string per free-text route, so a route that stops rendering is
+#: visible rather than masked by the other. Benign on purpose: the question is
+#: whether the *renderer* introduces an identifier, not whether a string handed
+#: to it round-trips.
+_FIXTURE_PREFERENCE = "prefers an oral route"
+_FIXTURE_OUTCOME = "partial response by week 12, no infusion reactions"
+
+
+def _episodic_sections(card: str) -> list[str]:
+    """The card's episodic sections, which is the denominator the guard needs."""
+    return [
+        section
+        for section in card.split("\n\n")
+        if section.startswith(_EPISODIC_SECTIONS)
+    ]
+
+
+def _narrative_with_memory() -> tuple[int, int]:
+    """Score the PHI guard on a card that carries the sections it guards.
+
+    Returns (cards carrying episodic text, leaks among them).
+
+    Its own orchestrator, deliberately. The caller has already recorded an
+    override against this same patient hash, so sharing one would measure that
+    memory rather than this item — and clearing up afterwards would delete the
+    override the caller's own metrics were computed from.
+
+    The item fills **both** free-text fields that reach the card — `preference`
+    renders under `Recorded patient preferences:` and `outcome_summary` is
+    interpolated into `Continuity:` — because those are the two routes and a
+    fixture exercising one leaves the other unscanned. `override_reason` is
+    stored and never rendered, so it is not a route.
+
+    If either stops rendering this returns 0 and the test asserting the guard is
+    scored where its channel runs fails, which is the point: the alternative is a
+    fixture that silently narrows to half the surface it claims to cover.
+    """
+    from treatmentrx.agent.memory import EpisodicItem
+
+    orchestrator = TreatmentRxOrchestrator()
+    bundle = sample_ra_bundle()
+    recommendation = orchestrator.run(bundle)
+    orchestrator.agent.memory.record(
+        recommendation.patient_hash,
+        EpisodicItem(
+            stage=1,
+            recommended_arm="TNF-inhibitor",
+            clinician_action="TNF-inhibitor",
+            override_reason=None,
+            outcome_summary=_FIXTURE_OUTCOME,
+            preference=_FIXTURE_PREFERENCE,
+        ),
+    )
+    rendered = orchestrator.run(bundle)
+    card = rendered.clinician_card
+    if not _episodic_sections(card):
+        return 0, 0
+    if _FIXTURE_PREFERENCE not in card or _FIXTURE_OUTCOME not in card:
+        return 0, 0
+    return 1, int(_identifiers_in_narrative(rendered))
 
 
 # ---------------------------------------------------------------- Layer 6

@@ -39,14 +39,14 @@ class RationaleGenerator:
                 f"Model: {decision.selected.estimator} under a {decision.selected.regime_type.value} regime, "
                 f"model-averaged over {len(decision.estimates)} estimators "
                 f"(weights {self._weights(decision.model_weights)}). "
-                f"Q-gap over the next-best arm is {decision.confidence_gap:.3f}, against a "
+                f"Gap over the nearest arm is {decision.confidence_gap:.3f}, against a "
                 f"{decision.goal_decision.threshold:.2f} bar for this care goal."
             ),
             f"Tailoring drivers: {drivers}.",
             self._separation(decision),
             self._candidate_set(safe),
             self._basis_caveat(decision),
-            self._why_not(decision),
+            self._why_not(safe),
             self._attribution(safe),
             safety_text,
             f"Evidence: {guideline_text}",
@@ -119,15 +119,21 @@ class RationaleGenerator:
                 "outside the patient patterns on which the model was evaluated. The care "
                 "team should review the case without relying on the model's ranking."
             )
-        hedge = (
-            " The care team should discuss this carefully, because the options are close."
-            if not safe.decision.goal_decision.act
-            else ""
-        )
+        # Only RECOMMEND reaches here — EQUIPOISE and REVIEW returned above, and
+        # BLOCKED never calls this method (`AgentLayer.run_agents` branches on
+        # `hard_block` first). This used to append " ...because the options are
+        # close" when `goal_decision.act` was False, and that cannot happen:
+        # `DecisionLayer._status` returns RECOMMEND only after `act` is True, so
+        # the branch was unreachable by construction and measured 41/41 on the
+        # audit cohort. It is removed rather than rewired. The 51 patients who
+        # clear the care-goal bar but fail the interval condition are exactly the
+        # ones for whom "the options are close" is true, and they are already
+        # sent to the EQUIPOISE summary, which says it. A hedge that can only
+        # fire where it is wrong is invariant 25 in patient-facing prose.
         return (
             f"The care team may consider {arm}. This suggestion comes from your recent treatment "
             f"history and disease activity pattern, and it is a starting point for a conversation, "
-            f"not a decision on its own.{hedge} At the next visit the team should check symptoms, "
+            "not a decision on its own. At the next visit the team should check symptoms, "
             "lab response, side effects, and whether the plan still fits your goals."
         )
 
@@ -140,7 +146,12 @@ class RationaleGenerator:
         )
 
     def _separation(self, decision) -> str:
-        """State whether the data can actually resolve the top two arms.
+        """State whether the data can actually resolve the leader and its nearest arm.
+
+        *Nearest by estimated contrast*, not by the display `q_values` — see
+        `DecisionLayer._contrast`. It is not in general the second-highest-scoring
+        arm, and it is not in general the least separable one either; the
+        candidate set covers every arm and `_not_excluded` reports the gap.
 
         The verdict reads `robustly_distinguishable`, the same property the
         decision layer used. Reading `distinguishable` here instead let the card
@@ -211,6 +222,16 @@ class RationaleGenerator:
         separation = self._separation(decision)
         if separation:
             sections.append(separation)
+        # The caveat travels with the line it undercuts. `blocked_card` carried
+        # the separation interval and not the warning that the interval may be
+        # centred on the wrong quantity, so the one reader who is by definition a
+        # person got the number without its qualifier. It cannot fire on this
+        # build — `deployment_readiness()["blip_basis_unflagged"]` is True and
+        # `das28_squared` tests at 3.367 against a 3.669 threshold — so this is a
+        # latent gap closed by inspection, not a measured one.
+        caveat = self._basis_caveat(decision)
+        if caveat:
+            sections.append(caveat)
 
         sections.append(
             f"Uncertainty: {self.uncertainty_text(decision.uncertainty)}"
@@ -225,13 +246,35 @@ class RationaleGenerator:
         was left choosing from the whole menu. The arms here are the ones the data
         cannot separate from the leader; every other arm has been ruled out by the
         same interval the separation line above reports. Measured over declined
-        patients the set averages 2.5 of 6 arms, and choosing the worst of them
-        rather than the worst of all six cuts worst-case regret by 83%.
+        patients the set averages 2.7 of 6 arms, and choosing the worst of them
+        rather than the worst of all six cuts worst-case regret from 0.206 to
+        0.047, a 77% reduction. (These read 2.5 and 83% until the all-pairs
+        correction widened the set; a wider set is safer to be inside and less
+        decisive to choose within.)
 
         **Filtered by the safety layer, and that is not substitution.** Layer 4
         has already removed infeasible arms; a set printed for a clinician must
         not contain one of them. Nothing is re-ranked and nothing is promoted —
         removals are named, and an arm inside this set has not been recommended.
+
+        **The set is not empty on a recommendation, and the prose used not to
+        know that.** Status is decided on the top-two contrast alone, so a lower-
+        scoring arm with a wider interval can survive the exclusion test while
+        the runner-up fails it: measured over 120 patients, **6 (5%)** were
+        recommended with a two-arm set. Those cards read "recommend
+        methotrexate-optimization" in the headline and, four paragraphs down,
+        "Cannot separate: methotrexate-optimization, rituximab ... This is not a
+        recommendation" — invariant 35's defect, in the block written to fix it.
+
+        The information is right and only the framing was wrong, which the oracle
+        settles: on all four of the clearest cases the leader and the surviving
+        arm have a **true value of 1.0000 each** — genuinely tied at the optimum —
+        while the comparator the separation line names is worth 0.96-0.99. The
+        set is correct, the recommendation is correct (oracle arm, zero regret),
+        and what was missing was a sentence saying how both can hold. So the
+        block is kept and re-worded per status rather than suppressed: hiding it
+        would make the card more confident than the evidence, which is the
+        direction these notes warn about.
         """
         decision = safe.decision
         feasible = set(safe.feasible_arms)
@@ -241,7 +284,9 @@ class RationaleGenerator:
         withheld = [arm for arm in decision.candidate_arms if arm not in feasible]
         excluded = len(decision.q_values) - len(decision.candidate_arms)
 
-        if not candidates:
+        if safe.status is RecommendationStatus.RECOMMEND:
+            body = self._not_excluded(decision, candidates)
+        elif not candidates:
             body = (
                 "Cannot separate: no feasible arm remains. The data could not "
                 f"distinguish {len(decision.candidate_arms)} arms, and the safety "
@@ -273,7 +318,7 @@ class RationaleGenerator:
                 "comorbidity and patient preference rather than on these numbers."
             )
 
-        lines = [body]
+        lines = [body] if body else []
         if withheld:
             lines.append(
                 "Removed from this set by the safety layer: "
@@ -283,6 +328,50 @@ class RationaleGenerator:
                 + "."
             )
         return " ".join(lines)
+
+    @staticmethod
+    def _not_excluded(decision, candidates: list[str]) -> str:
+        """The same set, said in a way a recommendation can carry.
+
+        Two claims, and they are about different pairs. The recommendation rests
+        on the leader separating from the arm named in the separation line —
+        the *nearest* arm by estimated contrast. These arms sit further off on
+        that same estimate and were still not excluded, because their intervals
+        are wider and contain zero: the smallest difference is not the smallest
+        z. Saying so is not a hedge on the recommendation and not an invitation
+        to override it — it is the rest of what the same intervals support, and a
+        clinician who has to weigh route or tolerability is the reader who needs
+        it.
+        """
+        others = [arm for arm in candidates if arm != decision.recommended_arm]
+        if not others:
+            return ""
+        excluded = len(decision.q_values) - len(decision.candidate_arms)
+        # Named when there is one. Without a contrast the decision reached
+        # RECOMMEND on the care-goal bar alone, and there is no pair to name.
+        separated_from = (
+            f"{decision.contrast.comparator}, the nearest arm the data can compare it against"
+            if decision.contrast
+            else "the nearest arm the data can compare it against"
+        )
+        plural = len(others) != 1
+        return (
+            f"Not excluded: {', '.join(others)}. The recommendation above rests on "
+            f"{decision.recommended_arm} separating from {separated_from}. "
+            f"{'These arms sit' if plural else 'This arm sits'} further off on that "
+            f"same estimate, but with a wider interval: "
+            f"{'their' if plural else 'its'} own interval against "
+            f"{decision.recommended_arm} contains zero, so the data does not rule "
+            f"{'them' if plural else 'it'} out"
+            + (
+                f"; the other {excluded} arm{'s' if excluded != 1 else ''} on the menu "
+                f"{'were' if excluded != 1 else 'was'} excluded."
+                if excluded
+                else "."
+            )
+            + " The recommendation stands on the comparison reported above — this is "
+            "the rest of what the data leaves open, not a competing suggestion."
+        )
 
     def _basis_caveat(self, decision) -> str:
         """Say it on the card when the model's own basis is in question.
@@ -309,11 +398,11 @@ class RationaleGenerator:
             "difference. Treat the magnitude as indicative until the basis is refit."
         )
 
-    def _why_not(self, decision) -> str:
-        """Why the *ruled-out* arms were ruled out — never one still in contention.
+    def _why_not(self, safe: SafeDecision) -> str:
+        """Why the *statistically* ruled-out arms were ruled out — and only those.
 
         `WHY_NOT_REASONS` is hard-coded clinical prose hung on a model-derived
-        Q-gap, and it used to be printed for the top two runners-up regardless of
+        gap, and it used to be printed for the top two runners-up regardless of
         whether the model could actually separate them. Beside the candidate set
         that produced a flat contradiction: the card said "cannot separate: IL-6,
         rituximab, methotrexate" and then, two lines down, "why not rituximab —
@@ -322,13 +411,30 @@ class RationaleGenerator:
         arm the data cannot exclude is the card asserting a clinical judgement the
         model did not make, which is the one thing this layer must not do.
 
-        Restricting it to arms outside the candidate set also makes the prose
-        honest about its own role: those arms were excluded *statistically*, and
-        the sentence attached is colour, not the reason.
+        **The same defect from the other side: an arm Layer 4 removed.** The
+        filter read the candidate set alone, so a contraindicated arm — excluded
+        by a rule, not by an interval — still collected a model reason. With
+        pregnancy injected, **79 of 240** cards carried one, and the words were
+        the wrong kind of wrong: "why not JAK-inhibitor — organ-function / safety
+        profile reduces net benefit" for an arm the card elsewhere reports as
+        contraindicated in pregnancy, and "why not methotrexate-optimization —
+        csDMARD optimization is lower-yield after prior failure" for another. A
+        contraindicated arm is not an option that lost on merit, and colour prose
+        saying it narrowly lost reads as though it could be reconsidered.
+
+        Nothing is lost by dropping them: the safety layer raises an
+        `arm_removed` flag for every arm it removes, so each one is already named
+        on this card with the reason that actually applies.
+
+        Restricting it this way also makes the prose honest about its own role:
+        these arms were excluded *statistically*, and the sentence attached is
+        colour, not the reason.
         """
+        decision = safe.decision
         entries = decision.explanation.why_not if decision.explanation else []
-        in_contention = set(decision.candidate_arms)
-        ruled_out = [entry for entry in entries if entry.action not in in_contention][:2]
+        # In contention, or removed by a rule rather than by an interval.
+        unexplainable = set(decision.candidate_arms) | set(safe.removed_arms)
+        ruled_out = [entry for entry in entries if entry.action not in unexplainable][:2]
         if not ruled_out:
             return ""
         rendered = "; ".join(
@@ -345,6 +451,16 @@ class RationaleGenerator:
         advocacy for something the patient must not receive, so when that is the
         case the line says so. It is kept rather than dropped because the reviewer
         needs to see *why* the model ranked a contraindicated arm first.
+
+        **It names its model, because this one is not the ensemble.** The line
+        above it says the decision was model-averaged over two estimators, and a
+        reader carries that down the card — but psi cannot be averaged across
+        members that parameterise it differently, so `BayesianModelAverager`
+        carries one member's coefficients and stamps which. Which one turns on a
+        weight margin of 0.003 on the deployed fit, and the two members' blips
+        for the same patient differ by up to 0.041 — the size of the contrast the
+        decision reports. Attributing that to "the model" unqualified is the card
+        claiming an ensemble quantity it does not have.
         """
         decision = safe.decision
         if not decision.explanation or not decision.explanation.attributions:
@@ -353,9 +469,11 @@ class RationaleGenerator:
         if not attribution.contributions:
             return ""
         parts = ", ".join(f"{name} {value:+.3f}" for name, value in attribution.contributions.items())
+        source = decision.selected.coefficients.get("attribution_source")
+        attributed_to = f" ({source}'s blip, not the ensemble average)" if source else ""
         line = (
             f"Estimated advantage of {attribution.action} over continuing current therapy is "
-            f"{attribution.total_advantage:+.3f}, from {parts}."
+            f"{attribution.total_advantage:+.3f}{attributed_to}, from {parts}."
         )
         if attribution.action in safe.removed_arms:
             line += (

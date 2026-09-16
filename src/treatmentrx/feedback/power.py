@@ -246,7 +246,7 @@ def final_test_feasibility(
     identified on the quantity being confirmed.
 
     This is `cli power` asking its own question about a different resource. That
-    study says ~1,490 trajectories buy 30% abstention; this one says a cohort
+    study says ~1,430 trajectories buy 30% abstention; this one says a cohort
     several times the current size is what buys a test set worth locking. Both
     are statements about data rather than method.
     """

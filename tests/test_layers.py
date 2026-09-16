@@ -890,8 +890,606 @@ class KnowledgeRetrievalTests(unittest.TestCase):
         for _ in range(5):
             self.assertEqual(knowledge.retrieve("methotrexate tnf", subject=""), first)
 
+
+class CareGoalGapTests(unittest.TestCase):
+    """The care-goal bar must judge the difference the interval brackets.
+
+    `GoalThresholds.decide` derived its gap from `q_values`, which is clamped to
+    `[Q_FLOOR, Q_CEILING]` and rounded to 3dp. Measured over 120 patients, every
+    one of the nine whose response saturated the ceiling had a top-two gap of
+    exactly 0.0000 — arms the model distinguishes, reported to the clinician as
+    identical and failing the action bar for an arithmetic reason. That is the
+    fourth place the leader was being re-derived from a display quantity.
+    """
+
+    def test_the_clamp_no_longer_collapses_the_gap(self):
+        from treatmentrx.data import DataLayer
+        from treatmentrx.data.contract import DataContractError
+        from treatmentrx.orchestrator import TreatmentRxOrchestrator
+        from treatmentrx.simulation.fhir_export import simulated_bundles
+
+        orchestrator = TreatmentRxOrchestrator()
+        zero_gaps = scored = 0
+        for bundle in simulated_bundles(60, seed=991):
+            try:
+                recommendation = orchestrator.run(bundle)
+            except DataContractError:
+                continue
+            gap = recommendation.audit_event.get("confidence_gap")
+            if gap is None:
+                continue
+            scored += 1
+            zero_gaps += gap == 0.0
+        self.assertGreater(scored, 10)
+        self.assertEqual(
+            zero_gaps, 0, "a clamped q_value is still collapsing the care-goal gap"
+        )
+
+    def test_the_card_reports_the_same_gap(self):
+        """`confidence_gap` is what the clinician card prints as the Q-gap."""
+        from treatmentrx.data import DataLayer
+        from treatmentrx.decision import DecisionLayer
+        from treatmentrx.demo_data import sample_ra_bundle
+        from treatmentrx.estimation import EstimationLayer
+
+        state = DataLayer().build_patient_state(sample_ra_bundle())
+        decision = DecisionLayer().decide(state, EstimationLayer().estimate(state))
+        self.assertAlmostEqual(
+            decision.confidence_gap, decision.goal_decision.observed_gap, places=6
+        )
+
+    def test_the_bar_and_the_interval_read_the_same_number(self):
+        """Invariant 10's two conditions are only comparable if they agree."""
+        from treatmentrx.data import DataLayer
+        from treatmentrx.decision import DecisionLayer
+        from treatmentrx.demo_data import sample_ra_bundle
+        from treatmentrx.estimation import EstimationLayer
+
+        state = DataLayer().build_patient_state(sample_ra_bundle())
+        decision = DecisionLayer().decide(state, EstimationLayer().estimate(state))
+        self.assertIsNotNone(decision.contrast)
+        self.assertAlmostEqual(
+            decision.goal_decision.observed_gap,
+            round(decision.contrast.difference, 4),
+            places=4,
+        )
+
+    def test_the_gap_is_signed_not_absolute(self):
+        """A leader scoring below its comparator must fail the bar, not clear it.
+
+        The contrast can be negative in the one honest case where the two serving
+        members disagree and the weighted vote picks the leader. Taking the
+        magnitude would let that clear an action bar and rely on the interval
+        condition to catch it downstream.
+        """
+        from treatmentrx.domain import CareGoal
+        from treatmentrx.estimation.goal_conditioned import GoalConditionedThresholds
+
+        goal = GoalConditionedThresholds()
+        estimate = _regime_estimate_with_q_values({"a": 0.8, "b": 0.5})
+        negative = goal.decide(estimate, CareGoal.INDUCTION, observed_gap=-0.30)
+        self.assertLess(negative.observed_gap, 0.0)
+        self.assertFalse(negative.act)
+
+    def test_a_caller_without_a_contrast_still_works(self):
+        """`cli misspecification` and the subgroup sweep construct estimates directly."""
+        from treatmentrx.domain import CareGoal
+        from treatmentrx.estimation.goal_conditioned import GoalConditionedThresholds
+
+        estimate = _regime_estimate_with_q_values({"a": 0.8, "b": 0.5})
+        fallback = GoalConditionedThresholds().decide(estimate, CareGoal.INDUCTION)
+        self.assertAlmostEqual(fallback.observed_gap, 0.3, places=4)
+
+
+def _regime_estimate_with_q_values(q_values):
+    from treatmentrx.contracts import RegimeEstimate
+    from treatmentrx.domain import RegimeType
+
+    return RegimeEstimate(
+        estimator="test",
+        regime_type=RegimeType.DTR,
+        recommended_arm=max(q_values, key=q_values.get),
+        q_values=q_values,
+        policy_value=0.7,
+        confidence_band=(0.6, 0.8),
+        coefficients={},
+        top_tailoring_variables=[],
+    )
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class WhyNotScaleTests(unittest.TestCase):
+    """The why-not gap is the decision's contrast, not a difference of Q-values.
+
+    `q_values` is clamped to `[Q_FLOOR, Q_CEILING]` and rounded to 3dp, and both
+    steps are many-to-one. For a patient whose predicted response saturates the
+    ceiling three arms collapse to 0.99, and the card printed "TNF-inhibitor
+    (gap 0.000)" one line under "Separation: methotrexate-optimization over
+    TNF-inhibitor is +0.051 — separable at this sample size". Measured over 120
+    patients: 4 printed exactly 0.000 under a separable verdict, and 29
+    disagreed with the separation line by any amount, by up to 0.065. That is
+    invariant 46's defect in a fifth place, on a served field.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from treatmentrx.data.contract import DataContractError
+        from treatmentrx.estimation import EstimationLayer
+        from treatmentrx.simulation.fhir_export import simulated_bundles
+
+        data, estimation, decision = DataLayer(), EstimationLayer(), DecisionLayer()
+        cls.decisions = []
+        for bundle in simulated_bundles(60, seed=4242):
+            try:
+                state = data.build_patient_state(bundle)
+            except DataContractError:
+                continue
+            cls.decisions.append(decision.decide(state, estimation.estimate(state)))
+
+    def test_the_gap_is_the_interval_the_separation_line_reports(self):
+        """The runner-up's two numbers now agree by construction, not by luck."""
+        checked = 0
+        for decision in self.decisions:
+            if decision.contrast is None or decision.explanation is None:
+                continue
+            for entry in decision.explanation.why_not:
+                if entry.action != decision.contrast.comparator:
+                    continue
+                checked += 1
+                with self.subTest(arm=entry.action):
+                    # `q_gap` carries three decimals; that is the only slack.
+                    self.assertAlmostEqual(
+                        entry.q_gap, decision.contrast.difference, places=2
+                    )
+        self.assertGreater(checked, 10)
+
+    def test_a_saturated_patient_does_not_get_a_zero_gap(self):
+        """The mechanism, pinned where it bit.
+
+        A separable verdict beside a gap of 0.000 is the contradiction; assert
+        that no arm the decision could rule out is reported as tied with the
+        leader.
+        """
+        from treatmentrx.estimation.q_learning import Q_CEILING, Q_FLOOR
+
+        saturated = collapsed = 0
+        for decision in self.decisions:
+            if decision.explanation is None:
+                continue
+            if not any(
+                value >= Q_CEILING or value <= Q_FLOOR
+                for value in decision.q_values.values()
+            ):
+                continue
+            saturated += 1
+            for entry in decision.explanation.why_not:
+                if entry.action in decision.candidate_arms:
+                    continue  # genuinely not separable; a small gap is honest
+                collapsed += entry.q_gap == 0.0
+        self.assertGreater(saturated, 0, "no patient in this cohort hit the clamp")
+        self.assertEqual(collapsed, 0, "a clamped q_value is still collapsing a why-not gap")
+
+    def test_the_entries_are_ordered_by_the_gap_they_print(self):
+        """The renderer shows the first two, so the order has to be the printed
+        number rather than the display value it replaced."""
+        for decision in self.decisions:
+            if decision.explanation is None:
+                continue
+            gaps = [entry.q_gap for entry in decision.explanation.why_not]
+            with self.subTest(arms=decision.recommended_arm):
+                self.assertEqual(gaps, sorted(gaps))
+
+
+class ComparatorSelectionTests(unittest.TestCase):
+    """The arm the recommendation is justified against is chosen by the data.
+
+    It came from `_ranked()[1]` — the argmax over the *clamped, rounded*
+    non-leader `q_values` — so for a patient whose response saturates the ceiling
+    three arms sit at 0.99 and dictionary order picked it. Measured over 120
+    patients, 5 had a tied comparator and 4 of those were recommended on a
+    separation (+0.051) that did not hold for the genuinely closest arm (+0.018).
+    That was the last place invariant 46's display quantity reached a clinical
+    output.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from treatmentrx.data.contract import DataContractError
+        from treatmentrx.estimation import EstimationLayer
+        from treatmentrx.simulation.fhir_export import simulated_bundles
+
+        data, estimation, decision = DataLayer(), EstimationLayer(), DecisionLayer()
+        cls.decisions = []
+        for bundle in simulated_bundles(60, seed=4242):
+            try:
+                state = data.build_patient_state(bundle)
+            except DataContractError:
+                continue
+            cls.decisions.append(decision.decide(state, estimation.estimate(state)))
+
+    def test_the_comparator_is_the_closest_arm_the_model_estimated(self):
+        for decision in self.decisions:
+            if decision.contrast is None or not decision.candidate_contrasts:
+                continue
+            closest = min(
+                decision.candidate_contrasts.values(),
+                key=lambda test: (test.difference, test.comparator),
+            )
+            with self.subTest(patient=decision.recommended_arm):
+                self.assertEqual(decision.contrast.comparator, closest.comparator)
+                self.assertAlmostEqual(
+                    decision.contrast.difference, closest.difference, places=9
+                )
+
+    def test_a_clamped_tie_no_longer_chooses_it(self):
+        """The mechanism. Where arms are tied in the display dict the comparator
+        must still be the one the unclamped estimate says is nearest."""
+        from treatmentrx.estimation.q_learning import Q_CEILING, Q_FLOOR
+
+        saturated = 0
+        for decision in self.decisions:
+            if decision.contrast is None:
+                continue
+            tied = [
+                arm for arm, value in decision.q_values.items()
+                if arm != decision.recommended_arm
+                and (value >= Q_CEILING or value <= Q_FLOOR)
+            ]
+            if len(tied) < 2:
+                continue
+            saturated += 1
+            others = [
+                test.difference for arm, test in decision.candidate_contrasts.items()
+                if arm != decision.contrast.comparator
+            ]
+            with self.subTest(arms=tuple(tied)):
+                self.assertTrue(
+                    all(decision.contrast.difference <= other for other in others),
+                    "a clamped tie is still supplying the comparator",
+                )
+        self.assertGreater(saturated, 0, "no patient in this cohort hit the clamp")
+
+    def test_the_contrast_is_the_candidate_sets_own_interval(self):
+        """One interval per pair, built once. Computing the runner-up's twice was
+        how the separation line and the set could report different verdicts about
+        the same arms."""
+        for decision in self.decisions:
+            if decision.contrast is None:
+                continue
+            with self.subTest(arm=decision.recommended_arm):
+                self.assertIn(decision.contrast.comparator, decision.candidate_contrasts)
+                self.assertIs(
+                    decision.contrast,
+                    decision.candidate_contrasts[decision.contrast.comparator],
+                )
+
+    def test_the_nearest_arm_is_not_always_the_least_separable(self):
+        """Why this does *not* make RECOMMEND mean "separated from every arm".
+
+        The smallest difference is not the smallest z, so an arm further away but
+        less precisely estimated can still be the one the data cannot exclude.
+        That is what `_not_excluded` reports, and pinning it here stops a future
+        reader from collapsing the two rules together.
+        """
+        divergent = 0
+        for decision in self.decisions:
+            if decision.contrast is None or len(decision.candidate_contrasts) < 2:
+                continue
+            least_separable = min(
+                decision.candidate_contrasts.values(),
+                key=lambda test: (
+                    abs(test.difference) / test.standard_error
+                    if test.standard_error
+                    else float("inf")
+                ),
+            )
+            divergent += least_separable.comparator != decision.contrast.comparator
+        self.assertGreater(
+            divergent,
+            0,
+            "if these never diverge the two rules are the same rule and one should go",
+        )
+
+
+class CardMatchesItsStatusTests(unittest.TestCase):
+    """Invariant 35, checked on the two blocks that were still missing it."""
+
+    def _flagged_basis(self):
+        """A real pipeline decision with the blip-basis flag forced on.
+
+        The specification test does not fire on this build —
+        `deployment_readiness()["blip_basis_unflagged"]` is True and
+        `das28_squared` reaches 3.367 against a 3.669 threshold — so the flag has
+        to be injected to render the branch at all.
+        """
+        from treatmentrx.estimation import EstimationLayer
+        from treatmentrx.safety import SafetyLayer
+
+        state = DataLayer().build_patient_state(sample_ra_bundle())
+        decision = DecisionLayer().decide(state, EstimationLayer().estimate(state))
+        safe = SafetyLayer().apply(decision, state)
+        uncertainty = replace(
+            decision.uncertainty,
+            flags=list(decision.uncertainty.flags) + ["blip_basis_may_omit:crp_std"],
+        )
+        decision = replace(decision, uncertainty=uncertainty)
+        return replace(safe, decision=decision)
+
+    def test_the_blocked_card_carries_the_caveat_with_the_interval(self):
+        """A caveat travels with the line it undercuts.
+
+        `blocked_card` reports the separation interval — invariant 35 put it
+        there, because the one status that escalates to a person was handing that
+        person the least — but not the warning that the interval may be centred
+        on the wrong quantity. The reviewer got the number without its qualifier.
+        """
+        from treatmentrx.agent.rationale import RationaleGenerator
+
+        safe = self._flagged_basis()
+        rationale = RationaleGenerator()
+        blocked = rationale.blocked_card(safe, "blocked for the purposes of this test")
+        self.assertIn("Separation:", blocked)
+        self.assertIn("CAVEAT", blocked)
+        self.assertIn("crp_std", blocked)
+
+    def test_both_cards_caveat_the_same_interval(self):
+        """The clinician card already did; the two must not diverge."""
+        from treatmentrx.agent.rationale import RationaleGenerator
+
+        safe = self._flagged_basis()
+        rationale = RationaleGenerator()
+        context = AgentLayer().build_context(safe)
+        clinician = rationale.clinician_card(context, safe, "safety text", "evidence")
+        blocked = rationale.blocked_card(safe, "safety text")
+        for card in (clinician, blocked):
+            self.assertIn("CAVEAT", card)
+
+    def test_a_recommendation_always_clears_its_own_action_bar(self):
+        """Why `patient_summary`'s hedge was removed rather than rewired.
+
+        It appended " ...because the options are close" when
+        `goal_decision.act` was False, and `DecisionLayer._status` returns
+        RECOMMEND only *after* `act` is True — so the branch could not fire, on
+        any patient, ever. Measured 41/41 on the audit cohort.
+
+        The patients it was aimed at are real and are elsewhere: those who clear
+        the care-goal bar but fail the interval condition are sent to the
+        EQUIPOISE summary, which says the options are close in its first
+        sentence. A hedge that can only fire where it is wrong is invariant 25 in
+        patient-facing prose.
+        """
+        from treatmentrx.data.contract import DataContractError
+        from treatmentrx.estimation import EstimationLayer
+        from treatmentrx.simulation.fhir_export import simulated_bundles
+
+        data, estimation, decision = DataLayer(), EstimationLayer(), DecisionLayer()
+        recommended = close_but_declined = 0
+        for bundle in simulated_bundles(60, seed=4242):
+            try:
+                state = data.build_patient_state(bundle)
+            except DataContractError:
+                continue
+            made = decision.decide(state, estimation.estimate(state))
+            if made.status is RecommendationStatus.RECOMMEND:
+                recommended += 1
+                self.assertTrue(
+                    made.goal_decision.act,
+                    "a recommendation that failed its own action bar would make "
+                    "the removed hedge reachable again",
+                )
+            elif made.goal_decision.act:
+                close_but_declined += 1
+        self.assertGreater(recommended, 10)
+        self.assertGreater(
+            close_but_declined,
+            0,
+            "the patients the hedge was written for should still exist, and be declined",
+        )
+
+
+class AttributionSourceTests(unittest.TestCase):
+    """The blip decomposition comes from one member, and the card must say which.
+
+    `q_values` are averaged; psi is not, and cannot be — dWOLS's is a
+    single-visit blip and Q-Pooled's a stage psi from a value-to-go fit, so
+    summing them term by term mixes the scales invariant 9 keeps apart.
+    `BayesianModelAverager` carries the dominant member's coefficients, and on
+    the deployed fit "dominant" is a **0.003** weight margin (0.4985 / 0.5015)
+    while the two members' blips for the same patient differ by up to **0.041** —
+    the size of the contrast the decision reports.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from treatmentrx.orchestrator import TreatmentRxOrchestrator
+        from treatmentrx.simulation.fhir_export import simulated_bundles
+
+        orchestrator = TreatmentRxOrchestrator()
+        cls.bundles = simulated_bundles(12, seed=4242)
+        cls.recommendations = [orchestrator.run(bundle) for bundle in cls.bundles]
+
+    def test_the_source_is_recorded_and_is_a_serving_member(self):
+        from treatmentrx.estimation import training
+
+        for recommendation in self.recommendations:
+            source = recommendation.audit_event["attribution_source"]
+            with self.subTest(patient=recommendation.patient_hash):
+                self.assertIn(source, training.SERVING_ENSEMBLE)
+
+    def test_the_card_names_the_model_it_decomposed(self):
+        for recommendation in self.recommendations:
+            source = recommendation.audit_event["attribution_source"]
+            card = recommendation.clinician_card
+            if "Estimated advantage of" not in card:
+                continue
+            line = card.split("Estimated advantage of", 1)[1].split("\n\n", 1)[0]
+            with self.subTest(patient=recommendation.patient_hash):
+                self.assertIn(source, line)
+
+    def test_the_decomposition_matches_the_model_it_names(self):
+        """The faithfulness check the audit's arithmetic identity stood in for.
+
+        Recomputed from the fitted model rather than read back out of the
+        coefficients the estimate carries, and it discriminates: against the
+        named member the residual is the 4dp rounding floor, against the other
+        serving member it is 261x larger.
+        """
+        from treatmentrx.estimation import training
+        from treatmentrx.feedback.audit import _attribution_against_its_model
+
+        named = other = 0.0
+        checked = 0
+        for bundle, recommendation in zip(self.bundles, self.recommendations):
+            source, residual = _attribution_against_its_model(bundle, recommendation)
+            if source is None:
+                continue
+            checked += 1
+            named = max(named, residual)
+            swapped = dict(recommendation.audit_event)
+            swapped["attribution_source"] = (
+                training.Q_POOLED if source == training.DWOLS_SHARED else training.DWOLS_SHARED
+            )
+            _, wrong = _attribution_against_its_model(
+                bundle, replace(recommendation, audit_event=swapped)
+            )
+            other = max(other, wrong)
+        self.assertGreater(checked, 5)
+        self.assertLess(named, 1e-3, "the attribution does not match the model it names")
+        self.assertGreater(
+            other,
+            1e-2,
+            "the check does not discriminate between the two members, so it cannot fail",
+        )
+
+
+class ExplanationAuditTests(unittest.TestCase):
+    """Layer 5's audit read 1.0 / 0.0 / 0 and two of those could not do otherwise."""
+
+    @classmethod
+    def setUpClass(cls):
+        from treatmentrx.feedback.audit import audit_explanation
+
+        cls.section = audit_explanation(n=12)
+
+    def test_the_identity_check_is_labelled_as_one(self):
+        """`sum(parts) == total` is arithmetic: both sides are rounded to 4dp and
+        the measured residual is 5.6e-17. Keeping it is fine; presenting it as a
+        faithfulness rate was not."""
+        block = self.section.metrics["attribution_parts_sum_to_total"]
+        self.assertEqual(block["rate"], 1.0)
+        self.assertIn("wiring check", block["note"])
+
+    def test_the_faithfulness_figure_names_its_denominator_and_source(self):
+        block = self.section.metrics["attribution_matches_its_source_model"]
+        self.assertGreater(block["patients"], 0)
+        self.assertTrue(block["sources"])
+
+    def test_the_phi_guard_is_scored_where_the_channel_runs(self):
+        """It scanned 30 cards for a patient hash while the two sections that
+        carry patient-specific free text — both fed from episodic memory — were
+        empty for every one of them. The denominator is now reported and the
+        memory path is exercised."""
+        block = self.section.metrics["phi_leaks_into_narrative"]
+        self.assertGreater(block["cards_scanned"], 0)
+        self.assertGreater(
+            block["cards_carrying_episodic_text"],
+            0,
+            "the guard is still being scored where its channel does not run",
+        )
+        self.assertEqual(block["leaks"], 0)
+
+    def test_the_leak_count_and_its_denominator_cover_the_same_cards(self):
+        """Invariant 36, in the block that was written to satisfy it.
+
+        `leaks` is summed over the cohort loop *and* the fixture card, so
+        reporting the loop's count alone as `cards_scanned` would put a count and
+        its denominator over different populations — which is the defect this
+        metric was rewritten to remove, reproduced one level in.
+        """
+        block = self.section.metrics["phi_leaks_into_narrative"]
+        self.assertGreater(
+            block["cards_scanned"],
+            block["cards_carrying_episodic_text"],
+            "the scan is only the fixture card, so the cohort loop is unreported",
+        )
+        self.assertIn("cohort cards", block["note"])
+
+    def test_both_free_text_routes_reach_the_card(self):
+        """The guard's denominator rests on this inventory being complete.
+
+        Two episodic fields render as free text — `preference` under `Recorded
+        patient preferences:` and `outcome_summary` interpolated into
+        `Continuity:` — and `override_reason` is stored and never rendered. A
+        fixture that fills one of the two leaves the other route unscanned, so
+        the route list is pinned here rather than in a comment.
+        """
+        from treatmentrx.agent.memory import EpisodicItem
+        from treatmentrx.demo_data import sample_ra_bundle
+        from treatmentrx.feedback.audit import _episodic_sections
+        from treatmentrx.orchestrator import TreatmentRxOrchestrator
+
+        orchestrator = TreatmentRxOrchestrator()
+        bundle = sample_ra_bundle()
+        clean = orchestrator.run(bundle)
+        self.assertEqual(
+            _episodic_sections(clean.clinician_card),
+            [],
+            "a patient with no recorded history should carry no episodic section",
+        )
+
+        orchestrator.agent.memory.record(
+            clean.patient_hash,
+            EpisodicItem(
+                stage=1,
+                recommended_arm="TNF-inhibitor",
+                clinician_action="TNF-inhibitor",
+                override_reason="override reason free text",
+                outcome_summary="outcome summary free text",
+                preference="preference free text",
+            ),
+        )
+        card = orchestrator.run(bundle).clinician_card
+        self.assertIn("preference free text", card)
+        self.assertIn("outcome summary free text", card)
+        self.assertNotIn(
+            "override reason free text",
+            card,
+            "override_reason has become a route and the fixture does not fill it",
+        )
+        self.assertEqual(len(_episodic_sections(card)), 2)
+
+    def test_the_phi_guard_fires_when_an_identifier_reaches_the_card(self):
+        """The guard has to be able to catch something, or reporting 0 says
+        nothing. Episodic preferences are free text a clinician typed, which is
+        the realistic route onto this card."""
+        from treatmentrx.agent.memory import EpisodicItem
+        from treatmentrx.demo_data import sample_ra_bundle
+        from treatmentrx.feedback.audit import _identifiers_in_narrative
+        from treatmentrx.orchestrator import TreatmentRxOrchestrator
+
+        orchestrator = TreatmentRxOrchestrator()
+        bundle = sample_ra_bundle()
+        clean = orchestrator.run(bundle)
+        self.assertFalse(_identifiers_in_narrative(clean))
+
+        orchestrator.agent.memory.record(
+            clean.patient_hash,
+            EpisodicItem(
+                stage=1,
+                recommended_arm="TNF-inhibitor",
+                clinician_action=None,
+                override_reason=None,
+                outcome_summary=None,
+                preference=f"patient {clean.patient_hash} prefers oral therapy",
+            ),
+        )
+        leaked = orchestrator.run(bundle)
+        self.assertTrue(
+            _identifiers_in_narrative(leaked),
+            "the guard cannot see an identifier that reached the card",
+        )
 
 
 class EnsembleRegimeLabelTests(unittest.TestCase):

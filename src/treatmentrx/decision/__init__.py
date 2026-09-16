@@ -59,8 +59,20 @@ class DecisionLayer:
             for name, value in selected.coefficients.items()
             if name.startswith("bma_weight:")
         }
-        goal_decision = self.goal_thresholds.decide(selected, state.care_goal)
-        contrast = self._contrast(state, selected, model_weights)
+        # Every arm's interval against the leader, once. Three things read it:
+        # the candidate set is its membership, `_contrast` is its minimum, and
+        # the why-not gaps are its differences. Each of those used to derive its
+        # own quantity — two of them from the clamped, rounded `q_values` — and
+        # the card printed the three side by side.
+        candidate_arms, candidate_contrasts = self._candidate_set(state, selected, model_weights)
+        contrast = self._contrast(candidate_contrasts)
+        # The care-goal bar judges the same difference the interval brackets, so
+        # it is handed that difference rather than re-deriving one.
+        goal_decision = self.goal_thresholds.decide(
+            selected,
+            state.care_goal,
+            observed_gap=contrast.difference if contrast is not None else None,
+        )
         uncertainty = self.uncertainty.decompose(
             state.stages,
             selected,
@@ -68,13 +80,14 @@ class DecisionLayer:
             training.holdout_calibration(),
             contrast,
         )
-        # The contrast is already computed above; the explainer used to
-        # rebuild a worse quantity from `q_values` rather than be handed it.
         explanation = self.explainer.explain(
-            selected, estimates, state.stages, contrast=contrast
+            selected,
+            estimates,
+            state.stages,
+            contrast=contrast,
+            arm_contrasts=candidate_contrasts,
         )
 
-        candidate_arms, candidate_contrasts = self._candidate_set(state, selected, model_weights)
         status, rationale = self._status(state, uncertainty, goal_decision, contrast)
         return Decision(
             recommended_arm=selected.recommended_arm,
@@ -93,8 +106,45 @@ class DecisionLayer:
             candidate_contrasts=candidate_contrasts,
         )
 
-    def _contrast(self, state: PatientState, selected: RegimeEstimate, weights: dict[str, float]):
+    @staticmethod
+    def _contrast(arm_contrasts: dict):
         """Interval for the contrast the decision is actually made on.
+
+        **The comparator is the arm the data says is closest, and it used to be
+        whichever arm sorted first.** This is the last place invariant 46's
+        display quantity reached a clinical output. The pair came from
+        `_ranked()[1]` — the argmax over the *clamped, rounded* non-leader
+        `q_values` — so for a patient whose predicted response saturates the
+        ceiling, three arms sit at 0.99 and **dictionary order chose the arm the
+        recommendation was justified against**. Measured over 120 patients: 5 had
+        a tied comparator, and for 4 of them the arm dictionary order picked was
+        separable (+0.051) while the genuinely closest arm was not (+0.018). The
+        card announced a separation that held only for the pair nobody would have
+        chosen on purpose.
+
+        Selecting the minimum is a search over all five comparisons, which is
+        exactly the family `_simultaneous_alpha` already corrects for — the
+        leader is chosen by looking at every arm, so the honest family is the one
+        the search ranged over (invariant 32). No level changes here.
+
+        The care-goal bar in invariant 10 now judges the gap to the nearest
+        competitor, which is the only thing "large enough to be worth acting on"
+        can sensibly mean, and both of that invariant's conditions read the one
+        interval. The pair is no longer computed here at all — `_candidate_set`
+        already builds it for every arm, and computing the runner-up's twice was
+        how the two could differ in the first place.
+
+        **It does not make RECOMMEND mean "separated from every arm", and that
+        would be the easy thing to assume.** The smallest *difference* is not the
+        smallest z: an arm further away but less precisely estimated can be the
+        one the data cannot exclude. Measured over 240 patients, 3 of 71
+        recommendations are exactly that — TNF-inhibitor at +0.049 with SE 0.0144
+        (z 3.41, separable) is the comparator, while IL-6 inhibitor at +0.050
+        with SE 0.0176 (z 2.86) is not. Reporting the z-minimum instead would
+        hand the care-goal bar the *larger* of two near-identical gaps, which is
+        the permissive direction. The candidate set is what covers every arm, and
+        `RationaleGenerator._not_excluded` is the card block that says so when
+        the two differ.
 
         The decision uses the model-averaged Q-values, so the interval has to
         describe the *averaged* contrast. Taking the widest of the three
@@ -129,20 +179,16 @@ class DecisionLayer:
         which is fitted and never served because `build_patient_state` appends
         the pending visit.
         """
-        ordered = self._ranked(selected)
-        if len(ordered) < 2:
+        if not arm_contrasts:
             return None
-        return self._pair_contrast(
-            state,
-            ordered[0],
-            ordered[1],
-            weights,
-            alpha=self._simultaneous_alpha(len(ordered)),
-        )
+        # Ties broken by name so the choice is deterministic. Unlike the rounded
+        # display dict this sorts a continuous estimate, so a tie means two arms
+        # the ensemble genuinely cannot order, not two it was not asked to.
+        return min(arm_contrasts.values(), key=lambda test: (test.difference, test.comparator))
 
     @staticmethod
     def _ranked(selected: RegimeEstimate) -> list[str]:
-        """Arms worst-to-best with the ensemble's own leader first.
+        """Arms best-to-worst with the ensemble's own leader first.
 
         Sorting `q_values` is not enough, and the failure is not hypothetical.
         That dict is clamped to `[Q_FLOOR, Q_CEILING]` and rounded to 3dp for
@@ -154,8 +200,15 @@ class DecisionLayer:
         interval beside the recommendation said the runner-up was better.
         Measured over 120 patients, 6 of them.
 
-        Choosing the leader once, in one place, is the fix. The rest of the menu
-        is ordered by the display values, which is only a presentation question.
+        Choosing the leader once, in one place, is the fix.
+
+        **Only position 0 is load-bearing now.** This used to supply the
+        comparator as well, at position 1, and that is where dictionary order
+        among clamped ties still reached the decision — see `_contrast`, which
+        now takes it from the estimated contrasts instead. What is left is the
+        leader, which matters, and the rest of the menu in display order, which
+        is a presentation question: `_candidate_set` tests every one of them and
+        the order it walks them in changes nothing it returns.
         """
         ordered = sorted(selected.q_values, key=selected.q_values.get, reverse=True)
         leader = selected.recommended_arm
@@ -170,7 +223,7 @@ class DecisionLayer:
         """Every arm the data cannot separate from the leader, and why.
 
         **Why this exists.** The agent declines to name one arm for most patients
-        it sees — about 67% at the training population, 57-89% across the sites in
+        it sees — about 66% at the training population, 54-89% across the sites in
         `cli transfer`, and 97% for seronegative patients. Until now that produced
         a status and a paragraph, and the clinician, who still has to prescribe
         something, got nothing to prescribe *with*. The information to do better

@@ -243,9 +243,9 @@ class RecommendationService:
             },
             "known_limitations": {
                 "abstention": {
-                    "pooled_rate": 0.67,
+                    "pooled_rate": 0.66,
                     "what_it_means": (
-                        "The agent declines to separate arms for ~67% of "
+                        "The agent declines to separate arms for ~66% of "
                         "patients at this training size after simultaneous "
                         "all-pairs multiplicity correction. Equipoise is a "
                         "measured result, not a failure: see `cli power`."
@@ -255,10 +255,10 @@ class RecommendationService:
                     # seeing the common case, not an unlucky one.
                     # Measured at seven simulated sites (`cli transfer`): the
                     # rate is a property of the population at least as much as
-                    # of the method, and a consumer reading 67% as a property of
+                    # of the method, and a consumer reading 66% as a property of
                     # the tool will be wrong by tens of points.
                     "varies_by_population": (
-                        "57%-89% across seven simulated sites differing in case "
+                        "54%-89% across seven simulated sites differing in case "
                         "mix, prescribing and retention (`cli transfer`). The "
                         "quoted rate describes this training population."
                     ),

@@ -91,13 +91,20 @@ class CardConsistencyTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        from treatmentrx.feedback.audit import _with_pregnancy
+
         orchestrator = TreatmentRxOrchestrator()
         cls.recommendations = []
+        # The same patients with a contraindication injected, because a removed
+        # arm is the only way to exercise the safety half of these rules.
+        cls.pregnant = []
         for bundle in simulated_bundles(30, seed=606):
             try:
                 cls.recommendations.append(orchestrator.run(bundle))
+                cls.pregnant.append(orchestrator.run(_with_pregnancy(bundle)))
             except DataContractError:
                 continue
+        assert any(r.audit_event.get("removed_arms") for r in cls.pregnant)
 
     def test_why_not_never_names_an_arm_still_in_contention(self):
         """`WHY_NOT_REASONS` is hard-coded clinical prose on a model-derived gap.
@@ -124,6 +131,75 @@ class CardConsistencyTests(unittest.TestCase):
             for arm in recommendation.audit_event.get("removed_arms", {}):
                 with self.subTest(arm=arm):
                     self.assertNotIn(arm, listed)
+
+    def test_why_not_never_explains_away_an_arm_safety_removed(self):
+        """The same rule from the other side, and it is the worse half.
+
+        `WHY_NOT_REASONS` is colour attached to a statistical exclusion. An arm
+        Layer 4 removed was not excluded statistically — it was refused — so a
+        sentence saying it narrowly lost on merit misdescribes why it is gone and
+        reads as though it could be reconsidered. Nothing is lost by dropping it:
+        the safety layer raises an `arm_removed` flag for every removal, so each
+        one is already named on this card with the reason that applies.
+        """
+        for recommendation in self.pregnant:
+            card = recommendation.clinician_card
+            if "Why not the alternatives:" not in card:
+                continue
+            clause = card.split("Why not the alternatives:", 1)[1].split("\n\n", 1)[0]
+            for arm in recommendation.audit_event.get("removed_arms", {}):
+                with self.subTest(arm=arm):
+                    self.assertNotIn(arm, clause)
+
+    def test_a_recommendation_never_carries_declining_prose(self):
+        """Invariant 35, in the block that was written to satisfy it.
+
+        Status is decided on the top-two contrast alone, so a lower-scoring arm
+        with a wider interval survives the exclusion test while the runner-up
+        fails it — and then a RECOMMEND card rendered the declining wording:
+        "Cannot separate: X, Y ... This is not a recommendation", four paragraphs
+        under "recommend X". Measured 6 of 120 patients before the fix.
+        """
+        recommended = [
+            r for r in self.recommendations
+            if r.status is RecommendationStatus.RECOMMEND
+        ]
+        self.assertTrue(recommended)
+        for recommendation in recommended:
+            card = recommendation.clinician_card
+            with self.subTest(patient=recommendation.patient_hash):
+                for declining in (
+                    "Cannot separate:",
+                    "not a recommendation",
+                    "has not been recommended",
+                    "remains in contention",
+                ):
+                    self.assertNotIn(declining, card)
+
+    def test_the_unexcluded_arms_still_reach_a_recommendation_card(self):
+        """Suppressing the block would have been the wrong fix.
+
+        The information is right and only the framing was wrong, so the arms the
+        data cannot rule out must still be named beside a recommendation —
+        hiding them makes the card more confident than the evidence.
+        """
+        shown = 0
+        for recommendation in self.recommendations:
+            if recommendation.status is not RecommendationStatus.RECOMMEND:
+                continue
+            others = [
+                arm for arm in recommendation.audit_event["candidate_arms"]
+                if arm != recommendation.recommended_arm
+            ]
+            if not others:
+                continue
+            shown += 1
+            card = recommendation.clinician_card
+            with self.subTest(patient=recommendation.patient_hash):
+                self.assertIn("Not excluded:", card)
+                for arm in others:
+                    self.assertIn(arm, card.split("Not excluded:", 1)[1])
+        self.assertTrue(shown, "no recommended patient had an unexcluded alternative")
 
     def test_a_declined_patient_is_given_something_to_act_on(self):
         declined = [

@@ -85,6 +85,18 @@ class BayesianModelAverager:
             weights[result.estimator] * (result.q_values.get(recommended, 0.0) - q_values[recommended]) ** 2
             for result in results
         )
+        # The q_values above are averaged; the *coefficients* are not, and cannot
+        # be — dWOLS's psi is a single-visit blip and Q-Pooled's is a stage psi
+        # from a value-to-go fit, so summing them term by term would mix the two
+        # scales invariant 9 keeps apart. One member's are carried instead, and
+        # which one turns on a weight margin of **0.003** on the deployed fit
+        # (0.4985 / 0.5015) while the two blips differ by up to **0.041** for the
+        # same patient — as large as the contrast the decision reports.
+        #
+        # So the choice is recorded rather than left to be inferred. The card
+        # renders this decomposition directly under a line saying the decision
+        # was model-averaged over two estimators, and a reader is owed the name
+        # of the one it is actually reading.
         dominant = max(results, key=lambda result: weights[result.estimator])
         low = sum(weights[result.estimator] * result.confidence_band[0] for result in results)
         high = sum(weights[result.estimator] * result.confidence_band[1] for result in results)
@@ -93,6 +105,7 @@ class BayesianModelAverager:
             f"bma_weight:{name}": round(weight, 4) for name, weight in weights.items()
         }
         coefficients["model_disagreement_variance"] = round(model_variance, 6)
+        coefficients["attribution_source"] = dominant.estimator
 
         return RegimeEstimate(
             estimator=BMA_ENSEMBLE,
