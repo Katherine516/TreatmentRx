@@ -920,34 +920,133 @@ def _narrative_with_memory() -> tuple[int, int]:
 
 # ---------------------------------------------------------------- Layer 6
 
-def audit_governance() -> Section:
-    """Are the estimands separated, and are the deployment gates still closed?"""
-    orchestrator = TreatmentRxOrchestrator()
-    first = orchestrator.run(sample_ra_bundle())
-    other = orchestrator.run(simulated_bundles(1, seed=77)[0])
+def audit_governance(n: int = 60, seed: int = AUDIT_SEED) -> Section:
+    """Are the estimands model-level, do the three tracks stay apart, and are the
+    gates shut?
 
-    values = {result.estimand: result.policy_value for result in first.estimands}
-    other_values = {result.estimand: result.policy_value for result in other.estimands}
+    **The section measured two patients and never looked at what the layer is
+    for.** `estimands_are_model_level` compared one patient against one other, so
+    a patient-dependent estimand had to disagree on exactly that pair to be
+    caught — invariant 36's denominator problem at n=2. It sweeps now, and the
+    count is reported beside the verdict.
+
+    What was missing entirely is the separation this layer's own docstring opens
+    with. Layer 6 keeps three tracks and the rule is that **an abstention must
+    not reach Track B**: there is no policy action to evaluate, and the
+    diagnostic top-scored arm must never be smuggled in as though it were a
+    recommendation. That is invariant 2's shape one layer down — a name appearing
+    where nothing was recommended — and the agent abstains on most patients, so
+    the denominator is large and the property can genuinely fail. Nothing checked
+    it. Measured over 120 patients: 120 observational rows, 33 on the OPE track
+    against 33 recommendations, and 87 abstentions all carrying
+    `clinician-usual-care`, none of them the top-scored arm.
+
+    The rung is reported with its **blockers** now. `validation_rung: silent`
+    beside `retraining_allowed: false` told a reader the gate was shut and
+    nothing about why, while `ValidationStatus.blockers` sat populated and
+    unread — the defect invariant 41 fixed in `PolicyScore.notes`, in the section
+    whose subject is the gate.
+
+    Three metrics here are regression tripwires rather than measurements, and are
+    grouped and labelled as such. Each guards a specific defect that was fixed
+    and could silently return; none of them has a denominator, because a
+    structural assertion does not have one.
+    """
+    orchestrator = TreatmentRxOrchestrator()
+    estimand_sets: dict[tuple, int] = {}
+    values: dict[str, float] = {}
+    scored = coincident = 0
+    top_scored: dict[str, str] = {}
+    published: dict[str, str | None] = {}
+    statuses: dict[str, int] = {}
+    # The last patient of the sweep, not a fresh run. Scoring one more here would
+    # append a row to every track and report it against a denominator of `n` —
+    # which is the defect this section was rewritten to remove.
+    latest = None
+
+    for bundle in simulated_bundles(n, seed=seed):
+        try:
+            recommendation = orchestrator.run(bundle)
+        except DataContractError:
+            continue
+        scored += 1
+        latest = recommendation
+        statuses[recommendation.status.value] = statuses.get(recommendation.status.value, 0) + 1
+        top_scored[recommendation.patient_hash] = recommendation.top_scored_arm
+        published[recommendation.patient_hash] = recommendation.recommended_arm
+        values = {result.estimand: result.policy_value for result in recommendation.estimands}
+        key = tuple(sorted(values.items()))
+        estimand_sets[key] = estimand_sets.get(key, 0) + 1
+        if len(set(values.values())) != len(values):
+            coincident += 1
+
+    feedback = orchestrator.feedback
+    recommended = statuses.get(RecommendationStatus.RECOMMEND.value, 0)
+    abstained = scored - recommended
+
+    # The rule: no abstention on Track B, and no abstention carrying the
+    # diagnostic top-scored arm as though it were a policy action.
+    abstentions_on_ope = sum(
+        1 for row in feedback.ope_track
+        if published.get(row["patient_hash"]) != row["policy_arm"]
+    )
+    leaked_top_arm = sum(
+        1 for row in feedback.full_system_track
+        if row["agent_status"] != RecommendationStatus.RECOMMEND.value
+        and row["policy_action"] == top_scored.get(row["patient_hash"])
+    )
+
+    validation = latest.validation if latest else None
 
     section = Section("6 feedback")
     section.metrics = {
         "estimands": values,
-        "estimands_are_model_level": values == other_values,
-        "estimands_are_distinct": len(set(values.values())) == len(values),
-        "validation_rung": first.validation.rung.value if first.validation else None,
-        "retraining_allowed": first.provenance["feedback"]["retraining_allowed"],
-        "ope_is_patient_level": (
-            first.audit_event["ope"]["observed_mean_outcome"]
-            != first.audit_event["ope"]["model_policy_value"]
-        ),
-        # The patient-level block used to carry an `iptw_policy_value` built from
-        # hand-set constants. It is gone; what is left is descriptive and says so.
-        "ope_is_descriptive_only": "observed_mean_outcome" in first.audit_event["ope"]
-        and "iptw_policy_value" not in first.audit_event["ope"],
+        "estimands_are_model_level": {
+            "patients": scored,
+            "distinct_value_sets": len(estimand_sets),
+            "model_level": len(estimand_sets) == 1,
+        },
+        "track_separation": {
+            "patients": scored,
+            "recommendations": recommended,
+            "abstentions": abstained,
+            "observational_rows": len(feedback.observational_track),
+            "ope_rows": len(feedback.ope_track),
+            "full_system_rows": len(feedback.full_system_track),
+            "ope_rows_not_the_published_arm": abstentions_on_ope,
+            "abstentions_carrying_the_top_scored_arm": leaked_top_arm,
+        },
+        "validation_rung": validation.rung.value if validation else None,
+        "validation_gate_passed": validation.gate_passed if validation else None,
+        "validation_blockers": list(validation.blockers) if validation else [],
+        "retraining_allowed": latest.provenance["feedback"]["retraining_allowed"],
+        "regression_tripwires": {
+            "estimands_are_distinct": coincident == 0,
+            "ope_is_patient_level": (
+                latest.audit_event["ope"]["observed_mean_outcome"]
+                != latest.audit_event["ope"]["model_policy_value"]
+            ),
+            # The patient-level block used to carry an `iptw_policy_value` built
+            # from hand-set constants. It is gone; what is left is descriptive.
+            "ope_is_descriptive_only": "observed_mean_outcome" in latest.audit_event["ope"]
+            and "iptw_policy_value" not in latest.audit_event["ope"],
+            "note": (
+                "structural assertions, not measurements: each guards a defect "
+                "that was fixed and could silently return, and none has a "
+                "denominator because a structural assertion does not have one"
+            ),
+        },
     }
     section.notes.append(
         "Estimands describe the policy and must not vary by patient; the OPE summarises "
         "the patient and must not be averaged into them."
+    )
+    section.notes.append(
+        "Track B is the off-policy evaluation cohort and takes recommendations only. "
+        "An abstention is a referral to clinician-led usual care, not the top-scored "
+        "arm — `abstentions_carrying_the_top_scored_arm` is the count that would show "
+        "the diagnostic argmax being promoted into a policy action, and it is the "
+        "abstentions that form its denominator."
     )
     return section
 

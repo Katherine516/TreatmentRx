@@ -1415,6 +1415,45 @@ recovery compares it against the generating blips), `beta:` (the treatment-free
 surface, which nothing reads), and `top_tailoring_variables` (ranks by
 `|psi_k · h_k(X)|`, which a positive constant cannot reorder).
 
+### The layer whose audit never looked at what the layer does
+
+Layer 6's section reported the estimands, the rung, and two OPE tripwires.
+`estimands_are_model_level` compared **one patient against one other**, so a
+patient-dependent estimand had to disagree on exactly that pair to be caught. It
+sweeps 60 now and reports `distinct_value_sets` beside the verdict.
+
+What was missing is the separation the layer's own docstring opens with. Layer 6
+keeps three tracks, and the rule is that **an abstention must not reach Track B**
+— there is no policy action to evaluate, and the diagnostic top-scored arm must
+never enter as though it were a recommendation. That is the same defect the
+safety layer is built against, one layer down, and because the agent abstains on
+most patients the denominator is large:
+
+| | count |
+| --- | --- |
+| observational rows | 120 of 120 patients |
+| OPE-track rows | **33**, against 33 recommendations |
+| abstentions carrying `clinician-usual-care` | **87 of 87** |
+| abstentions carrying the top-scored arm | **0** |
+
+Both halves are counted separately, and the test injects both regressions to
+prove each fails on its own: promoting the top-scored arm moves one counter to 19
+while the other stays at 0, and smuggling abstentions onto Track B does the
+reverse. One counter standing in for two properties is how a partial regression
+passes unnoticed.
+
+The rung now carries its **blockers** — `validation_rung: silent` beside
+`retraining_allowed: false` said the gate was shut and nothing about why, while
+`ValidationStatus.blockers` sat populated and unemitted. And three metrics here
+are regression tripwires rather than measurements (`estimands_are_distinct`,
+`ope_is_patient_level`, `ope_is_descriptive_only`); they are grouped and labelled,
+because none has a denominator and none ever could.
+
+One defect caught while writing the fix, which is the same defect one level in:
+the first version scored `n` patients and then ran one more for the validation
+status, appending a row to every track — **61** rows reported against a
+denominator of **60**.
+
 **Deliberately simple, and labelled as such in-module:**
 `HandcraftedFeatureEncoder` (nine clinical features normalised and tiled — not a
 learned representation, and it does not claim to be),

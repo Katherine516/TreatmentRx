@@ -800,10 +800,98 @@ class AuditHarnessTests(unittest.TestCase):
         self.assertTrue(metrics["memory_changed_narrative"])
 
     def test_governance_keeps_the_gates_closed(self):
-        metrics = audit_governance().metrics
-        self.assertTrue(metrics["estimands_are_model_level"])
-        self.assertTrue(metrics["estimands_are_distinct"])
+        """And says why. `validation_rung: silent` beside `retraining_allowed:
+        false` told a reader the gate was shut and nothing about the reason,
+        while `ValidationStatus.blockers` sat populated and unemitted."""
+        metrics = audit_governance(n=12).metrics
         self.assertFalse(metrics["retraining_allowed"])
+        self.assertFalse(metrics["validation_gate_passed"])
+        self.assertTrue(
+            metrics["validation_blockers"],
+            "the gate is shut and the section does not say why",
+        )
+
+    def test_the_estimands_are_model_level_over_a_denominator(self):
+        """This compared exactly two patients, so a patient-dependent estimand
+        had to disagree on that one pair to be caught."""
+        block = audit_governance(n=12).metrics["estimands_are_model_level"]
+        self.assertGreater(block["patients"], 2)
+        self.assertEqual(block["distinct_value_sets"], 1)
+        self.assertTrue(block["model_level"])
+
+    def test_the_three_tracks_stay_separate(self):
+        """Layer 6's stated purpose, and nothing measured it.
+
+        Track B is the off-policy evaluation cohort and takes recommendations
+        only: an abstention has no policy action to evaluate, and the diagnostic
+        top-scored arm must never enter as though it were one. That is invariant
+        2's shape a layer down.
+        """
+        block = audit_governance(n=30).metrics["track_separation"]
+        self.assertEqual(block["observational_rows"], block["patients"])
+        self.assertEqual(block["full_system_rows"], block["patients"])
+        self.assertEqual(block["ope_rows"], block["recommendations"])
+        self.assertEqual(block["ope_rows_not_the_published_arm"], 0)
+        self.assertEqual(block["abstentions_carrying_the_top_scored_arm"], 0)
+        self.assertGreater(
+            block["abstentions"],
+            0,
+            "no abstentions scored, so the checks above have no denominator",
+        )
+
+    def test_each_half_of_the_separation_can_fail_on_its_own(self):
+        """A gate that cannot close is not a gate (invariant 25).
+
+        Both regressions are injected, and each must be caught by its own
+        counter while the other stays at zero — otherwise one number is standing
+        in for two properties.
+        """
+        from treatmentrx.domain import RecommendationStatus
+        from treatmentrx.feedback import FeedbackLayer
+
+        original = FeedbackLayer.enqueue
+
+        def leak_top_arm(self, state, recommendation, safe=None):
+            receipt = original(self, state, recommendation, safe)
+            if recommendation.status is not RecommendationStatus.RECOMMEND:
+                self.full_system_track[-1]["policy_action"] = recommendation.top_scored_arm
+            return receipt
+
+        def leak_onto_track_b(self, state, recommendation, safe=None):
+            receipt = original(self, state, recommendation, safe)
+            if recommendation.status is not RecommendationStatus.RECOMMEND:
+                self.ope_track.append(
+                    {
+                        "patient_hash": state.patient_hash,
+                        "stage": state.stage,
+                        "policy_arm": recommendation.top_scored_arm,
+                    }
+                )
+            return receipt
+
+        try:
+            FeedbackLayer.enqueue = leak_top_arm
+            promoted = audit_governance(n=20).metrics["track_separation"]
+            FeedbackLayer.enqueue = leak_onto_track_b
+            smuggled = audit_governance(n=20).metrics["track_separation"]
+        finally:
+            FeedbackLayer.enqueue = original
+
+        self.assertGreater(promoted["abstentions_carrying_the_top_scored_arm"], 0)
+        self.assertEqual(promoted["ope_rows_not_the_published_arm"], 0)
+
+        self.assertGreater(smuggled["ope_rows_not_the_published_arm"], 0)
+        self.assertGreater(smuggled["ope_rows"], smuggled["recommendations"])
+        self.assertEqual(smuggled["abstentions_carrying_the_top_scored_arm"], 0)
+
+    def test_the_structural_assertions_are_labelled_as_such(self):
+        """Three of these have no denominator and never could. Reporting them
+        beside measurements without saying so is what invariant 49 is about."""
+        block = audit_governance(n=12).metrics["regression_tripwires"]
+        self.assertIn("structural assertions", block["note"])
+        for name in ("estimands_are_distinct", "ope_is_patient_level", "ope_is_descriptive_only"):
+            with self.subTest(tripwire=name):
+                self.assertTrue(block[name])
 
 
 if __name__ == "__main__":

@@ -8,12 +8,12 @@ test fixture, not evidence.
 ## Commands
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests    # 559 tests, ~6 min
+PYTHONPATH=src python3 -m unittest discover -s tests    # 563 tests, ~6 min
 PYTHONPATH=src python3 -m treatmentrx.cli demo          # one patient end to end
 PYTHONPATH=src python3 -m treatmentrx.cli evaluate      # estimator scorecard
 PYTHONPATH=src python3 -m treatmentrx.cli stability     # k-fold + seed sweep (~10s)
 PYTHONPATH=src python3 -m treatmentrx.cli inference     # sandwich vs bootstrap (~35s)
-PYTHONPATH=src python3 -m treatmentrx.cli audit         # layer-by-layer evaluation (~2s)
+PYTHONPATH=src python3 -m treatmentrx.cli audit         # layer-by-layer evaluation (~6s)
 PYTHONPATH=src python3 -m treatmentrx.cli coverage      # do the 95% intervals cover? (~76s)
 PYTHONPATH=src python3 -m treatmentrx.cli coverage --candidate-set  # does the set hold the best arm? (~40s)
 PYTHONPATH=src python3 -m treatmentrx.cli coverage --multiplicity   # what the all-pairs correction costs (~60s)
@@ -1462,6 +1462,51 @@ produced a real clinical divergence, and the notes below are the scar tissue.
    the horizon is greater than 1 somewhere, because a division by 1 everywhere
    would make the other two assertions vacuous — which is precisely the shape
    that hid this.
+
+59. **Layer 6's audit measured two patients and never looked at what the layer
+   is for.** The section reported the estimands, the rung and two OPE tripwires.
+   `estimands_are_model_level` compared one patient against one other, so a
+   patient-dependent estimand had to disagree on exactly that pair to be caught —
+   invariant 36's denominator problem at n=2. It sweeps 60 now and reports
+   `distinct_value_sets` beside the verdict; measured, 1 set over 60 patients.
+
+   **What was missing entirely is the separation the layer's own docstring opens
+   with.** Layer 6 keeps three tracks, and the rule is that an abstention must
+   not reach Track B: there is no policy action to evaluate, and the diagnostic
+   top-scored arm must never enter as though it were a recommendation. That is
+   invariant 2's shape one layer down — a name appearing where nothing was
+   recommended — and since the agent abstains on most patients the denominator is
+   large and the property can genuinely fail. Nothing checked it. Measured over
+   120 patients: 120 observational rows, **33 on the OPE track against 33
+   recommendations**, and 87 abstentions all carrying `clinician-usual-care`.
+
+   Both halves are counted separately and each can fail on its own, which
+   `tests/test_coverage.py` asserts by injecting both regressions: promoting the
+   top-scored arm into a policy action moves
+   `abstentions_carrying_the_top_scored_arm` to 19 while
+   `ope_rows_not_the_published_arm` stays 0, and smuggling abstentions onto Track
+   B does the reverse (`ope_rows` 30 against 11 recommendations). One counter
+   standing in for two properties is how a partial regression passes.
+
+   **The rung now carries its blockers.** `validation_rung: silent` beside
+   `retraining_allowed: false` told a reader the gate was shut and nothing about
+   why, while `ValidationStatus.blockers` sat populated and unemitted — invariant
+   41's defect in the section whose subject is the gate.
+
+   Three metrics here are **regression tripwires, not measurements**, and are
+   grouped and labelled: `estimands_are_distinct`, `ope_is_patient_level` and
+   `ope_is_descriptive_only` are structural assertions guarding defects that were
+   fixed and could silently return. None has a denominator, because a structural
+   assertion does not have one. The test that covered them read
+   `assertTrue(metrics["estimands_are_model_level"])`, which became vacuous the
+   moment that metric grew a denominator and turned into a dict — every dict is
+   truthy. It asserts the fields now.
+
+   One caught in the writing, worth recording because it is the same defect one
+   level in: the first version scored `n` patients and then ran
+   `sample_ra_bundle()` once more for the validation status, which appended a row
+   to every track — so it reported **61** rows against a denominator of **60**.
+   The extra run is gone and the last swept patient is used instead.
 
 ## What is real vs. still a placeholder
 
