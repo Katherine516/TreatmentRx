@@ -692,8 +692,38 @@ class QLearningModel:
         Blips for *all* arms are reported, not just the recommended one: model
         averaging can select an arm the dominant estimator did not, and the
         explanation layer must still be able to decompose it.
+
+        **The blips are divided by the remaining horizon, and that is the whole
+        difference between this and `blip_parameters`.** What leaves this method
+        is consumed beside `q_values` — the explanation layer decomposes it into
+        the per-covariate terms the clinician card prints under a gap — and
+        `q_values` are value-to-go divided by the remaining stages (invariant 9).
+        Published raw, the two disagreed by exactly that horizon: measured at
+        `stage_index` 1, a decomposition sourced from this model ran **1.54x to
+        3.49x** the gap it claimed to explain, and agreed only at the terminal
+        block where the horizon is 1. Nothing served ever crossed those scales,
+        because `attribution_source` was dWOLS-Shared for all 120 patients on the
+        deployed fit — but the BMA weight margin deciding that is 0.003.
+
+        The division is exact rather than approximate, which is why it is the
+        right repair and not a fudge: `psi_a . h(X)` *is* `raw_q(a) - raw_q(ref)`
+        by construction, so dividing by the horizon gives precisely
+        `q_values[a] - q_values[ref]`. Measured, it agrees to the 3dp `q_values`
+        are rounded to.
+
+        `blip_parameters` stays raw and must: it is the value-to-go psi the model
+        estimates, and `cli coverage`, `cli misspecification` and the estimator
+        tests compare it against the generating process's blips. `blip_standard_error`
+        already divides and already says "per-remaining-visit scale", so this
+        makes the point estimate agree with its own standard error — they were
+        the two halves of one number on different scales.
+
+        `beta:` is the treatment-free surface and is left raw. It is not a
+        contrast, nothing renders it beside a per-visit quantity, and nothing in
+        the package reads it — it is here for a human reading the audit trail.
         """
         offset = self._clamp_stage(stage_index) * self._n_free
+        horizon = self.remaining_stages(stage_index)
         summary = {
             f"beta:{name}": round(self._beta[offset + i], 4)
             for i, name in enumerate(TREATMENT_FREE_BASIS)
@@ -703,7 +733,7 @@ class QLearningModel:
                 continue
             summary.update(
                 {
-                    f"psi:{candidate}:{name}": round(value, 4)
+                    f"psi:{candidate}:{name}": round(value / horizon, 4)
                     for name, value in self.blip_parameters(candidate, stage_index).items()
                 }
             )

@@ -1376,17 +1376,44 @@ the reference arm the two agree **exactly** (0.000000 over 120), because the gap
 over continuing current therapy *is* the leader's blip, which the attribution
 block already publishes.
 
-**One latent exposure, recorded rather than bundled in.** `Q-Pooled` publishes a
-stage psi from a value-to-go fit *undivided by the remaining horizon*, while the
-gap is per-remaining-visit. Measured at `stage_index` 1, a Q-Pooled-sourced
-decomposition runs **1.54× to 3.49×** the gap it claims to explain; at the
-terminal block, horizon 1, both members agree. The source is dWOLS-Shared for all
-120 patients on the deployed fit, so nothing served crosses scales today — but
-the BMA margin deciding it is **0.003**. So the reconstruction is asserted at
-every served stage, and the guard closes: forced onto Q-Pooled it fires at stage
-1 (0.1434 against a 0.1 bar) and stays quiet at the terminal block. The repair
-belongs in what `coefficient_summary` publishes, and applies to the attribution
-block too.
+**It also surfaced a latent scale defect, which the next section repairs.**
+
+### A point estimate and its standard error on two different scales
+
+`QLearningModel.blip_standard_error` divides by the remaining horizon and says so
+— *"on the per-remaining-visit scale"*. `blip_parameters` does not, because it is
+the value-to-go parameter the model estimates. Both are right. What was wrong is
+that `coefficient_summary`, the audit-facing view that becomes
+`RegimeEstimate.coefficients`, published the **undivided** blip — and the only
+consumer of those psi keys is the explanation layer, which decomposes them into
+the terms the card prints *under a gap taken from `q_values`*. Those are
+value-to-go divided by the remaining horizon. Decomposition and gap would have
+differed by exactly that horizon.
+
+The division is exact rather than approximate, which is what makes it a repair:
+`psi_a · h(X)` **is** `raw_q(a) − raw_q(reference)` by construction, so dividing
+by the horizon gives precisely `q_values[a] − q_values[reference]`.
+
+Forcing `attribution_source` onto Q-Pooled:
+
+| | before | after |
+| --- | --- | --- |
+| worst residual, `stage_index` 1 | **0.1434** | **0.0560** |
+| worst ratio to the gap, `stage_index` 1 | **3.49×** | **1.90×** |
+| worst residual, terminal block | 0.0290 | 0.0290 |
+
+What remains is the members' genuine disagreement — the same size the deployed
+dWOLS path shows. The terminal block does not move because its horizon is 1,
+which is also why this was invisible: it is the stage `build_patient_state` puts
+almost every patient at.
+
+**Nothing served changed**, asserted rather than assumed: cards, audit events and
+why-not entries over 40 patients hash identically before and after, because
+`attribution_source` is dWOLS-Shared throughout and a single-visit blip has no
+horizon to divide by. Not rescaled, deliberately: `blip_parameters` (parameter
+recovery compares it against the generating blips), `beta:` (the treatment-free
+surface, which nothing reads), and `top_tailoring_variables` (ranks by
+`|psi_k · h_k(X)|`, which a positive constant cannot reorder).
 
 **Deliberately simple, and labelled as such in-module:**
 `HandcraftedFeatureEncoder` (nine clinical features normalised and tiled — not a

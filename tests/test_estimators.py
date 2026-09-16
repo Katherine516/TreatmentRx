@@ -180,6 +180,92 @@ class BlipRecoveryTests(unittest.TestCase):
             self.assertGreater(first, terminal + 0.005, msg=arm)
 
 
+
+class PublishedBlipScaleTests(unittest.TestCase):
+    """What `coefficient_summary` publishes sits on the scale `q_values` sit on.
+
+    `blip_parameters` is a value-to-go stage parameter; `q_values` divide that by
+    the remaining horizon so every estimator reports response per remaining visit
+    (invariant 9). `coefficient_summary` used to publish the blips raw, and the
+    explanation layer decomposes exactly those into the per-covariate terms the
+    clinician card prints *under a gap taken from `q_values`*. Measured before the
+    repair, a decomposition sourced from this model ran 1.54x to 3.49x the gap it
+    claimed to explain at `stage_index` 1, agreeing only at the terminal block
+    where the horizon is 1.
+
+    Nothing served ever crossed those scales — `attribution_source` was
+    dWOLS-Shared for every patient on the deployed fit — so these assert the
+    property directly rather than through a card, because the margin that keeps
+    it off the card is a 0.003 BMA weight.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = QLearningModel(generate_ra_cohort(400, seed=7), share_blip=False)
+        _, stages = _demo_stages()
+        cls.features = model_features(stages)
+
+    def _published(self, arm, index):
+        from treatmentrx.estimation.basis import BLIP_BASIS, blip_basis
+
+        summary = self.model.coefficient_summary(arm, index)
+        basis = dict(zip(BLIP_BASIS, blip_basis(self.features)))
+        return sum(
+            summary[f"psi:{arm}:{name}"] * basis[name]
+            for name in BLIP_BASIS
+            if f"psi:{arm}:{name}" in summary
+        )
+
+    def test_the_published_blip_is_the_q_value_difference(self):
+        """The identity that makes the division exact rather than a fudge.
+
+        `psi_a . h(X)` *is* `raw_q(a) - raw_q(reference)` by construction, so
+        dividing by the horizon gives precisely `q_values[a] - q_values[ref]` —
+        the quantity the card prints beside the decomposition.
+        """
+        for index in range(self.model.n_stages):
+            q_values = self.model.q_values(self.features, index)
+            for arm in self.model.arms:
+                if arm == REFERENCE_ARM:
+                    continue
+                with self.subTest(arm=arm, stage=index):
+                    self.assertAlmostEqual(
+                        self._published(arm, index),
+                        q_values[arm] - q_values[REFERENCE_ARM],
+                        places=2,
+                    )
+
+    def test_the_accessor_stays_the_value_to_go_parameter(self):
+        """`blip_parameters` must *not* be divided: it is the parameter the model
+        estimates, and `cli coverage`, `cli misspecification` and the recovery
+        tests above compare it against the generating process's blips. The two
+        methods differ by exactly the horizon, and nothing else."""
+        from treatmentrx.estimation.basis import BLIP_BASIS, blip_basis
+
+        basis = dict(zip(BLIP_BASIS, blip_basis(self.features)))
+        for index in range(self.model.n_stages):
+            horizon = self.model.remaining_stages(index)
+            for arm in self.model.arms:
+                if arm == REFERENCE_ARM:
+                    continue
+                raw = sum(
+                    value * basis[name]
+                    for name, value in self.model.blip_parameters(arm, index).items()
+                )
+                with self.subTest(arm=arm, stage=index):
+                    self.assertAlmostEqual(self._published(arm, index), raw / horizon, places=3)
+
+    def test_the_horizon_actually_bites_somewhere(self):
+        """A division by 1 everywhere would make both tests above vacuous — which
+        is what made this defect invisible: the terminal block is the only stage
+        the deployed pipeline usually serves, and there the horizon is 1."""
+        horizons = {self.model.remaining_stages(i) for i in range(self.model.n_stages)}
+        self.assertGreater(max(horizons), 1)
+        arm = next(a for a in self.model.arms if a != REFERENCE_ARM)
+        raw = self._published(arm, 0) * self.model.remaining_stages(0)
+        self.assertNotAlmostEqual(self._published(arm, 0), raw, places=3)
+
+
 class PolicyValueTests(unittest.TestCase):
     def test_every_estimator_beats_the_clinician_policy(self):
         behaviour = rollout_value(behaviour_policy, n=3000, seed=202)

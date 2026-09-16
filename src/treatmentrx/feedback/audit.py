@@ -818,6 +818,12 @@ def _attribution_against_its_model(bundle, recommendation) -> tuple[str | None, 
 
     Independent of the coefficients the estimate carries, which is the point: the
     identity check reads those back to themselves.
+
+    `Q-Pooled`'s psi is a value-to-go stage parameter and the attribution is
+    published per remaining visit, so the horizon division is applied here too —
+    it is the same division `coefficient_summary` now makes, and recomputing
+    without it would measure that rescaling rather than the model. dWOLS's blip
+    is single-visit and has no horizon to divide by.
     """
     source = (recommendation.audit_event or {}).get("attribution_source")
     if not source:
@@ -827,15 +833,16 @@ def _attribution_against_its_model(bundle, recommendation) -> tuple[str | None, 
     state = DataLayer().build_patient_state(bundle)
     features = model_features(state.stages)
     basis = dict(zip(BLIP_BASIS, blip_basis(features)))
+    horizon = 1
     if source == training.Q_POOLED:
-        psi = fit.pooled.blip_parameters(
-            attribution.action, stage_index(state.stages, fit.pooled.n_stages)
-        )
+        index = stage_index(state.stages, fit.pooled.n_stages)
+        psi = fit.pooled.blip_parameters(attribution.action, index)
+        horizon = fit.pooled.remaining_stages(index)
     elif source == training.DWOLS_SHARED:
         psi = fit.dwols.blip_parameters(attribution.action)
     else:
         return None, 0.0
-    value = sum(psi[name] * basis[name] for name in BLIP_BASIS if name in psi)
+    value = sum(psi[name] * basis[name] for name in BLIP_BASIS if name in psi) / horizon
     return source, abs(value - attribution.total_advantage)
 
 

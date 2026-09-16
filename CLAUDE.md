@@ -8,7 +8,7 @@ test fixture, not evidence.
 ## Commands
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests    # 556 tests, ~6 min
+PYTHONPATH=src python3 -m unittest discover -s tests    # 559 tests, ~6 min
 PYTHONPATH=src python3 -m treatmentrx.cli demo          # one patient end to end
 PYTHONPATH=src python3 -m treatmentrx.cli evaluate      # estimator scorecard
 PYTHONPATH=src python3 -m treatmentrx.cli stability     # k-fold + seed sweep (~10s)
@@ -1402,14 +1402,66 @@ produced a real clinical divergence, and the notes below are the scar tissue.
    forced onto Q-Pooled it fires at stage 1 (0.1434 against a 0.1 bar) and stays
    quiet at the terminal block, which is the right discrimination.
 
-   **That guard is not the repair.** The repair belongs where the scale is known —
-   in what `QLearningModel.coefficient_summary` publishes — and it applies to
-   `_attributions` too, which has carried the same latent exposure since
-   invariant 56. It is recorded here rather than bundled into this change.
+   **That guard is not the repair**, and the repair is invariant 58. The guard
+   stays: it is what would catch the next way these two scales drift apart.
 
    What remains hand-written is a four-entry vocabulary of clinical words for the
    four basis terms, and a test asserts it covers `BLIP_BASIS` so a new modifier
    cannot reach a card as a bare variable name.
+
+58. **A model published its point estimate and its standard error on two
+   different scales.** Invariant 57 guarded this; this is the fix.
+   `QLearningModel.blip_standard_error` divides by the remaining horizon and its
+   docstring says "on the per-remaining-visit scale". `blip_parameters` does not,
+   because it is the value-to-go parameter the model actually estimates. Both are
+   right. What was wrong is that `coefficient_summary` — the audit-facing view
+   that becomes `RegimeEstimate.coefficients` — published the *undivided* blip,
+   and the only thing that consumes those psi keys is the explanation layer,
+   which decomposes them into the per-covariate terms the clinician card prints
+   **under a gap taken from `q_values`**. `q_values` are value-to-go divided by
+   the remaining horizon (invariant 9). So the card would have shown a
+   decomposition and a gap differing by exactly that horizon.
+
+   **The division is exact, which is what makes it a repair and not a fudge.**
+   `psi_a . h(X)` *is* `raw_q(a) - raw_q(reference)` by construction, so dividing
+   by the horizon gives precisely `q_values[a] - q_values[reference]` — verified
+   to the 3dp `q_values` are rounded to, at every stage.
+
+   Measured, forcing `attribution_source` onto Q-Pooled:
+
+   | | before | after |
+   | --- | --- | --- |
+   | worst residual, `stage_index` 1 | **0.1434** | **0.0560** |
+   | worst ratio to the gap, `stage_index` 1 | **3.49x** | **1.90x** |
+   | worst residual, terminal block | 0.0290 | 0.0290 |
+   | invariant 57's guard at stage 1 | fires | quiet |
+
+   What remains at stage 1 is the two members' genuine disagreement, the same
+   thing the deployed dWOLS path shows (max 0.0575). The terminal block does not
+   move because its horizon is 1, which is also why this was invisible: it is the
+   stage `build_patient_state` puts almost every patient at (invariant 40).
+
+   **Nothing served changed**, and that is asserted rather than assumed — cards,
+   audit events and why-not entries over 40 patients hash identically before and
+   after, because `attribution_source` is dWOLS-Shared throughout and dWOLS's
+   blip is single-visit with no horizon to divide by.
+
+   Three things deliberately not rescaled. `blip_parameters` stays the
+   value-to-go parameter: `cli coverage`, `cli misspecification` and the
+   parameter-recovery tests compare it against the generating process's blips,
+   and dividing it would break the comparison it exists for. `beta:` stays raw —
+   it is the treatment-free surface, not a contrast, nothing renders it beside a
+   per-visit quantity, and nothing in the package reads it. And
+   `top_tailoring_variables` ranks by `|psi_k * h_k(X)|`, which a positive
+   constant cannot reorder, so it reads the accessor and is unaffected either way.
+
+   `audit._attribution_against_its_model` divides too. It is the audit's
+   *independent* recomputation, so it has to target the scale that is published;
+   without the division it would have measured the rescaling rather than the
+   model. `tests/test_estimators.py` pins the identity at every stage and asserts
+   the horizon is greater than 1 somewhere, because a division by 1 everywhere
+   would make the other two assertions vacuous — which is precisely the shape
+   that hid this.
 
 ## What is real vs. still a placeholder
 
