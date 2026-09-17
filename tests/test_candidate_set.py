@@ -350,15 +350,19 @@ class WhyNotIsModelDerivedTests(unittest.TestCase):
     def test_the_contributions_reconstruct_the_gap_at_every_served_stage(self):
         """The scale guard, and it is the one that can fail loudly.
 
-        `q_gap` is the model-averaged contrast and the decomposition is the
-        dominant member's, so they differ by the members' disagreement — measured
-        max 0.0575 over 600 entries. They must not differ by a *horizon*:
-        `Q-Pooled` publishes an undivided value-to-go stage psi, so a
-        decomposition sourced from it runs 1.54x to 3.49x the gap at
-        `stage_index` 1. `attribution_source` is dWOLS-Shared on the deployed fit
-        and the margin deciding that is 0.003, so this is asserted rather than
-        assumed — and asserted at every stage the pipeline actually serves, since
-        the two members coincide only at the terminal block.
+        Both sides are now the same weighted mean — `_pair_contrast` builds the
+        gap from the members' contrasts on the BMA weights, and the decomposition
+        averages their blips on those same weights — so the residual is the 4dp
+        coefficient rounding rather than the members' disagreement: **0.0006**
+        max here, against 0.0575 when a single member's psi was carried.
+
+        The bar stays well above that because what it guards is a *scale*, not a
+        rounding. `Q-Pooled` publishes a value-to-go stage psi and dividing it by
+        the remaining horizon is what puts it on the gap's scale; remove that
+        division and stage 1 goes to **0.0828** while the terminal block, horizon
+        1, does not move at all. 0.01 sits ~16x above the healthy residual and
+        ~8x below the regression, and the sweep covers every served stage because
+        the terminal block is the one place the two members coincide anyway.
         """
         worst = 0.0
         for _, entry in self.entries:
@@ -367,7 +371,7 @@ class WhyNotIsModelDerivedTests(unittest.TestCase):
             with self.subTest(arm=entry.action):
                 self.assertLess(
                     residual,
-                    0.1,
+                    0.01,
                     "the decomposition is not on the same scale as the gap it explains",
                 )
         # The two members coincide only at the terminal block, so a sweep that
@@ -377,7 +381,7 @@ class WhyNotIsModelDerivedTests(unittest.TestCase):
             1,
             f"only stage {self.stages_covered} reached; the horizon is 1 there",
         )
-        self.assertLess(worst, 0.1)
+        self.assertLess(worst, 0.01)
 
     def test_the_reason_moves_with_the_patient(self):
         """The property the replaced prose structurally could not have.

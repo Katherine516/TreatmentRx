@@ -50,7 +50,9 @@ class DecisionLayer:
         if not estimates:
             return self._no_estimate_decision()
 
-        selected = self.bma.aggregate(estimates)
+        # Features go in so the ensemble ranks its tailoring drivers off the
+        # averaged blip rather than the marginally heavier member's.
+        selected = self.bma.aggregate(estimates, model_features(state.stages))
         selected = self.competing_endpoint.adjust(selected, state.stages, state.competing_risk_incidence)
         selected = self.belief_adjuster.adjust(selected, state.stages)
 

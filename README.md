@@ -1287,16 +1287,18 @@ reports.
 
 ### A number attributed to "the model", under a line naming two
 
-`q_values` are averaged and psi is not — it cannot be, since dWOLS's is a
+`q_values` were averaged and psi was not — it could not be, since dWOLS's is a
 single-visit blip and Q-Pooled's a stage psi from a value-to-go fit. So the
-ensemble carries the **dominant member's** coefficients, and the card renders
+ensemble carried the **dominant member's** coefficients, and the card rendered
 that decomposition directly under "model-averaged over 2 estimators (weights
 Q-Pooled 0.50, dWOLS-Shared 0.50)". Which member is dominant turns on a weight
 margin of **0.003**, while the two members' blips for the same patient differ by
 up to **0.041** — the size of the contrast the decision reports.
 
-The scales forbid averaging it, so it is recorded and named instead:
-*"+0.244 (dWOLS-Shared's blip, not the ensemble average)"*.
+The scales forbade averaging, so it was recorded and named instead:
+*"+0.244 (dWOLS-Shared's blip, not the ensemble average)"*. The horizon repair
+below removed that obstacle, and *[the margin stops
+deciding](#the-margin-that-decided-which-model-the-card-described)* finishes it.
 
 That is also what Layer 5's audit should have been measuring. It read 1.0 / 0.0 /
 0 on every metric and two of the three could not have read anything else. The
@@ -1453,6 +1455,43 @@ One defect caught while writing the fix, which is the same defect one level in:
 the first version scored `n` patients and then ran one more for the validation
 status, appending a row to every track — **61** rows reported against a
 denominator of **60**.
+
+### The margin that decided which model the card described
+
+Naming the dominant member was the right call while psi could not be averaged.
+The horizon repair removed that obstacle — both members publish on the
+per-remaining-visit scale now — and averaging turns out to be not merely possible
+but the **right** quantity: `_pair_contrast` builds the gap the card prints as
+exactly the BMA-weighted mean of the members' contrasts, so the decomposition
+beside it should be the weighted mean of their blips.
+
+| decomposition | mean residual vs the gap | max |
+| --- | --- | --- |
+| dominant member (before) | 0.00983 | **0.05590** |
+| BMA-weighted (now) | 0.00005 | **0.00018** |
+
+0.00018 is the 4dp coefficient rounding floor, and it holds at **both served
+stages** — the two members coincide only at the terminal block, so an average
+that worked there and nowhere else would not be this.
+
+**It reaches three card-facing things.** The attribution block, the why-not
+decomposition, and `top_tailoring_variables` — whose docstring calls itself
+"exactly the decomposition `ModelExplainer` already reports", a claim that holds
+only while both read the same psi. Over 120 patients the two members disagreed on
+a printed driver magnitude by up to **0.147** (`anti_ccp` at −0.016 against
++0.131 — *opposite signs* on the card) and on the **order** of the drivers for
+**11**.
+
+`attribution_source` becomes `BMA Ensemble`, and the card's qualifier changes from
+a caveat to a confirmation: *"(the weighted average of the estimators above)"*.
+It is kept rather than dropped because the line above names two models and a
+reader is owed which object they are reading.
+
+The faithfulness check got stronger with it. It averages the *fitted* models the
+same way, so it stays independent of the coefficients the estimate carries — and
+where it used to discriminate 261× against the one other member, it now
+discriminates **376× against Q-Pooled and 372× against dWOLS**. It says *this is
+the ensemble*, not merely *this is not the other one*.
 
 **Deliberately simple, and labelled as such in-module:**
 `HandcraftedFeatureEncoder` (nine clinical features normalised and tiled — not a

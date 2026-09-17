@@ -28,6 +28,7 @@ from treatmentrx.data import DataContractError, DataLayer
 from treatmentrx.demo_data import sample_ra_bundle
 from treatmentrx.domain import RecommendationStatus
 from treatmentrx.estimation import training
+from treatmentrx.decision.bma import BMA_ENSEMBLE
 from treatmentrx.estimation.basis import BLIP_BASIS, blip_basis
 from treatmentrx.estimation.features import model_features, stage_index
 from treatmentrx.orchestrator import TreatmentRxOrchestrator
@@ -814,36 +815,65 @@ def audit_explanation(n: int = 30, seed: int = AUDIT_SEED) -> Section:
 
 
 def _attribution_against_its_model(bundle, recommendation) -> tuple[str | None, float]:
-    """Recompute psi . h(X) from the fitted model the estimate names.
+    """Recompute psi . h(X) from the fitted models, not from the estimate.
 
     Independent of the coefficients the estimate carries, which is the point: the
     identity check reads those back to themselves.
 
-    `Q-Pooled`'s psi is a value-to-go stage parameter and the attribution is
-    published per remaining visit, so the horizon division is applied here too —
-    it is the same division `coefficient_summary` now makes, and recomputing
-    without it would measure that rescaling rather than the model. dWOLS's blip
-    is single-visit and has no horizon to divide by.
+    The source is normally `BMA Ensemble` — the blips are averaged on the same
+    weights as the q_values — so the recomputation averages the *fitted* models
+    the same way. A single-member source is still handled, for an ensemble of one
+    or a caller that aggregated without the serving pair.
+
+    `Q-Pooled`'s psi is a value-to-go stage parameter and everything published is
+    per remaining visit, so the horizon division is applied here too; it is the
+    same division `coefficient_summary` makes, and recomputing without it would
+    measure that rescaling rather than the model. dWOLS's blip is single-visit
+    and has no horizon to divide by.
     """
     source = (recommendation.audit_event or {}).get("attribution_source")
     if not source:
         return None, 0.0
     attribution = recommendation.explanation.attributions[0]
-    fit = training.fitted()
     state = DataLayer().build_patient_state(bundle)
-    features = model_features(state.stages)
-    basis = dict(zip(BLIP_BASIS, blip_basis(features)))
-    horizon = 1
-    if source == training.Q_POOLED:
-        index = stage_index(state.stages, fit.pooled.n_stages)
-        psi = fit.pooled.blip_parameters(attribution.action, index)
-        horizon = fit.pooled.remaining_stages(index)
-    elif source == training.DWOLS_SHARED:
-        psi = fit.dwols.blip_parameters(attribution.action)
+    basis = dict(zip(BLIP_BASIS, blip_basis(model_features(state.stages))))
+
+    if source == BMA_ENSEMBLE:
+        weights = recommendation.audit_event.get("model_weights") or {}
+        blips = {
+            name: _member_blip(name, attribution.action, state)
+            for name in weights
+        }
+        present = {name: weights[name] for name, psi in blips.items() if psi}
+        total = sum(present.values())
+        if not present or total <= 0.0:
+            return None, 0.0
+        value = sum(
+            weight / total * sum(blips[name][term] * basis[term] for term in BLIP_BASIS if term in blips[name])
+            for name, weight in present.items()
+        )
     else:
-        return None, 0.0
-    value = sum(psi[name] * basis[name] for name in BLIP_BASIS if name in psi) / horizon
+        psi = _member_blip(source, attribution.action, state)
+        if not psi:
+            return None, 0.0
+        value = sum(psi[term] * basis[term] for term in BLIP_BASIS if term in psi)
+
     return source, abs(value - attribution.total_advantage)
+
+
+def _member_blip(method: str, arm: str, state) -> dict[str, float]:
+    """One serving member's blip for this arm, on the per-remaining-visit scale."""
+    fit = training.fitted()
+    if method == training.Q_POOLED:
+        index = stage_index(state.stages, fit.pooled.n_stages)
+        horizon = fit.pooled.remaining_stages(index)
+        return {
+            name: value / horizon
+            for name, value in fit.pooled.blip_parameters(arm, index).items()
+        }
+    if method == training.DWOLS_SHARED:
+        return dict(fit.dwols.blip_parameters(arm))
+    return {}
 
 
 def _identifiers_in_narrative(recommendation) -> bool:

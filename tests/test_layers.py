@@ -1290,15 +1290,17 @@ class CardMatchesItsStatusTests(unittest.TestCase):
 
 
 class AttributionSourceTests(unittest.TestCase):
-    """The blip decomposition comes from one member, and the card must say which.
+    """The blip decomposition is the ensemble's, on the same weights as q_values.
 
-    `q_values` are averaged; psi is not, and cannot be — dWOLS's is a
-    single-visit blip and Q-Pooled's a stage psi from a value-to-go fit, so
-    summing them term by term mixes the scales invariant 9 keeps apart.
-    `BayesianModelAverager` carries the dominant member's coefficients, and on
-    the deployed fit "dominant" is a **0.003** weight margin (0.4985 / 0.5015)
-    while the two members' blips for the same patient differ by up to **0.041** —
-    the size of the contrast the decision reports.
+    It used to be one member's, chosen by a **0.003** weight margin (0.4985 /
+    0.5015) while the two members' blips for the same patient differed by up to
+    **0.041** — the size of the contrast the decision reports. psi could not be
+    averaged then, because dWOLS's is a single-visit blip and `Q-Pooled` published
+    an undivided value-to-go stage psi. `coefficient_summary` puts both on the
+    per-remaining-visit scale now, so the average is well defined — and it is the
+    right quantity rather than an available one, because `_pair_contrast` builds
+    the gap the card prints as exactly this weighted mean of the members'
+    contrasts.
     """
 
     @classmethod
@@ -1306,27 +1308,79 @@ class AttributionSourceTests(unittest.TestCase):
         from treatmentrx.orchestrator import TreatmentRxOrchestrator
         from treatmentrx.simulation.fhir_export import simulated_bundles
 
+        from treatmentrx.data import DataLayer
+        from treatmentrx.decision import DecisionLayer
+        from treatmentrx.estimation import EstimationLayer
+
         orchestrator = TreatmentRxOrchestrator()
         cls.bundles = simulated_bundles(12, seed=4242)
         cls.recommendations = [orchestrator.run(bundle) for bundle in cls.bundles]
+        data, estimation, decision = DataLayer(), EstimationLayer(), DecisionLayer()
+        cls.decisions = {}
+        for bundle in cls.bundles:
+            state = data.build_patient_state(bundle)
+            cls.decisions[state.patient_hash] = decision.decide(
+                state, estimation.estimate(state)
+            )
 
-    def test_the_source_is_recorded_and_is_a_serving_member(self):
+    def test_the_source_is_recorded_and_is_the_ensemble(self):
+        """Not a member chosen by a hair's-breadth weight margin."""
+        from treatmentrx.decision.bma import BMA_ENSEMBLE
         from treatmentrx.estimation import training
 
         for recommendation in self.recommendations:
             source = recommendation.audit_event["attribution_source"]
             with self.subTest(patient=recommendation.patient_hash):
-                self.assertIn(source, training.SERVING_ENSEMBLE)
+                self.assertEqual(source, BMA_ENSEMBLE)
+                self.assertNotIn(source, training.SERVING_ENSEMBLE)
 
-    def test_the_card_names_the_model_it_decomposed(self):
+    def test_the_published_blip_is_the_weighted_mean_of_the_members(self):
+        """The averaging itself, read off the coefficients both card blocks use.
+
+        Checked per basis term rather than through a dot product, so a blend that
+        happened to agree on one patient's features would still fail.
+        """
         for recommendation in self.recommendations:
-            source = recommendation.audit_event["attribution_source"]
+            event = recommendation.audit_event
+            weights = event["model_weights"]
+            selected = recommendation.explanation.attributions[0].action
+            estimate = self.decisions[recommendation.patient_hash]
+            prefix = f"psi:{selected}:"
+            members = {
+                e.estimator: {
+                    k[len(prefix):]: v for k, v in e.coefficients.items() if k.startswith(prefix)
+                }
+                for e in estimate.estimates
+            }
+            averaged = {
+                k[len(prefix):]: v
+                for k, v in estimate.selected.coefficients.items()
+                if k.startswith(prefix)
+            }
+            self.assertTrue(averaged)
+            for term, value in averaged.items():
+                present = {n: w for n, w in weights.items() if term in members.get(n, {})}
+                total = sum(present.values())
+                expected = sum(w / total * members[n][term] for n, w in present.items())
+                with self.subTest(patient=recommendation.patient_hash, term=term):
+                    self.assertAlmostEqual(value, expected, places=3)
+
+    def test_the_card_says_the_decomposition_is_the_ensembles(self):
+        """It used to read "(dWOLS-Shared's blip, not the ensemble average)".
+        Now that the blip *is* the ensemble average, that sentence would be
+        false, and dropping it silently would leave a reader guessing which of
+        the two models named on the line above they are looking at."""
+        shown = 0
+        for recommendation in self.recommendations:
             card = recommendation.clinician_card
             if "Estimated advantage of" not in card:
                 continue
+            shown += 1
             line = card.split("Estimated advantage of", 1)[1].split("\n\n", 1)[0]
             with self.subTest(patient=recommendation.patient_hash):
-                self.assertIn(source, line)
+                self.assertIn("weighted average of the estimators", line)
+                self.assertNotIn("not the ensemble average", line)
+        self.assertGreater(shown, 5)
 
     def test_the_decomposition_matches_the_model_it_names(self):
         """The faithfulness check the audit's arithmetic identity stood in for.

@@ -8,7 +8,7 @@ test fixture, not evidence.
 ## Commands
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests    # 563 tests, ~6 min
+PYTHONPATH=src python3 -m unittest discover -s tests    # 564 tests, ~6 min
 PYTHONPATH=src python3 -m treatmentrx.cli demo          # one patient end to end
 PYTHONPATH=src python3 -m treatmentrx.cli evaluate      # estimator scorecard
 PYTHONPATH=src python3 -m treatmentrx.cli stability     # k-fold + seed sweep (~10s)
@@ -1298,9 +1298,12 @@ produced a real clinical divergence, and the notes below are the scar tissue.
    hair's-breadth change in the BMA weights would swap the published attribution
    by more than the effect it explains.
 
-   Not repaired by averaging, which the scales forbid: recorded and named.
-   `attribution_source` is stamped in `aggregate`, carried on the audit event,
-   and rendered — "+0.244 (dWOLS-Shared's blip, not the ensemble average)".
+   Not repaired by averaging, which the scales forbade at the time: recorded and
+   named. `attribution_source` is stamped in `aggregate`, carried on the audit
+   event, and rendered — "+0.244 (dWOLS-Shared's blip, not the ensemble
+   average)". **Invariant 58 removed that obstacle and invariant 60 does the
+   averaging**, so the margin no longer decides anything; what survives from here
+   is `attribution_source` itself, which now reads `BMA Ensemble`.
 
    **And it is what Layer 5's audit should have been measuring.** That section
    read 1.0 / 0.0 / 0 on every metric, the tell invariant 49 describes, and two
@@ -1386,9 +1389,10 @@ produced a real clinical divergence, and the notes below are the scar tissue.
    therapy *is* the leader's blip.
 
    **`q_gap` stays the averaged contrast**, so it still matches the separation
-   line (invariant 54). The decomposition is one member's, so it reconstructs
-   that gap only to within the members' disagreement: mean **0.0100**, max
-   **0.0575**, against gaps reaching 0.306.
+   line (invariant 54). The decomposition was one member's when this landed, so
+   it reconstructed that gap only to within the members' disagreement — mean
+   **0.0100**, max **0.0575**, against gaps reaching 0.306. Invariant 60 averages
+   the blips too and takes that to **0.00018**.
 
    **That residual is a disagreement, and it would be a scale error if the source
    flipped.** `Q-Pooled` publishes a stage psi from a value-to-go fit *undivided
@@ -1403,7 +1407,9 @@ produced a real clinical divergence, and the notes below are the scar tissue.
    quiet at the terminal block, which is the right discrimination.
 
    **That guard is not the repair**, and the repair is invariant 58. The guard
-   stays: it is what would catch the next way these two scales drift apart.
+   stays — it is what would catch the next way these two scales drift apart — and
+   its bar tightened from 0.1 to **0.01** once invariant 60 made the healthy
+   residual a rounding.
 
    What remains hand-written is a four-entry vocabulary of clinical words for the
    four basis terms, and a test asserts it covers `BLIP_BASIS` so a new modifier
@@ -1507,6 +1513,62 @@ produced a real clinical divergence, and the notes below are the scar tissue.
    `sample_ra_bundle()` once more for the validation status, which appended a row
    to every track — so it reported **61** rows against a denominator of **60**.
    The extra run is gone and the last swept patient is used instead.
+
+60. **A 0.003 weight margin decided which model two card blocks described, and
+   invariant 58 is what made averaging possible.** Invariant 56 found the margin
+   and chose to *name* the winner rather than average, because the two members
+   parameterise psi differently: dWOLS's is a single-visit blip and `Q-Pooled`
+   published an undivided value-to-go stage psi, so summing them term by term
+   mixed the scales invariant 9 keeps apart. That reasoning was right at the
+   time. Invariant 58 put both on the per-remaining-visit scale, and the
+   objection went with it.
+
+   Averaging is not merely now-possible, it is the **right** quantity.
+   `DecisionLayer._pair_contrast` builds the gap the card prints as exactly the
+   BMA-weighted mean of the members' contrasts, so the decomposition beside it
+   should be the weighted mean of their blips — which is invariant 16's
+   principle ("the interval describes the quantity the decision uses") applied to
+   the decomposition rather than the interval. Measured over 300 entries:
+
+   | decomposition | mean residual vs `q_gap` | max |
+   | --- | --- | --- |
+   | dominant member (before) | 0.00983 | **0.05590** |
+   | BMA-weighted (now) | 0.00005 | **0.00018** |
+
+   0.00018 is the 4dp coefficient rounding floor, and it holds at **both served
+   stages** — the members coincide only at the terminal block, so an average that
+   worked there and nowhere else would not be this.
+
+   **It reaches three card-facing things, not one.** The attribution block and
+   the why-not decomposition both read `selected.coefficients`. So does
+   `top_tailoring_variables`, whose docstring calls itself "exactly the
+   decomposition `ModelExplainer` already reports" — a coherence claim that only
+   holds while both read the same psi. Measured over 120 patients, the two
+   members disagreed on a printed driver magnitude by up to **0.147**
+   (`anti_ccp` at -0.016 against +0.131, *opposite signs* on the card) and on the
+   **order** of the drivers for **11**. `aggregate` takes `features` now and
+   ranks off the averaged blip.
+
+   `attribution_source` becomes `BMA Ensemble` and the card says so: the line
+   read "(dWOLS-Shared's blip, not the ensemble average)" and now reads "(the
+   weighted average of the estimators above)". It is kept rather than dropped
+   because the line above names two models and a reader is owed which object this
+   is — the qualifier is a confirmation now instead of a caveat. A single-member
+   source is still handled and still named as itself.
+
+   **The faithfulness check got stronger.** `_attribution_against_its_model`
+   averages the *fitted* models the same way, so it remains independent of the
+   coefficients the estimate carries. It used to discriminate 261x against the
+   one other member; it now discriminates **376x against Q-Pooled and 372x
+   against dWOLS** — it says "this is the ensemble", not merely "this is not the
+   other one". Worst residual against the object it names: **0.00011**.
+
+   Non-psi coefficients still come from the dominant member. They are not
+   decomposed onto the card, `beta:` is a treatment-free surface rather than a
+   contrast, and averaging them is a question nothing here is asking. Weights are
+   renormalised over the members that actually carry each key, matching what
+   `_pair_contrast` does when an estimator cannot produce a contrast — a member
+   that does not report an arm must not be read as reporting zero for it.
 
 ## What is real vs. still a placeholder
 

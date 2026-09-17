@@ -459,15 +459,20 @@ class RationaleGenerator:
         case the line says so. It is kept rather than dropped because the reviewer
         needs to see *why* the model ranked a contraindicated arm first.
 
-        **It names its model, because this one is not the ensemble.** The line
-        above it says the decision was model-averaged over two estimators, and a
-        reader carries that down the card — but psi cannot be averaged across
-        members that parameterise it differently, so `BayesianModelAverager`
-        carries one member's coefficients and stamps which. Which one turns on a
-        weight margin of 0.003 on the deployed fit, and the two members' blips
-        for the same patient differ by up to 0.041 — the size of the contrast the
-        decision reports. Attributing that to "the model" unqualified is the card
-        claiming an ensemble quantity it does not have.
+        **It names its model, and the answer is now the ensemble.** This line
+        used to read "(dWOLS-Shared's blip, not the ensemble average)", because
+        psi could not be averaged across members that parameterise it
+        differently — so one member's coefficients were carried, chosen by a
+        weight margin of 0.003 while the two members' blips differed by up to
+        0.041 for the same patient. Since `coefficient_summary` publishes both on
+        the per-remaining-visit scale, the average is well defined and is what
+        the decision is actually made on, so the qualifier is now a confirmation
+        rather than a caveat. It is still printed: the line above says the
+        decision was model-averaged, and a reader is owed the statement that this
+        decomposition is the same object and not a single member's.
+
+        A single-member source can still arrive — an ensemble of one, or a caller
+        aggregating without the serving pair — and is named as itself.
         """
         decision = safe.decision
         if not decision.explanation or not decision.explanation.attributions:
@@ -476,8 +481,18 @@ class RationaleGenerator:
         if not attribution.contributions:
             return ""
         parts = ", ".join(f"{name} {value:+.3f}" for name, value in attribution.contributions.items())
+        # Compared against the selected estimate's own name rather than against
+        # an imported constant: the question is whether this decomposition is the
+        # same object that made the decision, and that is what the comparison
+        # literally asks. It also keeps Layer 5 from importing a Layer 3 symbol
+        # for a string match.
         source = decision.selected.coefficients.get("attribution_source")
-        attributed_to = f" ({source}'s blip, not the ensemble average)" if source else ""
+        if not source:
+            attributed_to = ""
+        elif source == decision.selected.estimator:
+            attributed_to = " (the weighted average of the estimators above)"
+        else:
+            attributed_to = f" ({source}'s blip, not the ensemble average)"
         line = (
             f"Estimated advantage of {attribution.action} over continuing current therapy is "
             f"{attribution.total_advantage:+.3f}{attributed_to}, from {parts}."

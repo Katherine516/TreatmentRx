@@ -5,6 +5,7 @@ import math
 from treatmentrx.contracts import RegimeEstimate
 from treatmentrx.domain import RegimeType
 from treatmentrx.estimation.dwols import DWOLS_METHOD
+from treatmentrx.estimation.features import top_tailoring_variables
 from treatmentrx.estimation.q_learning import (
     Q_POOLED_METHOD,
     Q_SHARED_METHOD,
@@ -38,7 +39,11 @@ class BayesianModelAverager:
         STAGE_SPECIFIC_METHOD: 0.05,
     }
 
-    def aggregate(self, results: list[RegimeEstimate]) -> RegimeEstimate:
+    def aggregate(
+        self,
+        results: list[RegimeEstimate],
+        features: dict[str, float] | None = None,
+    ) -> RegimeEstimate:
         """Average the estimates, refusing to average different estimands.
 
         **What the fingerprint check is and is not.** It is a precondition on a
@@ -85,27 +90,41 @@ class BayesianModelAverager:
             weights[result.estimator] * (result.q_values.get(recommended, 0.0) - q_values[recommended]) ** 2
             for result in results
         )
-        # The q_values above are averaged; the *coefficients* are not, and cannot
-        # be — dWOLS's psi is a single-visit blip and Q-Pooled's is a stage psi
-        # from a value-to-go fit, so summing them term by term would mix the two
-        # scales invariant 9 keeps apart. One member's are carried instead, and
-        # which one turns on a weight margin of **0.003** on the deployed fit
-        # (0.4985 / 0.5015) while the two blips differ by up to **0.041** for the
-        # same patient — as large as the contrast the decision reports.
+        # The blips are averaged on the same weights as the q_values, and until
+        # the horizon repair they could not be. `Q-Pooled` published a stage psi
+        # from a value-to-go fit while dWOLS publishes a single-visit blip, so
+        # summing them term by term mixed the two scales invariant 9 keeps apart
+        # — which is why one member's were carried instead, chosen by a weight
+        # margin of **0.003** on the deployed fit (0.4985 / 0.5015) while the two
+        # blips differ by up to **0.041** for the same patient.
         #
-        # So the choice is recorded rather than left to be inferred. The card
-        # renders this decomposition directly under a line saying the decision
-        # was model-averaged over two estimators, and a reader is owed the name
-        # of the one it is actually reading.
+        # `coefficient_summary` now publishes both on the per-remaining-visit
+        # scale, so the average is well defined, and it is the *right* quantity
+        # rather than merely an available one: `DecisionLayer._pair_contrast`
+        # builds the gap the card prints as exactly this weighted mean of the
+        # members' contrasts, so the decomposition beside it reconstructs it to
+        # the 4dp coefficient rounding (0.00018 measured, against 0.0559 when a
+        # single member's psi was carried).
+        #
+        # Non-psi coefficients still come from the dominant member. They are not
+        # decomposed onto the card, `beta:` is a treatment-free surface rather
+        # than a contrast, and averaging them raises questions nothing here is
+        # asking.
         dominant = max(results, key=lambda result: weights[result.estimator])
         low = sum(weights[result.estimator] * result.confidence_band[0] for result in results)
         high = sum(weights[result.estimator] * result.confidence_band[1] for result in results)
 
-        coefficients = dominant.coefficients | {
-            f"bma_weight:{name}": round(weight, 4) for name, weight in weights.items()
+        coefficients = {
+            name: value
+            for name, value in dominant.coefficients.items()
+            if not name.startswith("psi:")
         }
+        coefficients.update(self._averaged_blips(results, weights))
+        coefficients.update(
+            {f"bma_weight:{name}": round(weight, 4) for name, weight in weights.items()}
+        )
         coefficients["model_disagreement_variance"] = round(model_variance, 6)
-        coefficients["attribution_source"] = dominant.estimator
+        coefficients["attribution_source"] = BMA_ENSEMBLE
 
         return RegimeEstimate(
             estimator=BMA_ENSEMBLE,
@@ -115,9 +134,73 @@ class BayesianModelAverager:
             policy_value=round(sum(weights[result.estimator] * result.policy_value for result in results), 3),
             confidence_band=(round(low, 3), round(high, 3)),
             coefficients=coefficients,
-            top_tailoring_variables=dominant.top_tailoring_variables,
+            top_tailoring_variables=self._tailoring_variables(
+                coefficients, recommended, features, dominant
+            ),
             estimand_fingerprint=next(iter(fingerprints), ""),
         )
+
+    @staticmethod
+    def _averaged_blips(
+        results: list[RegimeEstimate], weights: dict[str, float]
+    ) -> dict[str, float]:
+        """Weighted-average psi, per arm and per basis term.
+
+        Weights are renormalised over the members that actually carry each key,
+        which is what `_pair_contrast` does when an estimator cannot produce a
+        contrast — a member that does not report an arm must not be read as
+        reporting zero for it.
+        """
+        collected: dict[str, list[tuple[float, float]]] = {}
+        for result in results:
+            weight = weights.get(result.estimator, 0.0)
+            for name, value in result.coefficients.items():
+                if not name.startswith("psi:"):
+                    continue
+                if not isinstance(value, (int, float)) or isinstance(value, bool):
+                    continue
+                collected.setdefault(name, []).append((weight, value))
+
+        averaged: dict[str, float] = {}
+        for name, pairs in collected.items():
+            total = sum(weight for weight, _ in pairs)
+            if total <= 0.0:
+                continue
+            averaged[name] = round(
+                sum(weight * value for weight, value in pairs) / total, 4
+            )
+        return averaged
+
+    @staticmethod
+    def _tailoring_variables(
+        coefficients: dict[str, float],
+        recommended: str,
+        features: dict[str, float] | None,
+        dominant: RegimeEstimate,
+    ) -> list[str]:
+        """Rank the drivers off the *averaged* blip, not the heavier member's.
+
+        `top_tailoring_variables` documents itself as "exactly the decomposition
+        `ModelExplainer` already reports", and that coherence is real only while
+        both read the same psi. Measured over 120 patients, the two members
+        disagreed on the printed magnitude by up to **0.147** — `anti_ccp` at
+        -0.016 against +0.131, opposite signs on the clinician card — and on the
+        *order* of the drivers for 11 of them.
+
+        Falls back to the dominant member's list when no features are supplied,
+        for callers that aggregate without a patient in hand.
+        """
+        if features is None:
+            return list(dominant.top_tailoring_variables)
+        prefix = f"psi:{recommended}:"
+        blip = {
+            name[len(prefix):]: value
+            for name, value in coefficients.items()
+            if name.startswith(prefix)
+        }
+        if not blip:
+            return list(dominant.top_tailoring_variables)
+        return top_tailoring_variables(blip, features)
 
     def _recommended(
         self,

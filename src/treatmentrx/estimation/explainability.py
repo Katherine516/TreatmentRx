@@ -145,33 +145,35 @@ class ModelExplainer:
         any arm is `(psi_leader - psi_arm) . h(X)` and splits term by term. Those
         terms are read from `selected.coefficients` — the same place
         `_attributions` reads them, so both blocks on the card describe the same
-        member, the one `attribution_source` names. The reference arm carries no
-        psi and needs none: the gap over continuing current therapy *is* the
-        leader's blip, and the two blocks agree to the last decimal there.
+        object, which `attribution_source` names and is now the ensemble itself.
+        The reference arm carries no psi and needs none: the gap over continuing
+        current therapy *is* the leader's blip, and the two blocks agree to the
+        last decimal there.
 
         `q_gap` stays the decision's own model-averaged contrast (invariant 54),
-        so it still matches the separation line. The decomposition is one
-        member's, so it reconstructs that gap to within the two members'
-        disagreement rather than exactly: over 600 entries from 120 patients the
-        residual runs mean **0.0100**, median 0.0072, max **0.0575**, against
-        gaps that reach 0.306. Reporting the decomposed total instead would make
-        the two numbers on the card disagree, which is the defect invariant 54
-        removed.
+        so it still matches the separation line — and now the decomposition is
+        the *same average*, so the two agree rather than nearly agreeing.
+        `_pair_contrast` builds the gap as the BMA-weighted mean of the members'
+        contrasts and `BayesianModelAverager` averages their blips on those same
+        weights, so the residual is the 4dp coefficient rounding: **0.00005**
+        mean and **0.00018** max over 600 entries, against 0.0100 and 0.0575 when
+        a single member's psi was carried (invariant 60).
 
-        **That residual is a disagreement, not a scale error, and only because
-        the source is dWOLS.** `Q-Pooled` publishes a stage psi from a
-        value-to-go fit and does not divide it by the remaining horizon, while
-        `q_gap` is per-remaining-visit — so a decomposition sourced from it would
-        be off by that horizon wherever the horizon is not 1. Measured at
-        `stage_index` 1, Q-Pooled's decomposition runs **1.54x to 3.49x** the gap
-        it claims to explain, against dWOLS tracking it closely; at the terminal
-        block, where the horizon is 1, both agree. `attribution_source` is
-        dWOLS-Shared for all 120 patients on the deployed fit, so nothing served
-        crosses scales today — but the BMA margin that decides it is 0.003
-        (invariant 56), so `tests/test_candidate_set.py` asserts the
-        reconstruction at every served stage rather than trusting that margin.
-        That is a guard, not a repair: the repair belongs where the scale is
-        known, in what `coefficient_summary` publishes.
+        That single member was chosen by a **0.003** weight margin while the two
+        members' blips differed by up to 0.041, so the card's decomposition and
+        the gap above it came from different objects. Reporting the decomposed
+        total in place of `q_gap` would still be wrong — that is the defect
+        invariant 54 removed — but the two no longer disagree about the number
+        they are both describing.
+
+        **The residual is a rounding now, and a scale error would still show.**
+        `Q-Pooled`'s psi is a value-to-go stage parameter; `coefficient_summary`
+        divides it by the remaining horizon so it lands on `q_gap`'s
+        per-remaining-visit scale (invariant 58). Remove that division and stage
+        1 goes to **0.0828** while the terminal block, horizon 1, does not move —
+        so `tests/test_candidate_set.py` asserts the reconstruction at every
+        served stage, at a bar well above the rounding and well below the
+        regression.
 
         Ordered by the gap printed, because the renderer shows the first two.
         """
