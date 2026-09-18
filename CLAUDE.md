@@ -8,7 +8,7 @@ test fixture, not evidence.
 ## Commands
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests    # 564 tests, ~6 min
+PYTHONPATH=src python3 -m unittest discover -s tests    # 566 tests, ~6 min
 PYTHONPATH=src python3 -m treatmentrx.cli demo          # one patient end to end
 PYTHONPATH=src python3 -m treatmentrx.cli evaluate      # estimator scorecard
 PYTHONPATH=src python3 -m treatmentrx.cli stability     # k-fold + seed sweep (~10s)
@@ -1569,6 +1569,45 @@ produced a real clinical divergence, and the notes below are the scar tissue.
    renormalised over the members that actually carry each key, matching what
    `_pair_contrast` does when an estimator cannot produce a contrast — a member
    that does not report an arm must not be read as reporting zero for it.
+
+61. **A safety sweep that scored which arms went, never why.** Layer 4 was the
+   one audit section whose perfect pair — recall 1.000 and precision 1.000 over
+   20 labelled cases — turned out to be *earned*: the expectation sets are
+   hand-written literals declared independently of `feasible_set.py`, and the
+   safe levels (ALT 25/100, eGFR 90/45, non-pregnant) give precision a real
+   denominator. What was missing is a different question.
+
+   `_RENAL_HEPATIC_ARMS` and `_TERATOGENIC_ARMS` are **the same pair**, so all
+   three physiological conditions remove the same two arms. The sweep read
+   `removed_arms` for its keys and dropped the values — and the values are the
+   reasons. So the counts cannot distinguish a filter that read the right
+   observation from one that read the wrong one and removed the same pair.
+
+   Injected, both regressions pass the old metrics untouched:
+
+   | injected defect | recall | precision | reason rate |
+   | --- | --- | --- | --- |
+   | none | 1.000 | 1.000 | 1.000 |
+   | ALT branch fires, names the renal reason | **1.000** | **1.000** | **0.857** |
+   | every reason collapsed to one string | **1.000** | **1.000** | **0.000** |
+
+   The first is the one to read. It produces a clinician card saying
+   *"JAK inhibitor unsafe with eGFR < 30"* for a patient whose eGFR is **90** and
+   whose ALT is **400** — a false explanation of why an arm was withdrawn, on the
+   layer whose whole claim is that it is code rather than prose.
+
+   Each case now carries the substring its removals must name — `ALT`, `eGFR`,
+   `pregnan`, or the allergen token, which `allergy conflict: <token>` always
+   carries — and `removal_reason_names_the_condition` scores it over the 14
+   labelled removals. `tests/test_coverage.py` asserts **both** that the check
+   catches the crossed wire *and* that recall and precision stay at 1.000
+   through it, because the point is not that the new metric works but that the
+   old ones are blind to this.
+
+   The reasons were already distinct and already served — `SafetyLayer` raises an
+   `arm_removed` flag carrying each one, and invariant 54 relies on that when it
+   drops model prose for arms Layer 4 removed. Nothing had ever checked they were
+   the *right* reasons.
 
 ## What is real vs. still a placeholder
 

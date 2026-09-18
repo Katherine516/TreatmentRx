@@ -760,6 +760,54 @@ class AuditHarnessTests(unittest.TestCase):
         self.assertEqual(metrics["healthy_patient_removals"], 0)
         self.assertEqual(metrics["allergen_composites_surviving"], {})
 
+    def test_the_removal_reason_names_the_condition_that_fired(self):
+        """Which arms went is only half of a safety filter's job.
+
+        All three physiological conditions contraindicate the same two arms, so
+        recall and precision cannot tell a filter that read the right
+        observation from one that read the wrong one and removed the same pair.
+        The reason is what the card shows a clinician and the only place that
+        distinction survives.
+        """
+        block = audit_safety().metrics["removal_reason_names_the_condition"]
+        self.assertGreater(block["removals_checked"], 10)
+        self.assertEqual(block["rate"], 1.0)
+        self.assertEqual(block["misnamed"], {})
+
+    def test_the_reason_check_catches_what_recall_and_precision_cannot(self):
+        """The regression this metric exists for, injected.
+
+        A crossed wire that fires the right branch and names the wrong organ
+        produces a card reading "unsafe with eGFR < 30" for a patient whose eGFR
+        is 90 and whose ALT is 400. Recall and precision stay at a perfect 1.000
+        through it — that is asserted here too, because the point is not that the
+        new check works but that the old ones are blind to this.
+        """
+        from treatmentrx.safety import feasible_set as fs
+
+        original = fs.FeasibleSet._unsafe_reason
+
+        def names_the_wrong_organ(self, action, alt, egfr, pregnant, tokens, arm=""):
+            reason = original(self, action, alt, egfr, pregnant, tokens, arm)
+            if reason and "ALT >" in reason:
+                return reason.replace(
+                    f"ALT > {fs.ALT_CEILING:.0f}", f"eGFR < {fs.EGFR_FLOOR:.0f}"
+                )
+            return reason
+
+        try:
+            fs.FeasibleSet._unsafe_reason = names_the_wrong_organ
+            metrics = audit_safety().metrics
+        finally:
+            fs.FeasibleSet._unsafe_reason = original
+
+        self.assertEqual(metrics["contraindication_recall"], 1.0, "recall should be blind here")
+        self.assertEqual(metrics["removal_precision"], 1.0, "precision should be blind here")
+
+        block = metrics["removal_reason_names_the_condition"]
+        self.assertLess(block["rate"], 1.0, "the reason check did not catch a misnamed organ")
+        self.assertIn("ALT=400", block["misnamed"])
+
     def test_the_safety_sweep_has_a_denominator_worth_having(self):
         """Recall over six removals could not distinguish a filter from a hammer.
 

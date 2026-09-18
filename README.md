@@ -1493,6 +1493,31 @@ where it used to discriminate 261× against the one other member, it now
 discriminates **376× against Q-Pooled and 372× against dWOLS**. It says *this is
 the ensemble*, not merely *this is not the other one*.
 
+### The safety sweep scored which arms went, never why
+
+Layer 4 was the one section whose perfect pair — recall **1.000**, precision
+**1.000** over 20 labelled cases — turned out to be earned. The expectation sets
+are hand-written literals declared independently of the implementation, and the
+safe levels give precision a real denominator. What was missing is a different
+question.
+
+The renal, hepatic and teratogenic arm sets are **the same pair**, so all three
+conditions remove the same two arms — and the sweep read `removed_arms` for its
+keys while the values, which are the reasons, went unread. Injected:
+
+| injected defect | recall | precision | reason rate |
+| --- | --- | --- | --- |
+| none | 1.000 | 1.000 | 1.000 |
+| ALT branch fires, names the renal reason | **1.000** | **1.000** | **0.857** |
+| every reason collapsed to one string | **1.000** | **1.000** | **0.000** |
+
+The first produces a card reading *"JAK inhibitor unsafe with eGFR < 30"* for a
+patient whose eGFR is **90** and whose ALT is **400** — a false explanation of
+why an arm was withdrawn, on the layer whose whole claim is that it is code
+rather than prose. Each case now carries the substring its removals must name,
+and the test asserts both that the new check catches the crossed wire *and* that
+recall and precision stay perfect through it.
+
 **Deliberately simple, and labelled as such in-module:**
 `HandcraftedFeatureEncoder` (nine clinical features normalised and tiled — not a
 learned representation, and it does not claim to be),

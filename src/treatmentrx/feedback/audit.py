@@ -583,38 +583,79 @@ def audit_safety() -> Section:
     that removes the two arms in question unconditionally. Every case here is a
     labelled (record, arm) pair, and the safe levels are what give the count a
     denominator: a filter that removes everything now scores precision 0.
+
+    **Which arms went is only half of it, and the other half was unmeasured.**
+    All three physiological conditions contraindicate the *same two arms*
+    (`_RENAL_HEPATIC_ARMS` and `_TERATOGENIC_ARMS` are the same pair), so the
+    counts above cannot tell a filter that read the right observation from one
+    that read the wrong one and removed the same pair. Injected: a crossed wire
+    that fires the ALT branch and names the renal one produces a card reading
+    *"unsafe with eGFR < 30"* for a patient whose eGFR is **90** and whose ALT is
+    **400** — and recall and precision both stay at a perfect **1.000** through
+    it. A refactor that collapses every reason to one generic string does the
+    same.
+
+    So each case now carries the substring its removals must name, and
+    `removal_reason_names_the_condition` scores it over the 14 labelled removals.
+    The reason is what the card shows a clinician; it is the only place the
+    distinction between "this drug is unsafe for your liver" and "for your
+    kidneys" survives, and `tests/test_coverage.py` pins both that the check
+    catches the crossed wire and that recall and precision do not.
     """
     orchestrator = TreatmentRxOrchestrator()
     # (label, bundle, arms that must be removed, token that must not survive)
-    cases: list[tuple[str, dict, frozenset, str | None]] = []
+    # (label, bundle, arms that must go, allergen that must not survive,
+    #  substring every removal reason must contain)
+    cases: list[tuple[str, dict, frozenset, str | None, str | None]] = []
 
     for level, unsafe in _ALT_LEVELS:
         cases.append((f"ALT={level:g}", _with_observation("ALT", level),
-                      _RENAL_HEPATIC_ARMS if unsafe else frozenset(), None))
+                      _RENAL_HEPATIC_ARMS if unsafe else frozenset(), None,
+                      "ALT" if unsafe else None))
     for level, unsafe in _EGFR_LEVELS:
         cases.append((f"eGFR={level:g}", _with_observation("eGFR", level),
-                      _RENAL_HEPATIC_ARMS if unsafe else frozenset(), None))
+                      _RENAL_HEPATIC_ARMS if unsafe else frozenset(), None,
+                      "eGFR" if unsafe else None))
     for level, unsafe in _PREGNANCY_LEVELS:
         cases.append((f"pregnant={level}", _with_observation("pregnant", level),
-                      _TERATOGENIC_ARMS if unsafe else frozenset(), None))
+                      _TERATOGENIC_ARMS if unsafe else frozenset(), None,
+                      "pregnan" if unsafe else None))
     for token, arms in _ALLERGY_CASES:
-        cases.append((f"allergy={token!r}", _with_allergy(token), arms, token))
+        # The allergen itself, which `allergy conflict: <token>` always carries.
+        cases.append((f"allergy={token!r}", _with_allergy(token), arms, token, token))
     for blank in _INERT_RECORDS:
-        cases.append((f"allergy={blank!r} (blank record)", _with_allergy(blank), frozenset(), None))
-    cases.append(("baseline (healthy)", sample_ra_bundle(), frozenset(), None))
+        cases.append((f"allergy={blank!r} (blank record)", _with_allergy(blank),
+                      frozenset(), None, None))
+    cases.append(("baseline (healthy)", sample_ra_bundle(), frozenset(), None, None))
 
     caught = expected = removed_total = spurious = 0
+    reason_named = reason_checked = 0
     misses: dict[str, list[str]] = {}
     over_removals: dict[str, list[str]] = {}
     surviving_allergens: dict[str, list[str]] = {}
+    misnamed_reasons: dict[str, list[str]] = {}
 
-    for label, bundle, should_remove, token in cases:
+    for label, bundle, should_remove, token, condition in cases:
         try:
             recommendation = orchestrator.run(bundle)
         except DataContractError:
             over_removals[label] = ["record rejected by the data contract"]
             continue
-        removed = set(recommendation.audit_event["removed_arms"])
+        reasons = dict(recommendation.audit_event["removed_arms"])
+        removed = set(reasons)
+
+        # Which arms went is only half of it. All three physiological conditions
+        # contraindicate the same two arms, so the counts above cannot tell a
+        # filter that read the right observation from one that read the wrong
+        # one and removed the same pair. The reason is what the card shows a
+        # clinician, and it is the only place that distinction survives.
+        if condition:
+            for arm in sorted(removed):
+                reason_checked += 1
+                if condition.lower() in reasons[arm].lower():
+                    reason_named += 1
+                else:
+                    misnamed_reasons.setdefault(label, []).append(f"{arm}: {reasons[arm]}")
         caught += len(removed & should_remove)
         expected += len(should_remove)
         removed_total += len(removed)
@@ -640,6 +681,11 @@ def audit_safety() -> Section:
         "labelled_removals_expected": expected,
         "contraindication_recall": _rate(caught, expected),
         "removal_precision": _rate(caught, removed_total),
+        "removal_reason_names_the_condition": {
+            "removals_checked": reason_checked,
+            "rate": _rate(reason_named, reason_checked),
+            "misnamed": misnamed_reasons,
+        },
         "allergen_composites_surviving": surviving_allergens,
         "missed": misses,
         "over_removed": over_removals,
@@ -654,6 +700,12 @@ def audit_safety() -> Section:
         f"class-level allergies, and records that must remove nothing. Recall and "
         f"precision are reported separately because a filter that removes every arm "
         f"scores perfect recall."
+    )
+    section.notes.append(
+        "`removal_reason_names_the_condition` is the half recall and precision cannot "
+        "see: all three physiological conditions contraindicate the same two arms, so "
+        "the counts stay perfect under a filter that fires the right branch and names "
+        "the wrong organ. The reason is what reaches the clinician card."
     )
     section.notes.append(
         "A drug-level allergy is expected to remove the molecule's composites and "
