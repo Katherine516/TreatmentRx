@@ -144,6 +144,35 @@ class MenuTests(unittest.TestCase):
                 self.assertIn("not a clinical source", molecule.provenance)
 
 
+class ArmNamingTests(unittest.TestCase):
+    """Whether a within-class alternative is even a coherent idea for an arm.
+
+    Derived from the arm name rather than declared, so a new arm cannot forget
+    to say which kind it is.
+    """
+
+    def test_class_named_arms_are_the_ones_with_alternatives(self):
+        self.assertFalse(formulary.is_molecule_named("TNF-inhibitor"))
+        self.assertFalse(formulary.is_molecule_named("IL-6 inhibitor"))
+        self.assertFalse(formulary.is_molecule_named("JAK-inhibitor"))
+
+    def test_an_arm_named_for_its_drug_is_recognised_as_such(self):
+        self.assertTrue(formulary.is_molecule_named("rituximab"))
+        self.assertTrue(formulary.is_molecule_named("methotrexate-optimization"))
+
+    def test_recognition_stays_broader_than_the_menu(self):
+        """`arms.py` maps `hydroxychloroquine` to the methotrexate arm and
+        `abatacept` to rituximab, because for reading a history "some csDMARD"
+        and "some non-TNF advanced therapy" is the right granularity. Neither is
+        a substitute *within* the arm's meaning, and the menu must not acquire
+        them by being derived from the recognition vocabulary."""
+        offerable = {m.name for m in formulary.MOLECULES if m.offerable}
+        for token in ("hydroxychloroquine", "sulfasalazine", "abatacept"):
+            with self.subTest(token=token):
+                self.assertEqual(normalize_arm(token) in TREATMENT_ARMS, True)
+                self.assertNotIn(token, offerable)
+
+
 class BreadthTests(unittest.TestCase):
     """Breadth is a curation choice, and these make it a measured one.
 
@@ -162,10 +191,40 @@ class BreadthTests(unittest.TestCase):
             {arm for arm in TREATMENT_ARMS if arm != REFERENCE_ARM},
         )
 
+    def test_every_widenable_arm_survives_a_single_molecule_allergy(self):
+        """The property this menu exists to have, and the reason the regimens
+        for `tofacitinib`, `baricitinib` and `sarilumab` were written.
+
+        A class-named arm with one offerable molecule is an arm a single drug
+        allergy removes outright, for a patient the same system would recognise
+        as having taken another member of that class.
+        """
+        widenable = {
+            arm: row for arm, row in self.breadth.items() if row["widening_is_possible"]
+        }
+        self.assertGreaterEqual(len(widenable), 3)
+        for arm, row in widenable.items():
+            with self.subTest(arm=arm):
+                self.assertTrue(
+                    row["survives_a_single_molecule_allergy"],
+                    f"{arm} names a drug class and offers only "
+                    f"{row['offerable_molecules']}",
+                )
+
+    def test_a_molecule_named_arm_is_not_scored_as_a_gap(self):
+        """`rituximab` and `methotrexate-optimization` are named for the drug
+        they are: swapping the molecule makes them a different arm. Reporting
+        them as unwidened breadth would be a gap that cannot be closed, and the
+        audit's denominator would be wrong rather than merely unflattering."""
+        named = {arm for arm, row in self.breadth.items() if row["named_after_its_molecule"]}
+        self.assertEqual(named, {"rituximab", "methotrexate-optimization"})
+        for arm in named:
+            with self.subTest(arm=arm):
+                self.assertFalse(self.breadth[arm]["widening_is_possible"])
+
     def test_survival_follows_the_offer_count_not_the_declared_count(self):
-        """JAK declares three molecules and offers one, so it does not survive —
-        and the reported flag has to track the offer list, because that is what
-        the patient is left with."""
+        """The flag has to track the offer list, not the declared one, because
+        the offer list is what the patient is left with."""
         for arm, row in self.breadth.items():
             with self.subTest(arm=arm):
                 self.assertEqual(

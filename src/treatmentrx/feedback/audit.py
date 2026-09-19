@@ -455,13 +455,25 @@ _TERATOGENIC_ARMS = frozenset({"JAK-inhibitor", "methotrexate-optimization"})
 # composite one below: the allergen must never appear in a feasible action.
 # Getting this distinction wrong in the audit is how a correct filter gets
 # "fixed" into an over-removing one.
+#
+# `tocilizumab` and `upadacitinib` used to expect their whole arm to go, and that
+# was the rule above failing to apply rather than an exception to it: those arms
+# had one offerable molecule each, so the only composite was the allergen's. The
+# formulary now offers `sarilumab` and two more JAK molecules, and both cases
+# moved to the empty expectation every other drug-level allergy already had.
+# The full sweep is what caught it — recall fell to 0.857 with these two listed
+# as misses, which is the fixture reporting that a behaviour change had made its
+# own labels inconsistent.
+#
+# `rituximab` and `methotrexate` stay non-empty and are not exceptions either:
+# their arms are named after the molecule, so removing it *is* removing the arm.
 _ALLERGY_CASES = (
     ("TNF-inhibitor", frozenset({"TNF-inhibitor"})),
     ("adalimumab", frozenset()),
     ("etanercept", frozenset()),
-    ("tocilizumab", frozenset({"IL-6 inhibitor"})),
+    ("tocilizumab", frozenset()),
     ("IL-6 inhibitor", frozenset({"IL-6 inhibitor"})),
-    ("upadacitinib", frozenset({"JAK-inhibitor"})),
+    ("upadacitinib", frozenset()),
     ("rituximab", frozenset({"rituximab"})),
     ("methotrexate", frozenset({"methotrexate-optimization"})),
 )
@@ -727,20 +739,32 @@ def _formulary_breadth() -> dict:
     outright, while an arm offered as two survives on the other. Measured, one of
     five survives.
 
-    That narrowness is a curation choice and not a property of the method —
-    `arms.py` recognises three JAK molecules and the hazard classes cover the
-    same three, while the menu offers one. Reported rather than tuned: widening
-    it means writing regimens for molecules the formulary declares but does not
-    propose, which is a clinical task and not a statistical one.
+    **The denominator is the arms widening is possible for, not all of them.**
+    `methotrexate-optimization` and `rituximab` are named after their only
+    molecule — swapping it would make them a different arm — so they are
+    single-molecule by definition and no menu can widen them. Scoring them
+    alongside the class-named arms reported three-fifths of a gap where
+    two-fifths of it did not exist.
+
+    On the class-named three the narrowness *was* curation: `arms.py` recognised
+    three JAK molecules and the hazard classes covered the same three while the
+    menu offered one. Those regimens are written now and all three survive.
     """
     breadth = formulary.breadth()
+    widenable = {arm: row for arm, row in breadth.items() if row["widening_is_possible"]}
     return {
         "version": formulary.VERSION,
         "arms": breadth,
-        "arms_surviving_a_single_molecule_allergy": sum(
-            1 for row in breadth.values() if row["survives_a_single_molecule_allergy"]
+        # Out of the arms it is coherent to widen — a molecule-named arm has one
+        # molecule by definition and belongs in neither the numerator nor the
+        # denominator of this.
+        "widenable_arms_surviving_a_single_molecule_allergy": sum(
+            1 for row in widenable.values() if row["survives_a_single_molecule_allergy"]
         ),
-        "arms_scored": len(breadth),
+        "widenable_arms": len(widenable),
+        "arms_named_after_their_only_molecule": sorted(
+            arm for arm, row in breadth.items() if row["named_after_its_molecule"]
+        ),
         "declared_but_never_offered": sorted(
             molecule.name for molecule in formulary.MOLECULES if not molecule.offerable
         ),

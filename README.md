@@ -1553,12 +1553,45 @@ though it broadened a safety rule and did not.
 safety path, the feasible composite sets and the whole safety audit hash
 identically before and after.
 
-What is new is that breadth is measured. `cli audit` reports `formulary_breadth`
-and `GET /model` carries the version: **1 of 5 arms** survives a single drug
-allergy, and three molecules are declared but never offered. Widening that menu
-means writing dose, route and timing for molecules the file declares but does not
-propose — clinical content, not a refactor — so the number is published and the
-decision is left to a human, the same way `COHORT_SIZE` is.
+What is new is that breadth is measured — `cli audit` reports
+`formulary_breadth` and `GET /model` carries the version.
+
+### The denominator was wrong before the number was
+
+That measurement first read **1 of 5 arms** survives a single drug allergy.
+Asking what it *should* be turned out to be two questions.
+
+**Two of the five cannot be widened at all.** `methotrexate-optimization` and
+`rituximab` are named after their only molecule; swapping it makes them a
+different arm. The other three name a *class*, and a class has members. Scored
+over all five, the figure reported three-fifths of a gap where two-fifths of it
+did not exist. The distinction is derived from the arm name, so a new arm cannot
+forget to declare it.
+
+**On the other three the narrowness was curation.** `arms.py` already recognised
+`tofacitinib`, `baricitinib` and `sarilumab`, and the hazard classes already
+covered the JAK pair — the menu was the only place they were missing:
+
+| | before | after |
+| --- | --- | --- |
+| IL-6 survives a tocilizumab allergy | no | **yes** |
+| JAK survives an upadacitinib allergy | no | **yes** |
+| composites offered (IL-6 / JAK) | 2 / 1 | **3 / 3** |
+| widenable arms surviving | 1 of 3 | **3 of 3** |
+
+**It changes feasibility and nothing else.** Statuses, recommendations, Q-values
+and removals over 40 patients with no allergy hash identically before and after —
+a wider menu cannot move a decision, because the arm-level Q-values never saw the
+composites. The organ-function paths still take the *whole* widened arm:
+pregnancy, ALT 400 and eGFR 12 each remove all three JAK composites with the
+reason naming the condition. IL-6 correctly drops to two under pregnancy, the
+MTX-combination going and the monotherapy surviving.
+
+Deliberately still narrow: TNF gains nothing (it already survives),
+and `hydroxychloroquine`, `sulfasalazine` and `abatacept` stay recognised and
+unoffered — they map to an arm for *reading a history*, not as substitutes within
+it. A test asserts the menu does not acquire them by being derived from the
+recognition vocabulary.
 
 **Deliberately simple, and labelled as such in-module:**
 `HandcraftedFeatureEncoder` (nine clinical features normalised and tiled — not a

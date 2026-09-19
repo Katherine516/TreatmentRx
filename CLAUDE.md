@@ -8,7 +8,7 @@ test fixture, not evidence.
 ## Commands
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests    # 580 tests, ~6 min
+PYTHONPATH=src python3 -m unittest discover -s tests    # 586 tests, ~6 min
 PYTHONPATH=src python3 -m treatmentrx.cli demo          # one patient end to end
 PYTHONPATH=src python3 -m treatmentrx.cli evaluate      # estimator scorecard
 PYTHONPATH=src python3 -m treatmentrx.cli stability     # k-fold + seed sweep (~10s)
@@ -1662,18 +1662,98 @@ produced a real clinical divergence, and the notes below are the scar tissue.
    and after. The derived menu reproduces the old literal exactly.
 
    **Breadth is now measured instead of accidental.** `cli audit` reports
-   `formulary_breadth` and `GET /model` carries the version: **1 of 5** arms
-   survives a single drug allergy, and three molecules are declared but never
-   offered. An arm offered as one molecule is an arm one allergy removes
-   outright — a property of the curation, not of the method.
+   `formulary_breadth` and `GET /model` carries the version. An arm offered as
+   one molecule is an arm one allergy removes outright — a property of the
+   curation, not of the method. Invariant 63 acts on it.
 
-   **Reported, not acted on.** Widening the menu means writing regimens for
-   molecules this file declares but does not propose, and that is a clinical
-   task: dose, route and timing are content, not a refactor. The same shape as
-   `COHORT_SIZE` — the number that makes the decision is published and the
-   decision is left to a human. Every entry carries `provenance` saying the
-   curation is illustrative, per molecule rather than in a header, so a reader
-   inspecting one does not have to go looking.
+   Every entry carries `provenance` saying the curation is illustrative, per
+   molecule rather than in a header, so a reader inspecting one does not have to
+   go looking.
+
+63. **"1 of 5 arms survives a single allergy" was the wrong denominator.**
+   Invariant 62 published that number and left the decision to a human. Asking
+   what the number should be first is what made it actionable, and it was two
+   questions rather than one.
+
+   **Two of those five arms cannot be widened at all.**
+   `methotrexate-optimization` and `rituximab` are named after their only
+   molecule: swapping it makes them a different arm. `TNF-inhibitor`,
+   `IL-6 inhibitor` and `JAK-inhibitor` name a *class*, and a class has members.
+   `is_molecule_named` derives that from the arm name rather than declaring it,
+   so a new arm cannot forget to say which kind it is, and the audit's
+   denominator is the three arms widening is coherent for. Scored over all five,
+   the old figure reported three-fifths of a gap where two-fifths of it did not
+   exist.
+
+   **On the other three the narrowness was curation, and it is closed.**
+   `arms.py` already recognised `tofacitinib`, `baricitinib` and `sarilumab`, and
+   the hazard classes already covered the JAK pair — the menu was the only place
+   they were missing. Writing their regimens takes JAK from 1 offerable molecule
+   to 3 and IL-6 from 1 to 2, so **3 of 3** widenable arms now survive a
+   single-molecule allergy where **1 of 3** did.
+
+   | | before | after |
+   | --- | --- | --- |
+   | IL-6 inhibitor survives a tocilizumab allergy | no | **yes** |
+   | JAK-inhibitor survives an upadacitinib allergy | no | **yes** |
+   | TNF-inhibitor survives either of its two | yes | yes |
+   | composites offered (IL-6 / JAK) | 2 / 1 | **3 / 3** |
+
+   **It changes feasibility and nothing else, asserted rather than assumed.**
+   Statuses, recommendations, Q-values and removals over 40 patients with no
+   allergy hash **identically** before and after — a wider menu cannot move a
+   decision, because the arm-level Q-values never saw the composites. What moves
+   is only which arms survive a contraindication, and only in the direction
+   invariant 15 wants.
+
+   The organ-function paths still remove the *whole* widened arm: pregnancy, ALT
+   400 and eGFR 12 each take all three JAK composites with the reason naming the
+   condition, because the hazard is declared on the class and every member
+   carries it. IL-6 correctly drops from 3 composites to 2 under pregnancy — the
+   MTX-combination goes and the monotherapy survives, which is invariant 15
+   working rather than an exception to it.
+
+   **What is deliberately still narrow.** `TNF-inhibitor` gains nothing here:
+   `arms.py` recognises three more TNF molecules, but the arm already survives
+   and adding them buys no measured property. `hydroxychloroquine`,
+   `sulfasalazine` and `abatacept` stay recognised and unoffered — they map to an
+   arm for *reading a history*, where "some csDMARD" is the right granularity,
+   and none is a substitute within that arm's meaning. `leflunomide` stays
+   declared, hepatotoxic and unoffered. The recognition vocabulary must stay
+   broader than the menu, and a test asserts the menu does not acquire those
+   three by being derived from it.
+
+   The three regimens are ordinary RA dosing and, like every other entry, carry
+   `provenance` marking the curation illustrative rather than sourced. This is
+   the one commit in this sequence that adds clinical content, and what keeps it
+   honest is that the content is labelled, the effect is measured on both sides,
+   and the property it buys is pinned by a test that fails if the menu narrows
+   back.
+
+   **The safety sweep caught two of its own labels going stale, which is the
+   fixture working.** `_ALLERGY_CASES` states its rule in a comment — *a
+   drug-level allergy removes only that molecule's composites, and the arm
+   survives if another molecule in it does, so the arm-level expectation is
+   empty* — and `tocilizumab` and `upadacitinib` were listed non-empty. That was
+   the rule failing to apply rather than an exception to it: those arms had one
+   offerable molecule, so the only composite was the allergen's. Widening made
+   the rule reach them, recall fell to **0.857** naming both as misses, and both
+   moved to the empty expectation every other drug-level allergy already had.
+
+   `rituximab` and `methotrexate` stay non-empty and are not exceptions either —
+   their arms are named after the molecule, so removing it *is* removing the arm.
+   The rule is now uniform with no special cases, which it was not before.
+
+   **The guarantee that did not move** is the composite one, and it is the one
+   that matters: the allergen never survives into a feasible action, verified for
+   all eight tokens. `tests/test_workflow.py` asserted the old narrowness in a
+   test *name* — `test_a_drug_level_allergy_still_removes_the_arm` — and now
+   asserts the molecule goes, the arm survives on `sarilumab`, and the allergen
+   appears nowhere.
+
+   *Found by the full suite, not by the module subset I ran first: I checked the
+   safety modules at the refactor stage and then changed behaviour, re-running
+   only the formulary and docs tests before the full run.*
 
 ## What is real vs. still a placeholder
 

@@ -145,6 +145,15 @@ MOLECULES: tuple = (
         ),
     ),
     Molecule(
+        name="sarilumab",
+        arm="IL-6 inhibitor",
+        hazards=frozenset(),
+        provenance=_PLACEHOLDER,
+        regimens=(
+            CompositeAction(drug="sarilumab", dose="200mg", route="SC", timing="q2wk"),
+        ),
+    ),
+    Molecule(
         name="upadacitinib",
         arm="JAK-inhibitor",
         # Hepatotoxic as well as JAK-class: `safety/rules.py` already classed the
@@ -161,15 +170,19 @@ MOLECULES: tuple = (
         name="tofacitinib",
         arm="JAK-inhibitor",
         hazards=frozenset({HAZARD_JAK, HAZARD_HEPATOTOXIC, HAZARD_TERATOGENIC}),
-        provenance=f"{_PLACEHOLDER}; hazard-classed but never proposed",
-        offerable=False,
+        provenance=_PLACEHOLDER,
+        regimens=(
+            CompositeAction(drug="tofacitinib", dose="5mg", route="PO", timing="BD"),
+        ),
     ),
     Molecule(
         name="baricitinib",
         arm="JAK-inhibitor",
         hazards=frozenset({HAZARD_JAK, HAZARD_HEPATOTOXIC, HAZARD_TERATOGENIC}),
-        provenance=f"{_PLACEHOLDER}; hazard-classed but never proposed",
-        offerable=False,
+        provenance=_PLACEHOLDER,
+        regimens=(
+            CompositeAction(drug="baricitinib", dose="4mg", route="PO", timing="daily"),
+        ),
     ),
     Molecule(
         name="rituximab",
@@ -206,6 +219,26 @@ def hazard_tokens(hazard: str) -> tuple:
         if hazard in molecule.hazards:
             tokens.extend(molecule.match_tokens)
     return tuple(dict.fromkeys(tokens))
+
+
+def is_molecule_named(arm: str) -> bool:
+    """Is the arm named after one of its own molecules?
+
+    This decides whether a within-class alternative is even a coherent idea.
+    `rituximab` and `methotrexate-optimization` are named for the drug they are;
+    swapping the molecule would make them a different arm, so they are
+    single-molecule by definition and a menu cannot widen them. `TNF-inhibitor`,
+    `IL-6 inhibitor` and `JAK-inhibitor` name a *class*, and a class has members.
+
+    Derived from the arm name rather than declared, so adding an arm cannot
+    forget to say which kind it is. `arms.ARM_SYNONYMS` recognises
+    `hydroxychloroquine` under the methotrexate arm and `abatacept` under
+    rituximab — for reading a history, where "some csDMARD" and "some non-TNF
+    advanced therapy" is the right granularity. Neither is a substitute *within*
+    the arm's meaning, which is why the recognition vocabulary stays separate
+    from this one.
+    """
+    return any(molecule.name in arm.lower() for molecule in molecules_for(arm))
 
 
 def arms_with_hazard(hazard: str) -> tuple:
@@ -261,12 +294,18 @@ def breadth() -> dict:
             continue
         declared = molecules_for(arm)
         offered = offerable_for(arm)
+        molecule_named = is_molecule_named(arm)
         summary[arm] = {
             "declared_molecules": [molecule.name for molecule in declared],
             "offerable_molecules": [molecule.name for molecule in offered],
             "composites": len(composites_for(arm)),
             # One molecule means one allergy takes the arm; two means it survives.
             "survives_a_single_molecule_allergy": len(offered) > 1,
+            # Whether widening is even coherent. Reporting "1 of 5 arms survive"
+            # without this reads as three-fifths of a gap, when two of those arms
+            # are named for their only molecule and cannot be widened at all.
+            "named_after_its_molecule": molecule_named,
+            "widening_is_possible": not molecule_named,
         }
     return summary
 
@@ -298,6 +337,7 @@ __all__ = [
     "breadth",
     "composites_for",
     "hazard_tokens",
+    "is_molecule_named",
     "molecules_for",
     "offerable_for",
     "unrecognised_offerables",

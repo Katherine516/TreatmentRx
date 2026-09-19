@@ -345,9 +345,37 @@ class AllergyMatchingTests(unittest.TestCase):
         recommendation = TreatmentRxOrchestrator().run(_bundle(_allergy("TNF-inhibitor")))
         self.assertIn("TNF-inhibitor", recommendation.audit_event["removed_arms"])
 
-    def test_a_drug_level_allergy_still_removes_the_arm(self):
-        recommendation = TreatmentRxOrchestrator().run(_bundle(_allergy("tocilizumab")))
-        self.assertIn("IL-6 inhibitor", recommendation.audit_event["removed_arms"])
+    def test_a_drug_level_allergy_removes_the_molecule_not_the_arm(self):
+        """It used to remove the arm, and that was the menu rather than the rule.
+
+        `IL-6 inhibitor` offered one molecule, so the only composite was the
+        allergen's and the arm went with it. It offers `sarilumab` too now, and
+        an arm the patient can still take must not be withdrawn for an allergy to
+        a different drug in the same class.
+
+        The guarantee that does not move is the composite one: the allergen never
+        survives into a feasible action.
+        """
+        from treatmentrx.feedback.audit import _feasible_actions
+
+        bundle = _bundle(_allergy("tocilizumab"))
+        recommendation = TreatmentRxOrchestrator().run(bundle)
+        self.assertNotIn("IL-6 inhibitor", recommendation.audit_event["removed_arms"])
+        surviving = _feasible_actions(bundle)
+        self.assertFalse(
+            [action for action in surviving if "tocilizumab" in action.lower()],
+            "the allergen survived as a feasible composite",
+        )
+        self.assertTrue(
+            [action for action in surviving if "sarilumab" in action.lower()],
+            "the arm survived on nothing — it should survive on the other molecule",
+        )
+
+    def test_a_drug_level_allergy_still_removes_a_molecule_named_arm(self):
+        """`rituximab` is named after its only molecule, so removing the drug is
+        removing the arm. Not an exception to the rule above — the same rule."""
+        recommendation = TreatmentRxOrchestrator().run(_bundle(_allergy("rituximab")))
+        self.assertIn("rituximab", recommendation.audit_event["removed_arms"])
 
     def test_an_allergy_to_every_arm_blocks(self):
         recommendation = TreatmentRxOrchestrator().run(
