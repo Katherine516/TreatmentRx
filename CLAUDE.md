@@ -8,7 +8,7 @@ test fixture, not evidence.
 ## Commands
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests    # 566 tests, ~6 min
+PYTHONPATH=src python3 -m unittest discover -s tests    # 580 tests, ~6 min
 PYTHONPATH=src python3 -m treatmentrx.cli demo          # one patient end to end
 PYTHONPATH=src python3 -m treatmentrx.cli evaluate      # estimator scorecard
 PYTHONPATH=src python3 -m treatmentrx.cli stability     # k-fold + seed sweep (~10s)
@@ -72,6 +72,7 @@ treatmentrx/
   contracts.py   the six layer handoffs (PatientState, RegimeEstimate, Decision,
                  SafeDecision, Recommendation, FeedbackReceipt)
   arms.py        the canonical treatment-arm vocabulary
+  formulary.py   the molecules each arm may be prescribed as, and their hazards
   simulation/    the cohort with known blips, plus a FHIR exporter so
                  simulated patients re-enter through Layer 1
   data/          Layer 1  → PatientState
@@ -127,7 +128,9 @@ produced a real clinical divergence, and the notes below are the scar tissue.
    2 blocked on a recommended arm, 7 routed to review, 0 blocked for want of a
    survivor.
 3. **One arm vocabulary**: `arms.py`. The data contract, the estimators, the
-   composite action space and the feasible-set filter must all agree.
+   composite action space and the feasible-set filter must all agree. **And one
+   molecule vocabulary**: `formulary.py` — see invariant 62, which is this same
+   rule a layer down, where four literals had already drifted.
 4. **One type per layer handoff.** `MethodResult`/`RegimeEstimate` and
    `PatientStage`/`StageRecord` were once duplicate pairs, and the conversion
    between them silently dropped the timing, belief, switching and competing-risk
@@ -1608,6 +1611,69 @@ produced a real clinical divergence, and the notes below are the scar tissue.
    `arm_removed` flag carrying each one, and invariant 54 relies on that when it
    drops model prose for arms Layer 4 removed. Nothing had ever checked they were
    the *right* reasons.
+
+62. **The arm vocabulary is one file; the molecule vocabulary was four.**
+   Invariant 3 holds — every layer agrees on the six arm names. The layer below
+   it did not. *Which molecules belong to an arm, and which hazards they carry*
+   was declared in four places, and nothing compared them:
+
+   | | declares | for |
+   | --- | --- | --- |
+   | `arms.ARM_SYNONYMS` | 5 TNF, 2 IL-6, 3 JAK molecules + class tokens | reading a history |
+   | `estimation.actions.ARM_CANDIDATES` | 2 TNF, 1 IL-6, **1 JAK** | what may be proposed |
+   | `safety.feasible_set.{JAK_DRUGS, HEPATOTOXIC_DRUGS}` | 3 JAK, 3 hepatotoxic tokens | composite filter |
+   | `safety.rules.HEPATOTOXIC_TOKENS` | 6 tokens | arm-level warning |
+
+   **Two of them agreed and the third had fallen behind.** `arms.py` recognises
+   `upadacitinib`, `tofacitinib` and `baricitinib`; `feasible_set.py`
+   hazard-classes the same three; the menu offered **one**. So an upadacitinib
+   allergy removes the whole JAK arm from a patient the agent would recognise as
+   having taken baricitinib — invariant 15's failure mode one level below where
+   invariant 15 guards it.
+
+   **The two hepatic lists were not subsets of each other** (`mtx` only in one,
+   the three JAK molecules only in the other) and still classed every arm the
+   same way. That agreement was curation, not construction, and nothing would
+   have caught it parting.
+
+   `formulary.py` is now the single declaration and the other three derive from
+   it. Three vocabularies stay **deliberately distinct**, because collapsing them
+   would be wrong: *recognition* is broadest and must place a drug the agent
+   would never propose; *offer* is a curated subset and a formulary decision;
+   *hazard* covers everything offerable and is matched by **spellings** rather
+   than molecules — `mtx` because a composite carries `combination="MTX"`.
+   `offerable=False` makes "known, hazard-classed, never proposed" a declared
+   state rather than an accident, which is what `leflunomide` had always been.
+
+   **A dead list in a safety rule, found on the way.**
+   `rules.HEPATOTOXIC_TOKENS` was molecule spellings substring-matched against a
+   **canonical arm name** — in both places that read it, including
+   `stage.treatment`, which Layer 1 maps through `normalize_arm`. So
+   `tofacitinib`, `baricitinib`, `upadacitinib` and `leflunomide` **could never
+   match in either**; only `methotrexate` and `jak` did any work. The list read
+   as though it broadened the rule and did not. An arm-level question now reads
+   arm-level membership, `arms_with_hazard`. *I checked one call site first and
+   was wrong about the second — the exception from the missing import is what
+   sent me to look, and `stage.treatment` had to be measured rather than assumed.*
+
+   **Nothing served changed, asserted rather than assumed.** 25 cohort cards,
+   every safety path (high ALT, low eGFR, pregnancy, eight allergy tokens), the
+   feasible composite sets and the whole safety audit hash **identically** before
+   and after. The derived menu reproduces the old literal exactly.
+
+   **Breadth is now measured instead of accidental.** `cli audit` reports
+   `formulary_breadth` and `GET /model` carries the version: **1 of 5** arms
+   survives a single drug allergy, and three molecules are declared but never
+   offered. An arm offered as one molecule is an arm one allergy removes
+   outright — a property of the curation, not of the method.
+
+   **Reported, not acted on.** Widening the menu means writing regimens for
+   molecules this file declares but does not propose, and that is a clinical
+   task: dose, route and timing are content, not a refactor. The same shape as
+   `COHORT_SIZE` — the number that makes the decision is published and the
+   decision is left to a human. Every entry carries `provenance` saying the
+   curation is illustrative, per molecule rather than in a header, so a reader
+   inspecting one does not have to go looking.
 
 ## What is real vs. still a placeholder
 

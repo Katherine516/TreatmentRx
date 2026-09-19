@@ -27,6 +27,7 @@ from treatmentrx.arms import TREATMENT_ARMS, normalize_arm
 from treatmentrx.data import DataContractError, DataLayer
 from treatmentrx.demo_data import sample_ra_bundle
 from treatmentrx.domain import RecommendationStatus
+from treatmentrx import formulary
 from treatmentrx.estimation import training
 from treatmentrx.decision.bma import BMA_ENSEMBLE
 from treatmentrx.estimation.basis import BLIP_BASIS, blip_basis
@@ -690,7 +691,8 @@ def audit_safety() -> Section:
         "missed": misses,
         "over_removed": over_removals,
         "spurious_removals": spurious,
-"contraindication_routing": _contraindication_routing(),
+        "formulary_breadth": _formulary_breadth(),
+        "contraindication_routing": _contraindication_routing(),
         "healthy_patient_removals": len(
             orchestrator.run(sample_ra_bundle()).audit_event["removed_arms"]
         ),
@@ -714,6 +716,35 @@ def audit_safety() -> Section:
         "surviving composite set, where it must not appear at all."
     )
     return section
+
+
+def _formulary_breadth() -> dict:
+    """How much of each arm survives a single drug allergy, and why.
+
+    The safety sweep above scores the filter. This scores the *menu* the filter
+    runs over, which is a different thing and decides how much a correct removal
+    costs: an arm offered as one molecule is an arm a single allergy removes
+    outright, while an arm offered as two survives on the other. Measured, one of
+    five survives.
+
+    That narrowness is a curation choice and not a property of the method —
+    `arms.py` recognises three JAK molecules and the hazard classes cover the
+    same three, while the menu offers one. Reported rather than tuned: widening
+    it means writing regimens for molecules the formulary declares but does not
+    propose, which is a clinical task and not a statistical one.
+    """
+    breadth = formulary.breadth()
+    return {
+        "version": formulary.VERSION,
+        "arms": breadth,
+        "arms_surviving_a_single_molecule_allergy": sum(
+            1 for row in breadth.values() if row["survives_a_single_molecule_allergy"]
+        ),
+        "arms_scored": len(breadth),
+        "declared_but_never_offered": sorted(
+            molecule.name for molecule in formulary.MOLECULES if not molecule.offerable
+        ),
+    }
 
 
 def _feasible_actions(bundle) -> list[str]:

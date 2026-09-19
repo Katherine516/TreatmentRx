@@ -11,6 +11,8 @@ narrative. Nothing downstream may promote or demote either one.
 
 from __future__ import annotations
 
+from treatmentrx import formulary
+
 from treatmentrx.contracts import Decision, PatientState
 from treatmentrx.domain import RecommendationStatus, SafetyFlag, StageRecord
 from treatmentrx.safety.feasible_set import allergy_matches
@@ -20,7 +22,17 @@ ALT_CEILING = 120.0
 EGFR_FLOOR = 30.0
 
 # Trajectory-level delayed-toxicity trigger.
-HEPATOTOXIC_TOKENS = ("methotrexate", "jak", "tofacitinib", "baricitinib", "upadacitinib", "leflunomide")
+#: Arms carrying a hepatotoxic molecule, derived from the formulary.
+#:
+#: This was a tuple of *molecule* spellings, and both places that read it
+#: substring-matched it against a **canonical arm name** — once against the arm
+#: under consideration, once against `stage.treatment`, which Layer 1 maps
+#: through `normalize_arm`. So four of its six tokens could never match in
+#: either: no arm is called `tofacitinib`, `baricitinib`, `upadacitinib` or
+#: `leflunomide`. Only `methotrexate` and `jak` did any work, so the list read as
+#: though it broadened the rule and did not. An arm-level question wants
+#: arm-level membership.
+HEPATOTOXIC_ARMS = formulary.arms_with_hazard(formulary.HAZARD_HEPATOTOXIC)
 RISING_ALT_FLOOR = 60.0
 CUMULATIVE_EXPOSURE_STAGES = 2
 
@@ -103,9 +115,11 @@ class SafetyRules:
         argmax happened to be non-hepatotoxic while the set still held
         hepatotoxic options — a warning lost for no reason.
         """
-        exposure = sum(
-            1 for stage in stages if any(token in stage.treatment.lower() for token in HEPATOTOXIC_TOKENS)
-        )
+        # `stage.treatment` is a canonical arm name — Layer 1 maps free text
+        # through `normalize_arm` — so this asks the same arm-level question the
+        # branch below does, and the molecule spellings it used to match against
+        # were unreachable here too.
+        exposure = sum(1 for stage in stages if _is_hepatotoxic(stage.treatment))
         alts = [
             _numeric(stage.features.get("alt"))
             for stage in stages
@@ -162,7 +176,7 @@ class SafetyRules:
 
 
 def _is_hepatotoxic(arm: str) -> bool:
-    return any(token in arm.lower() for token in HEPATOTOXIC_TOKENS)
+    return arm in HEPATOTOXIC_ARMS
 
 
 def _numeric(value: object) -> float | None:

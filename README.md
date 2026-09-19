@@ -1518,6 +1518,48 @@ rather than prose. Each case now carries the substring its removals must name,
 and the test asserts both that the new check catches the crossed wire *and* that
 recall and precision stay perfect through it.
 
+### The arm vocabulary is one file; the molecule vocabulary was four
+
+Every layer agrees on the six arm names. The layer below — *which molecules
+belong to an arm, and which hazards they carry* — was declared in four places
+with nothing comparing them:
+
+| declares | count | for |
+| --- | --- | --- |
+| `arms.ARM_SYNONYMS` | 3 JAK molecules | reading a history |
+| `estimation.actions.ARM_CANDIDATES` | **1 JAK molecule** | what may be proposed |
+| `safety.feasible_set.JAK_DRUGS` | 3 JAK molecules | composite filter |
+| `safety.rules.HEPATOTOXIC_TOKENS` | 6 mixed tokens | arm-level warning |
+
+Two agreed and the third had fallen behind. An upadacitinib allergy removes the
+whole JAK arm from a patient the agent would happily recognise as having taken
+baricitinib. The two hepatic lists were not subsets of each other and still
+classed every arm identically — agreement by curation, not by construction.
+
+`formulary.py` is the single declaration now and the rest derive from it. Three
+vocabularies stay deliberately distinct: *recognition* is broadest and must place
+a drug the agent would never propose; *offer* is a curated subset;
+*hazard* is matched by spellings rather than molecules — `mtx` exists because a
+composite carries `combination="MTX"`. `offerable=False` makes "known,
+hazard-classed, never proposed" a declared state instead of an accident.
+
+**A dead list turned up on the way.** `HEPATOTOXIC_TOKENS` was molecule spellings
+substring-matched against a **canonical arm name**, in both places that read it.
+`tofacitinib`, `baricitinib`, `upadacitinib` and `leflunomide` could never match
+in either — only `methotrexate` and `jak` did any work, so the list read as
+though it broadened a safety rule and did not.
+
+**Nothing served changed**, asserted rather than assumed: 25 cohort cards, every
+safety path, the feasible composite sets and the whole safety audit hash
+identically before and after.
+
+What is new is that breadth is measured. `cli audit` reports `formulary_breadth`
+and `GET /model` carries the version: **1 of 5 arms** survives a single drug
+allergy, and three molecules are declared but never offered. Widening that menu
+means writing dose, route and timing for molecules the file declares but does not
+propose — clinical content, not a refactor — so the number is published and the
+decision is left to a human, the same way `COHORT_SIZE` is.
+
 **Deliberately simple, and labelled as such in-module:**
 `HandcraftedFeatureEncoder` (nine clinical features normalised and tiled — not a
 learned representation, and it does not claim to be),

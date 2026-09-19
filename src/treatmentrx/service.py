@@ -47,6 +47,7 @@ from enum import Enum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+from treatmentrx import formulary
 from treatmentrx.scientific import ScientificMode
 
 DEFAULT_HOST = "127.0.0.1"
@@ -194,6 +195,16 @@ class RecommendationService:
                 "seed": training.COHORT_SEED,
             },
             "serving_ensemble": list(training.SERVING_ENSEMBLE),
+            # A recommendation is an arm, but what a clinician acts on is a
+            # molecule and a regimen, and those come from a curated menu. The
+            # version names it; `breadth` says how narrow it is, because an arm
+            # offered as one molecule is an arm a single drug allergy removes
+            # outright — a property of the curation, not of the model.
+            "formulary": {
+                "version": formulary.VERSION,
+                "curation": "illustrative, not sourced from a guideline",
+                "breadth": formulary.breadth(),
+            },
             "held_out": {
                 name: {
                     "policy_value": score.ipw_policy_value,

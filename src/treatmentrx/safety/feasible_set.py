@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from treatmentrx import formulary
 from treatmentrx.domain import CompositeAction, StageRecord
 
 
@@ -19,9 +20,15 @@ ALT_CEILING = 120.0
 EGFR_FLOOR = 30.0
 DOSE_CEILING_MG = 1500.0
 
-JAK_DRUGS = frozenset({"upadacitinib", "tofacitinib", "baricitinib"})
-# Agents whose label carries hepatic monitoring, as drug or as background combo.
-HEPATOTOXIC_DRUGS = ("methotrexate", "mtx", "leflunomide")
+# Derived from the formulary rather than restated. These were two hand-kept
+# literals, and a third lived in `safety/rules.py` with neither a subset of the
+# other — they agreed on every arm, but by curation rather than by construction.
+# A molecule the agent never proposes still contributes its spellings, because a
+# hazard has to be recognised wherever it appears: `mtx` is here because a
+# composite carries `combination="MTX"`, and `leflunomide` because a background
+# regimen could name it.
+JAK_DRUGS = frozenset(formulary.hazard_tokens(formulary.HAZARD_JAK))
+HEPATOTOXIC_DRUGS = formulary.hazard_tokens(formulary.HAZARD_HEPATOTOXIC)
 
 
 def _normalise_clinical_text(value: str) -> str:

@@ -1,0 +1,192 @@
+"""The molecule vocabulary, and the relationships four literals kept by hand.
+
+`arms.py` is the canonical arm vocabulary and invariant 3 says every layer must
+agree on it. They do. The layer below — which molecules belong to an arm, and
+which hazards they carry — was declared in four places, and *nothing compared
+them*, so the one that had already fallen behind went unnoticed: `arms.py`
+recognises three JAK molecules and `safety/feasible_set.py` hazard-classed the
+same three, while the offer list carried one.
+
+These assert the relationships rather than the contents. The curation is
+illustrative and will be replaced; what must survive that replacement is that
+the offer list, the hazard classes and the recognition vocabulary still line up.
+"""
+
+import unittest
+
+from treatmentrx import formulary
+from treatmentrx.arms import REFERENCE_ARM, TREATMENT_ARMS, normalize_arm
+
+
+class VocabularyAgreementTests(unittest.TestCase):
+    def test_every_offerable_molecule_is_recognisable(self):
+        """The agent must be able to read back a line it proposed.
+
+        A molecule it offers but `normalize_arm` cannot place would arrive in the
+        next visit's history as `manual-review`, and the trajectory would record
+        a decision the agent never made.
+        """
+        self.assertEqual(formulary.unrecognised_offerables(), ())
+
+    def test_every_offerable_molecule_lands_on_its_own_arm(self):
+        """Recognisable is not enough — it has to normalise to the *same* arm."""
+        for molecule in formulary.MOLECULES:
+            if not molecule.offerable:
+                continue
+            with self.subTest(molecule=molecule.name):
+                self.assertEqual(normalize_arm(molecule.name), molecule.arm)
+
+    def test_every_declared_molecule_belongs_to_a_real_arm(self):
+        for molecule in formulary.MOLECULES:
+            with self.subTest(molecule=molecule.name):
+                self.assertIn(molecule.arm, TREATMENT_ARMS)
+
+    def test_the_composite_filter_reads_the_formulary_not_its_own_list(self):
+        """The drift this file exists to prevent, asserted from the other side."""
+        from treatmentrx.safety import feasible_set
+
+        self.assertEqual(
+            set(feasible_set.JAK_DRUGS),
+            set(formulary.hazard_tokens(formulary.HAZARD_JAK)),
+        )
+        self.assertEqual(
+            set(feasible_set.HEPATOTOXIC_DRUGS),
+            set(formulary.hazard_tokens(formulary.HAZARD_HEPATOTOXIC)),
+        )
+
+    def test_the_arm_level_rule_and_the_composite_filter_agree(self):
+        """Two safety modules classed hepatic risk from two separate literals,
+        neither a subset of the other. They agreed on every arm — by curation,
+        not by construction. Now they are one declaration, and this is what
+        would catch them parting again."""
+        from treatmentrx.safety import rules
+        from treatmentrx.safety.feasible_set import ALT_CEILING, FeasibleSet
+
+        filter_ = FeasibleSet()
+        for arm in TREATMENT_ARMS:
+            if arm == REFERENCE_ARM:
+                continue
+            composites = formulary.composites_for(arm)
+            gated = bool(composites) and all(
+                filter_._unsafe_reason(action, 400.0, 90.0, False, [], arm) is not None
+                for action in composites
+            )
+            with self.subTest(arm=arm, alt_ceiling=ALT_CEILING):
+                self.assertEqual(
+                    rules._is_hepatotoxic(arm),
+                    gated,
+                    "the arm-level rule and the composite filter disagree on hepatic risk",
+                )
+
+    def test_the_arm_level_rule_only_matches_canonical_arm_names(self):
+        """Both readers of the old list substring-matched *molecule* spellings
+        against a canonical arm name, so four of six tokens were unreachable.
+        A molecule name must not be mistaken for an arm."""
+        from treatmentrx.safety import rules
+
+        for molecule in formulary.MOLECULES:
+            if molecule.name in TREATMENT_ARMS:
+                continue
+            with self.subTest(molecule=molecule.name):
+                self.assertFalse(rules._is_hepatotoxic(molecule.name))
+
+
+class MenuTests(unittest.TestCase):
+    def test_the_menu_is_derived_from_the_formulary(self):
+        from treatmentrx.estimation.actions import ARM_CANDIDATES
+
+        self.assertEqual(
+            {arm: [a.label for a in options] for arm, options in ARM_CANDIDATES.items()},
+            {arm: [a.label for a in options]
+             for arm, options in formulary.arm_candidates().items()},
+        )
+
+    def test_every_advanced_arm_keeps_a_monotherapy_composite(self):
+        """Invariant 15, now derivable instead of asserted in a comment.
+
+        Listing a biologic only in MTX combination turns one methotrexate
+        contraindication into a blocked recommendation for a patient who had a
+        viable option.
+        """
+        for arm in TREATMENT_ARMS:
+            if arm == REFERENCE_ARM:
+                continue
+            composites = formulary.composites_for(arm)
+            with self.subTest(arm=arm):
+                self.assertTrue(composites, "an arm with no composite cannot be offered")
+                self.assertTrue(
+                    any(not action.combination for action in composites),
+                    "every advanced arm needs a composite that is not MTX-combination",
+                )
+
+    def test_a_non_offerable_molecule_contributes_no_regimen(self):
+        for molecule in formulary.MOLECULES:
+            if molecule.offerable:
+                continue
+            with self.subTest(molecule=molecule.name):
+                self.assertEqual(molecule.regimens, ())
+
+    def test_a_non_offerable_molecule_still_carries_its_hazards(self):
+        """`leflunomide` is the case: recognised, hepatotoxic, never proposed.
+        Dropping it from the hazard tokens would let it through as a background
+        combination."""
+        hepatotoxic = formulary.hazard_tokens(formulary.HAZARD_HEPATOTOXIC)
+        self.assertIn("leflunomide", hepatotoxic)
+        self.assertFalse(
+            any(m.offerable for m in formulary.MOLECULES if m.name == "leflunomide")
+        )
+
+    def test_every_molecule_states_its_provenance(self):
+        """The curation is illustrative and each entry says so itself, so a
+        reader inspecting one does not have to find the module header."""
+        for molecule in formulary.MOLECULES:
+            with self.subTest(molecule=molecule.name):
+                self.assertIn("not a clinical source", molecule.provenance)
+
+
+class BreadthTests(unittest.TestCase):
+    """Breadth is a curation choice, and these make it a measured one.
+
+    An arm offered as a single molecule is an arm a single drug allergy removes
+    outright. That is not a property of the method and it is not inherent — it is
+    how many regimens the formulary happens to carry.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.breadth = formulary.breadth()
+
+    def test_breadth_covers_every_treatment_arm(self):
+        self.assertEqual(
+            set(self.breadth),
+            {arm for arm in TREATMENT_ARMS if arm != REFERENCE_ARM},
+        )
+
+    def test_survival_follows_the_offer_count_not_the_declared_count(self):
+        """JAK declares three molecules and offers one, so it does not survive —
+        and the reported flag has to track the offer list, because that is what
+        the patient is left with."""
+        for arm, row in self.breadth.items():
+            with self.subTest(arm=arm):
+                self.assertEqual(
+                    row["survives_a_single_molecule_allergy"],
+                    len(row["offerable_molecules"]) > 1,
+                )
+
+    def test_the_survival_flag_matches_what_the_pipeline_does(self):
+        """Asserted end to end rather than from the counts, because the counts
+        are the claim and the pipeline is the evidence."""
+        from treatmentrx.feedback.audit import _with_allergy
+        from treatmentrx.orchestrator import TreatmentRxOrchestrator
+
+        orchestrator = TreatmentRxOrchestrator()
+        for arm, row in self.breadth.items():
+            for molecule in row["offerable_molecules"]:
+                recommendation = orchestrator.run(_with_allergy(molecule))
+                arm_survived = arm not in recommendation.audit_event["removed_arms"]
+                with self.subTest(arm=arm, molecule=molecule):
+                    self.assertEqual(arm_survived, row["survives_a_single_molecule_allergy"])
+
+
+if __name__ == "__main__":
+    unittest.main()
