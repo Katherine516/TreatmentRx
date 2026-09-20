@@ -84,8 +84,28 @@ class EstimandContract:
 
     @property
     def fingerprint(self) -> str:
-        payload = json.dumps(self.as_dict(include_fingerprint=False), sort_keys=True)
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+        """Content hash of the contract, computed once per instance.
+
+        The contract is `frozen=True`, so this is the same sixteen characters
+        for the life of the object — but it was being recomputed on every read,
+        and every read runs `dataclasses.asdict` (a recursive copy of the whole
+        contract), `json.dumps` and a SHA-256. Six reads a request made it the
+        single most expensive thing in the pipeline once the cross-arm
+        covariance was memoised.
+
+        Stashed with `object.__setattr__` under a name that is deliberately
+        **not a field**. `dataclasses.replace` rebuilds through `__init__`, so a
+        derived contract starts with no cache and computes its own — had this
+        been a field, `replace` would have copied the old hash onto a contract
+        whose content no longer matched it, which is worse than the cost it
+        saves.
+        """
+        cached = getattr(self, "_fingerprint_cache", None)
+        if cached is None:
+            payload = json.dumps(self.as_dict(include_fingerprint=False), sort_keys=True)
+            cached = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+            object.__setattr__(self, "_fingerprint_cache", cached)
+        return cached
 
     def as_dict(self, include_fingerprint: bool = True) -> dict[str, object]:
         payload = asdict(self)

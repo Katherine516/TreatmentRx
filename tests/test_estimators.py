@@ -604,6 +604,108 @@ class DWOLSContrastCovarianceTests(unittest.TestCase):
             places=9,
         )
 
+    def test_the_memoised_covariance_is_the_one_it_replaced(self):
+        """The cache is behaviour-preserving, asserted rather than assumed.
+
+        `ArmFit.cross_covariance` takes no features — it is a property of the
+        fit, and the patient enters afterwards in the quadratic form — so it was
+        rebuilt identically on every request at 1.31ms a call. `DWOLSModel`
+        keeps it per ordered pair now. What must hold is that every contrast
+        still equals the one computed from a matrix built fresh from the fits.
+        """
+        from treatmentrx.estimation.basis import BLIP_BASIS, TREATMENT_FREE_BASIS, blip_basis
+        from treatmentrx.estimation import linalg
+
+        n_free = len(TREATMENT_FREE_BASIS)
+        for arm, fit in self.model.fits.items():
+            for comparator, other in self.model.fits.items():
+                if arm == comparator:
+                    continue
+                cross = fit.cross_covariance(other)
+                loading = [0.0] * len(cross)
+                for offset, value in enumerate(blip_basis(self.features)):
+                    loading[n_free + offset] = value
+                variance = (
+                    self.model.blip_standard_error(arm, self.features) ** 2
+                    + self.model.blip_standard_error(comparator, self.features) ** 2
+                    - 2.0 * linalg.quadratic_form(loading, cross)
+                )
+                with self.subTest(pair=(arm, comparator)):
+                    self.assertAlmostEqual(
+                        self.model.contrast_standard_error(arm, comparator, self.features),
+                        max(variance, 0.0) ** 0.5,
+                        places=12,
+                    )
+
+    def test_a_refit_does_not_inherit_the_cache(self):
+        """The property that keeps this away from invariant 7.
+
+        That defect was a second *model*, fit from its own cohort and silently
+        diverging from the one every study measured. `refit` builds a whole new
+        `DWOLSModel`, so a bootstrap replicate starts with an empty cache and
+        cannot read a parent's — if it could, every replicate would report the
+        deployed fit's covariance and the joint interval would stop moving.
+        """
+        from treatmentrx.estimation.dwols import DWOLSModel
+        from treatmentrx.estimation import training
+
+        cohort = training.training_cohort()
+        replica = DWOLSModel(cohort[: len(cohort) // 2])
+        self.assertEqual(replica._cross_covariance, {})
+        replica.contrast_standard_error("rituximab", "IL-6 inhibitor", self.features)
+        self.assertEqual(len(replica._cross_covariance), 1)
+        # And the parent's cache is untouched by the replica's work.
+        self.assertNotIn(
+            ("rituximab", "IL-6 inhibitor"),
+            {k: v for k, v in replica._cross_covariance.items() if v is None},
+        )
+
+    def test_scoring_many_patients_costs_one_covariance_per_pair(self):
+        """The quantity the memo buys, counted rather than timed.
+
+        Wall-clock on this machine has about 40% run-to-run variance — the same
+        unchanged suite measured 271s and 387s — so a timing assertion here would
+        be noise. The call count is deterministic and it is the thing that
+        matters: the matrix is a property of the fit, so scoring the tenth
+        patient must cost no covariance work at all.
+
+        Counted over `cli audit`, this is 1340 calls against 16.
+        """
+        from treatmentrx.estimation.dwols import ArmFit
+
+        # Cold cache, because a sibling test alphabetically ahead of this one
+        # warms some of these pairs and the count would silently under-read.
+        # Clearing is free and cannot corrupt anything: every entry is derived
+        # from fits that are written once and never mutated, so a later test
+        # simply recomputes the same matrix.
+        self.model._cross_covariance.clear()
+
+        calls = []
+        real = ArmFit.cross_covariance
+        try:
+            ArmFit.cross_covariance = lambda self, other: (
+                calls.append((self.arm, other.arm)) or real(self, other)
+            )
+            pairs = [
+                ("rituximab", "IL-6 inhibitor"),
+                ("rituximab", "JAK-inhibitor"),
+                ("TNF-inhibitor", "IL-6 inhibitor"),
+            ]
+            for patient in range(10):
+                features = dict(self.features, das28=3.0 + 0.4 * patient)
+                for arm, comparator in pairs:
+                    self.model.contrast_standard_error(arm, comparator, features)
+        finally:
+            ArmFit.cross_covariance = real
+
+        self.assertEqual(
+            len(calls),
+            len(pairs),
+            "the covariance is being rebuilt per patient for a matrix that has "
+            "no patient in it",
+        )
+        self.assertEqual(len(set(calls)), len(pairs))
+
     def test_the_coverage_study_measures_the_rule_the_facade_deploys(self):
         """Invariant 19's shape: a study that computes a wider interval than the
         agent emits is reporting a rule nobody deploys."""

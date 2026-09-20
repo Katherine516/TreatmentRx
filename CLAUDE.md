@@ -8,12 +8,12 @@ test fixture, not evidence.
 ## Commands
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests    # 597 tests, ~6 min
+PYTHONPATH=src python3 -m unittest discover -s tests    # 604 tests, ~6.5 min
 PYTHONPATH=src python3 -m treatmentrx.cli demo          # one patient end to end
 PYTHONPATH=src python3 -m treatmentrx.cli evaluate      # estimator scorecard
 PYTHONPATH=src python3 -m treatmentrx.cli stability     # k-fold + seed sweep (~10s)
 PYTHONPATH=src python3 -m treatmentrx.cli inference     # sandwich vs bootstrap (~35s)
-PYTHONPATH=src python3 -m treatmentrx.cli audit         # layer-by-layer evaluation (~6s)
+PYTHONPATH=src python3 -m treatmentrx.cli audit         # layer-by-layer evaluation (~5s)
 PYTHONPATH=src python3 -m treatmentrx.cli coverage      # do the 95% intervals cover? (~76s)
 PYTHONPATH=src python3 -m treatmentrx.cli coverage --candidate-set  # does the set hold the best arm? (~40s)
 PYTHONPATH=src python3 -m treatmentrx.cli coverage --multiplicity   # what the all-pairs correction costs (~60s)
@@ -1849,6 +1849,98 @@ produced a real clinical divergence, and the notes below are the scar tissue.
    trades a card carrying context for the reviewer (invariant 35) against a typed
    error at the gate (invariant 13); it is left alone rather than decided in
    passing.
+
+65. **A quantity that does not depend on the patient was being computed per
+   patient, and it was most of the request.** Profiling a warm request rather
+   than reasoning about it: 9.37ms, of which **Layer 3 was 6.62ms**, and inside
+   it one call dominated.
+
+   `ArmFit.cross_covariance` **takes no features**. It walks the clusters two
+   fits share and returns `A_a^-1 (sum s_a s_b') A_b^-1` — a property of the
+   *fit*, fixed once per process. The patient enters afterwards, in the
+   quadratic form against `blip_basis(features)`. So the same 10x10 matrix was
+   rebuilt for every patient forever, at **1.31ms a call and four calls a
+   request — 56% of the request**. `EstimandContract.fingerprint` was the same
+   shape on a `frozen=True` dataclass: six reads a request, each running
+   `dataclasses.asdict` over the whole contract, `json.dumps` and a SHA-256, to
+   return the same sixteen characters.
+
+   | | before | after |
+   | --- | --- | --- |
+   | warm request | 9.37 ms | **3.17 ms** |
+   | Layer 3 `decide` | 6.62 ms | **1.15 ms** |
+   | Layer 2 `estimate` | 0.68 ms | 0.43 ms |
+   | `cli audit` | 6.8 s | **5.1 s** |
+   | `as_dict` calls per request | 10 | 4 |
+
+   **Nothing served changed, asserted rather than assumed.** Statuses,
+   recommended and top-scored arms, Q-values, the candidate set, every arm
+   contrast and its interval, removals, flags and cards over 40 cohort patients
+   hash identically before and after.
+
+   **This is not the cache invariant 7 forbids, and the distinction is the whole
+   point.** That defect was a second *model* — `dwols.fitted_model()` kept its
+   own `_MODEL` global, fit from its own cohort, so the object the studies
+   measured and the object that served patients were different and silently
+   diverged. Nothing here caches a fit. The memo lives on the `DWOLSModel` that
+   *owns* both `ArmFit`s, they are written once in `__init__` and never mutated
+   anywhere in the package, and `refit` constructs a whole new model — so a
+   bootstrap replicate starts with an empty cache and cannot read a parent's. If
+   it could, every replicate would report the deployed fit's covariance and the
+   joint interval would stop responding to resampling, which is invariant 7's
+   failure mode exactly. `tests/test_estimators.py` asserts both halves: that
+   every contrast still equals one built from a fresh matrix, and that a replica
+   starts empty.
+
+   The fingerprint memo is stashed under a name that is **deliberately not a
+   field**. `dataclasses.replace` rebuilds through `__init__`, so a derived
+   contract computes its own; had it been a field, `replace` would have copied
+   the old hash onto a contract whose content no longer matched it — and the
+   estimand fingerprint exists to catch precisely that. A wrong fingerprint is
+   worse than a slow one, so `tests/test_scientific_contracts.py` asserts a
+   replaced contract differs *and* that the attribute is not a field, because
+   the first test alone would pass on a field that `replace` happened to reset.
+
+   **The suite barely benefits, and measuring *that* needed call counts rather
+   than a stopwatch.** The expectation going in was that a 3x faster request
+   would reach the 394s suite, since every study loop scores patients. Timing it
+   could not answer the question: the same unchanged suite ran **271s and 387s**
+   on this machine, about 40% run-to-run variance, which swamps anything being
+   looked for. So the memo was counted instead — how many `cross_covariance`
+   calls it removes, which is deterministic:
+
+   | workload | calls before | after | removed |
+   | --- | --- | --- | --- |
+   | `cli audit` — ~300 patients through **one** fit | **1340** | **16** | 1324 (~1.7s) |
+   | `decision_rule_coverage(8)` — **8 refits**, few patients each | 48 | 24 | 24 (~0.03s) |
+
+   That is the entire mechanism in two rows. Work that scores many patients
+   against one fitted model amortises **84x**; work that refits gets a fresh
+   cache each time and has nothing to amortise. The suite is **refit-bound**:
+   measured per module, `test_robustness` (86s) and `test_coverage` (84s) are
+   43% of it on their own, and with `test_transfer`, `test_inference` and
+   `test_bootstrap` roughly 58% is Monte Carlo studies whose cost is the *fit*.
+   So the suite keeps most of its 6.5 minutes and that is structural, not a
+   shortfall in the memo.
+
+   **Splitting those studies into a second suite was considered and rejected.**
+   It would take the everyday run to roughly 165s, and it is the obvious thing to
+   do. It is also exactly backwards here: invariant 63 is the scar from running a
+   module subset before a behaviour change, and the tests that would become
+   optional are the ones that catch statistical regressions. A 6.5-minute suite
+   that always runs is safer than a 2.7-minute one plus a 4-minute one somebody
+   forgets. Do not split it without a stronger argument than speed.
+
+   **Do not price a change here with a stopwatch.** The 40% variance above is the
+   standing reason; this file's other timings are single runs on a quiet machine
+   and should be read as magnitudes, not measurements.
+
+   What is deliberately *not* optimised further: `as_dict` still runs four times
+   a request at about 0.8ms, and the quadratic form only ever reads the 4x4 blip
+   sub-block of that 10x10 matrix. Both are real and neither is worth the
+   aliasing risk of handing out a cached mutable dict, or the subtlety of a
+   matrix whose shape no longer matches what `cross_covariance` documents, for
+   under a millisecond in a research prototype whose request is already 3ms.
 
 ## What is real vs. still a placeholder
 

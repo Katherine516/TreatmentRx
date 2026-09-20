@@ -58,6 +58,57 @@ class EstimandContractTests(unittest.TestCase):
             )
 
 
+class FingerprintCacheTests(unittest.TestCase):
+    """The fingerprint is memoised, and `replace()` must not carry a stale one.
+
+    The contract is `frozen=True`, so the hash is the same sixteen characters
+    for the life of the object — but it was recomputed on every read, and each
+    read runs `dataclasses.asdict`, `json.dumps` and a SHA-256. Six reads a
+    request made it the most expensive thing in the pipeline once the cross-arm
+    covariance was memoised.
+
+    The cache is stashed under a name that is deliberately not a field. Had it
+    been one, `dataclasses.replace` would have copied the old hash onto a
+    contract whose content no longer matched it — a wrong fingerprint is worse
+    than a slow one, because the estimand check exists to catch exactly that.
+    """
+
+    def setUp(self):
+        self.contract = ra_dtr_estimand(TREATMENT_ARMS)
+
+    def test_the_fingerprint_is_stable_across_reads(self):
+        self.assertEqual(self.contract.fingerprint, self.contract.fingerprint)
+
+    def test_a_replaced_contract_computes_its_own(self):
+        """The hazard the non-field stash exists to avoid."""
+        import dataclasses
+
+        original = self.contract.fingerprint
+        altered = dataclasses.replace(self.contract, outcome="a different outcome")
+        self.assertNotEqual(
+            altered.fingerprint,
+            original,
+            "the derived contract inherited the original's hash",
+        )
+
+    def test_the_cache_is_not_a_field(self):
+        """Asserted structurally, because the test above would still pass if the
+        cache were a field that `replace` happened to reset."""
+        self.assertNotIn("_fingerprint_cache", self.contract.__dataclass_fields__)
+
+    def test_the_memoised_value_is_the_one_it_replaced(self):
+        """Recomputed the long way, so the cache cannot quietly return something
+        else."""
+        import hashlib
+        import json
+
+        payload = json.dumps(
+            self.contract.as_dict(include_fingerprint=False), sort_keys=True
+        )
+        expected = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+        self.assertEqual(self.contract.fingerprint, expected)
+
+
 class PartitionContractTests(unittest.TestCase):
     def test_partitions_must_be_patient_disjoint(self):
         with self.assertRaises(EstimandContractError):

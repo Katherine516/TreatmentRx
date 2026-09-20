@@ -226,6 +226,22 @@ class DWOLSModel:
                 [cluster for *_, cluster in selected],
             )
         self._reference_fit = self._fit_reference(observations)
+        # Cross-arm covariance, memoised per ordered pair.
+        #
+        # `ArmFit.cross_covariance` takes no features: it walks the clusters the
+        # two fits share and returns a matrix that is a property of the *fit*,
+        # not of the patient. The patient enters afterwards, in the quadratic
+        # form. So it was being rebuilt identically on every request — measured
+        # at 1.31ms a call and four calls a request, 56% of a warm request,
+        # producing the same 10x10 matrix every time.
+        #
+        # This is not the cache invariant 7 forbids, and the distinction is the
+        # whole point: that one was a second *model*, fit from its own cohort and
+        # diverging from the one the studies measured. Nothing here caches a fit.
+        # The model owns both `ArmFit`s, they are written once in `__init__` and
+        # never mutated, and `refit` builds a whole new `DWOLSModel` — so a
+        # bootstrap replicate gets its own empty cache and cannot read this one.
+        self._cross_covariance: dict[tuple[str, str], list[list[float]]] = {}
 
     def _fit_reference(self, observations) -> list[float]:
         """Treatment-free model for the reference arm, from its own rows."""
@@ -278,7 +294,7 @@ class DWOLSModel:
             mine.blip_standard_error(features) ** 2
             + theirs.blip_standard_error(features) ** 2
         )
-        cross = mine.cross_covariance(theirs)
+        cross = self._cross(arm, comparator, mine, theirs)
         if cross:
             n_free = len(TREATMENT_FREE_BASIS)
             loading = [0.0] * len(cross)
@@ -293,6 +309,27 @@ class DWOLSModel:
             )
             variance -= 2.0 * covariance
         return math.sqrt(max(variance, 0.0))
+
+    def _cross(
+        self, arm: str, comparator: str, mine: ArmFit, theirs: ArmFit
+    ) -> list[list[float]]:
+        """`mine.cross_covariance(theirs)`, computed once per ordered pair.
+
+        Keyed on the ordered pair rather than the unordered one: swapping the
+        arms transposes the matrix, and while the quadratic form beside it is
+        symmetric and would not notice, storing the transpose under the same key
+        would make the cache return something the uncached call did not.
+        At most 30 entries for six arms.
+
+        `cross_covariance` legitimately returns `[]` when either fit has no
+        scores, so membership is tested rather than truthiness — `or` here would
+        recompute the empty case on every request, which is the one where the
+        answer is cheapest to get wrong and hardest to notice.
+        """
+        key = (arm, comparator)
+        if key not in self._cross_covariance:
+            self._cross_covariance[key] = mine.cross_covariance(theirs)
+        return self._cross_covariance[key]
 
     # --------------------------------------------------- joint-bootstrap support
     #
