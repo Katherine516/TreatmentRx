@@ -58,7 +58,8 @@ class IngestionTests(unittest.TestCase):
         self.assertEqual(contract.normalize_treatment_arm("rituximab"), "rituximab")
 
     def test_dag_returns_adjustment_set_and_causal_path(self):
-        result = CausalDAGRegistry().validate(_patient(), treatment="IL-6 inhibitor")
+        patient, stages = _stages()
+        result = CausalDAGRegistry().validate(patient, stages)
         self.assertTrue(result.identified)
         self.assertIn("baseline_disease_activity", result.adjustment_set)
         self.assertIn("colliders", result.causal_path_text)
@@ -585,3 +586,145 @@ class ConcomitantMedicationTests(unittest.TestCase):
         with self.assertRaises(ValueError) as raised:
             StageHistoryBuilder().build(patient)
         self.assertIn("concomitant", str(raised.exception))
+
+
+class IdentificationReadsWhatTheModelReadsTests(unittest.TestCase):
+    """The certificate and the covariate space were two vocabularies.
+
+    `data/dag.py` opens by saying the old check asked whether the *bundle
+    mentioned* an adjuster, and that what matters is whether the estimator
+    conditions on the variable. `_has_adjuster` then hand-listed observation
+    codes: `baseline_disease_activity` was satisfied by `cdai`, `sdai` or
+    `haq_di`, none of which produces a DAS28. A patient with a HAQ-DI and no
+    DAS28 was certified **identified** while `estimation.features` handed the
+    estimators `FEATURE_DEFAULTS["das28"]` — the exact case that docstring says
+    the check exists to catch.
+
+    These assert the agreement against `model_features` rather than against
+    `OBSERVED_AS`, because a check scored on the map it uses as truth reads 1.0
+    by construction.
+    """
+
+    @staticmethod
+    def _state(withheld=(), added=()):
+        import copy
+
+        from treatmentrx.data import DataLayer
+
+        bundle = copy.deepcopy(sample_ra_bundle())
+        drop = {code.lower() for code in withheld}
+        bundle["entry"] = [
+            entry
+            for entry in bundle["entry"]
+            if not (
+                entry["resource"].get("resourceType") == "Observation"
+                and (entry["resource"].get("code", {}).get("text") or "").lower() in drop
+            )
+        ]
+        for code, value in added:
+            key = "valueBoolean" if isinstance(value, bool) else "valueString"
+            bundle["entry"].append(
+                {
+                    "resource": {
+                        "resourceType": "Observation",
+                        "code": {"text": code},
+                        key: value,
+                        "effectiveDay": 365,
+                    }
+                }
+            )
+        return DataLayer().fhir.parse_bundle(bundle), bundle
+
+    def _validate(self, withheld=(), added=()):
+        from treatmentrx.data import DataLayer
+        from treatmentrx.data.dag import CausalDAGRegistry
+
+        patient, _ = self._state(withheld, added)
+        stages = DataLayer().stage_builder.build(patient)
+        return CausalDAGRegistry().validate(patient, stages), stages
+
+    def test_a_family_member_is_not_the_covariate(self):
+        """A HAQ-DI satisfies the contract's `disease_activity` family and
+        produces no DAS28. The contract is right to grade that a warning; the
+        certificate must not read it as the adjuster being present."""
+        from treatmentrx.estimation.features import FEATURE_DEFAULTS, model_features
+
+        result, stages = self._validate(withheld=("DAS28",))
+        self.assertTrue(
+            any("haq" in key for key in stages[-1].features),
+            "the point of this record is that a family member survives",
+        )
+        self.assertEqual(model_features(stages)["das28"], FEATURE_DEFAULTS["das28"])
+        self.assertFalse(result.identified)
+        self.assertIn("baseline_disease_activity", result.blocked_reason)
+
+    def test_a_non_numeric_value_is_not_a_measurement(self):
+        """`numeric_feature` falls back for a DAS28 recorded as "high", so the
+        record claims to carry the covariate and the model cannot read it."""
+        from treatmentrx.estimation.features import FEATURE_DEFAULTS, model_features
+
+        result, stages = self._validate(
+            withheld=("DAS28",), added=(("DAS28", "high"),)
+        )
+        self.assertEqual(model_features(stages)["das28"], FEATURE_DEFAULTS["das28"])
+        self.assertFalse(result.identified)
+
+    def test_a_recorded_negative_serostatus_is_an_observation(self):
+        """The half a value-against-default check would get wrong.
+
+        `FEATURE_DEFAULTS["anti_ccp"]` is 0.0 and a recorded negative is also
+        0.0, so "never tested" and "tested negative" are one number. Only the
+        second is a measurement, and refusing it would abstain on every
+        seronegative patient for having been tested.
+        """
+        result, _ = self._validate(
+            withheld=("anti_CCP",), added=(("anti_CCP", False),)
+        )
+        self.assertTrue(result.identified, result.blocked_reason)
+
+    def test_a_missing_serostatus_is_not(self):
+        result, _ = self._validate(withheld=("anti_CCP",))
+        self.assertFalse(result.identified)
+        self.assertIn("anti_ccp", result.blocked_reason)
+
+    def test_the_complete_record_is_identified(self):
+        """Precision. A certificate that refused everything would satisfy every
+        assertion above."""
+        result, _ = self._validate()
+        self.assertTrue(result.identified, result.blocked_reason)
+
+    def test_every_adjuster_the_model_carries_names_where_it_is_read_from(self):
+        """A new covariate in the basis becomes an adjuster automatically
+        (`_split_by_what_the_model_carries`). It must not become one whose
+        presence nothing can check."""
+        from treatmentrx.data.dag import OBSERVED_AS, CausalDAGRegistry
+
+        dag = CausalDAGRegistry()._ra_v1()
+        # `prior_biologic_exposure` is read from the medication history rather
+        # than an observation, and "no prior biologic" is a value of it.
+        self.assertEqual(
+            set(dag.adjustment_set),
+            set(OBSERVED_AS) | {"prior_biologic_exposure"},
+        )
+
+    def test_the_adjuster_keys_are_the_ones_the_features_are_built_from(self):
+        """`OBSERVED_AS` and `model_features` read the same record keys. Asserted
+        by withholding each one and watching the covariate fall to its default,
+        rather than by comparing the two lists to each other."""
+        from treatmentrx.data.dag import OBSERVED_AS
+        from treatmentrx.estimation.features import FEATURE_DEFAULTS, model_features
+
+        covariate_for = {
+            "baseline_disease_activity": "das28",
+            "crp": "crp",
+            "anti_ccp": "anti_ccp",
+        }
+        for node, (keys, _numeric) in OBSERVED_AS.items():
+            with self.subTest(node=node):
+                result, stages = self._validate(withheld=tuple(keys))
+                covariate = covariate_for[node]
+                self.assertEqual(
+                    model_features(stages)[covariate], FEATURE_DEFAULTS[covariate]
+                )
+                self.assertFalse(result.identified)
+                self.assertIn(node, result.blocked_reason)

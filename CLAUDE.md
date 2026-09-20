@@ -8,7 +8,7 @@ test fixture, not evidence.
 ## Commands
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests    # 586 tests, ~6 min
+PYTHONPATH=src python3 -m unittest discover -s tests    # 596 tests, ~6 min
 PYTHONPATH=src python3 -m treatmentrx.cli demo          # one patient end to end
 PYTHONPATH=src python3 -m treatmentrx.cli evaluate      # estimator scorecard
 PYTHONPATH=src python3 -m treatmentrx.cli stability     # k-fold + seed sweep (~10s)
@@ -1755,6 +1755,101 @@ produced a real clinical divergence, and the notes below are the scar tissue.
    safety modules at the refactor stage and then changed behaviour, re-running
    only the formulary and docs tests before the full run.*
 
+64. **The identification certificate read a different vocabulary from the model
+   it certifies.** `data/dag.py` opens by saying the previous version asked
+   whether the *bundle mentioned* an adjuster, and that what matters is whether
+   the estimator conditions on the variable. `_has_adjuster` still did not ask
+   that. It hand-listed observation codes, and one entry had drifted:
+   `baseline_disease_activity` was satisfied by `cdai`, `sdai` or `haq_di` —
+   none of which produces a DAS28 — while `MODELLED_BY`, the map declaring node
+   → basis term, sat twenty lines above it, unused by the check.
+
+   Measured on the demo record:
+
+   | record | identified | das28 the estimators read | status |
+   | --- | --- | --- | --- |
+   | complete | yes | 5.200 | recommend |
+   | **HAQ-DI present, DAS28 absent** | **yes** | **5.000** | **recommend** |
+   | ESR instead of CRP | no | 5.200 | blocked |
+   | RF instead of anti-CCP | no | 5.200 | blocked |
+
+   5.000 is `FEATURE_DEFAULTS["das28"]`, and row two is the case `data/dag.py`'s
+   own docstring names as the one this check exists to catch: *"a patient with no
+   disease-activity measurement is running the estimators on a default, and the
+   effect genuinely is not identified for them."* It was certified and served a
+   recommendation.
+
+   **Nothing else in the system had anything to say about that record.**
+   `estimation/features.py` carried a comment beside `FEATURE_DEFAULTS` reading
+   "the data contract is what flags genuinely missing families" — it does not.
+   The contract checks variable *families* and grades a missing one a **warning**,
+   and the families are deliberately broader than the covariates: `haq_di`
+   satisfies `disease_activity`, `esr` satisfies `inflammation`,
+   `rheumatoid_factor` satisfies `serostatus`. Each of those is an ordinary RA
+   record, not a corrupt one. Measured, **1 of 6** such records draws any contract
+   diagnostic at all. Two modules each believed the other held this.
+
+   `OBSERVED_AS` is now the single declaration of which record key each adjuster
+   is read from, and `_has_adjuster` asks the narrow question — *will
+   `estimation.features` find a usable value under that key, or fall back to a
+   default* — with the same numeric test `numeric_feature` applies, so a DAS28
+   recorded as the string "high" is not a measurement however present it looks.
+   `validate` takes the stage history rather than `patient.observations` and
+   reads the treatment off it, because two arguments describing one stage are two
+   things that can disagree. The dead `patient.demographics` branch is gone; no
+   node in `adjustment_set` was ever demographic.
+
+   **Nothing served changed, asserted rather than assumed.** Statuses,
+   recommendations, Q-values, removals, safety flags and cards over 40 cohort
+   patients hash identically before and after — the simulator writes all three
+   covariates for every patient, which is *why* `identified` was constant and is
+   the thing the old paragraph in this file got wrong.
+
+   **The audit now scores the gate instead of round-tripping well-formed
+   records.** Every other Layer 1 metric is an identity on a record the fixture
+   built correctly, so the only thing they can report is that the fixture is
+   correct. `identification_matches_the_features` is scored on six records built
+   to fail, and the truth is a **perturbation**, not a comparison against
+   `OBSERVED_AS`: two records differing in one observation, and if the covariate
+   the estimators read does not move when the record does, the model is not
+   reading the record. That is the docstring's own phrasing measured, and it owes
+   nothing to the map under test.
+
+   Comparing the value against `FEATURE_DEFAULTS` instead would not work, and the
+   reason is invariant 28 one covariate over: `anti_ccp` defaults to 0.0 and a
+   recorded *negative* is also 0.0, so "never tested" and "tested negative" would
+   be one number. Refusing the second would abstain on every seronegative patient
+   for having been tested. That row is the precision half's whole point.
+
+   Recall and precision are separate for Layer 4's reason — a certificate that
+   refused every record would score perfect recall — and both denominators are
+   real: 4 unreadable records, 2 readable. Injected, the discrimination is clean:
+
+   | check | recall | precision |
+   | --- | --- | --- |
+   | deployed | 1.000 | 1.000 |
+   | **the old code list** | **0.500** | 1.000 |
+   | certifies everything | 0.000 | 1.000 |
+   | refuses everything | 1.000 | **0.000** |
+
+   `tests/test_coverage.py` asserts both that the metric catches the old check
+   *and* that every other Layer 1 number reads identically either way, because
+   the finding is not that the new metric works — it is that nothing else here
+   could see the defect. `tests/test_data_layer.py` pins the property itself
+   against `model_features` rather than against `OBSERVED_AS`; three of its seven
+   assertions fail on the old implementation and four pass, which is right,
+   because the old code list happened to get `crp` and `anti_ccp` correct.
+
+   **What is deliberately not changed is the blocking behaviour.** A record with
+   an ESR and no CRP is still refused, and that is correct — the estimators have
+   no ESR term, so the value they use is a default whatever the contract's family
+   check says. What was wrong is that Layer 1 said nothing about it, and that is
+   now a reported number rather than a surprise three layers down. Widening the
+   contract's families to reject these records would be the larger change and it
+   trades a card carrying context for the reviewer (invariant 35) against a typed
+   error at the gate (invariant 13); it is left alone rather than decided in
+   passing.
+
 ## What is real vs. still a placeholder
 
 Real: the four estimators, the cohort and its known blips, informative-dropout
@@ -1773,13 +1868,19 @@ against M-bias and descendant-of-collider graphs, not just the one it ships with
 only thing that fills it.
 
 `identified` reads True for every patient the pipeline actually sees, and that is
-not a check that cannot fail: strip the observations and it returns False naming
-the missing adjusters. It is constant because the data contract already rejects
-records without DAS28 or CRP, so by the time the DAG is consulted the adjusters
-are present by construction. `_has_adjuster` treating any medication history as
-evidence for `prior_biologic_exposure` is deliberate — "no prior biologic" is a
-value of that variable, not a missing one, and requiring a biologic to appear
-blocked every csDMARD-only patient for having been treated conservatively.
+not a check that cannot fail: withhold a covariate and it returns False naming
+the missing adjuster. **It is constant because the simulator always writes a
+DAS28, a CRP and an anti-CCP — not because the contract requires them.** An
+earlier version of this paragraph said the contract rejects records without
+DAS28 or CRP; it does not. Missing variable families are *warnings* there, and
+the families are broader than the covariates, so a HAQ-DI, an ESR or a
+rheumatoid factor each satisfies the contract while leaving the estimators on a
+default. Those records reach Layer 3 and are **blocked**, and `cli audit` now
+scores that rather than asserting it — see invariant 64. `_has_adjuster`
+treating any medication history as evidence for `prior_biologic_exposure` is
+deliberate — "no prior biologic" is a value of that variable, not a missing one,
+and requiring a biologic to appear blocked every csDMARD-only patient for having
+been treated conservatively.
 
 Still deliberately simple, and labelled as such in-module:
 `HandcraftedFeatureEncoder` (nine clinical features normalised and tiled — not a

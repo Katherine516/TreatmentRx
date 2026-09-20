@@ -9,7 +9,15 @@ from __future__ import annotations
 from treatmentrx.domain import StageRecord
 
 # Defaults are deliberately mid-range: a missing value must not look like an
-# extreme one. The data contract is what flags genuinely missing families.
+# extreme one.
+#
+# What flags a covariate that fell back to one of these is `data/dag.py`'s
+# identification check, not the data contract. The contract checks variable
+# *families* and grades a missing one a warning, and the families are broader
+# than the covariates: a HAQ-DI satisfies `disease_activity`, an ESR satisfies
+# `inflammation`, a rheumatoid factor satisfies `serostatus`. Each of those is
+# an ordinary RA record that leaves a default in here, and this comment used to
+# say the contract caught them.
 FEATURE_DEFAULTS = {
     "das28": 5.0,
     "crp": 15.0,

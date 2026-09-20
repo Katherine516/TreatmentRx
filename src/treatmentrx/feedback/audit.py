@@ -149,6 +149,10 @@ def audit_ingestion(n: int = 40, seed: int = AUDIT_SEED) -> Section:
         # Dead seams, stated rather than left to be inferred from a silent field.
         "stages_where_realized_differs": realized_differs,
         "distinct_adherence_values": len(adherence_values),
+        # Every metric above is a round-trip on a well-formed record, so the
+        # only thing they can report is that the fixture is well formed. This is
+        # the one Layer 1 number scored on records built to fail.
+        "identification_matches_the_features": _identification_against_the_features(),
     }
     section.notes.append(
         "Timing and stage structure are reconstructed from dates and drug names, "
@@ -162,6 +166,21 @@ def audit_ingestion(n: int = 40, seed: int = AUDIT_SEED) -> Section:
         f"saying so. Of {flagged} flagged stages, "
         f"{flagged - definitional} rest on conditions the simulator carries no "
         f"ground truth for."
+    )
+    identification = section.metrics["identification_matches_the_features"]
+    section.notes.append(
+        "`identification_matches_the_features` asks whether the certificate "
+        "refuses exactly the records the estimators must run on a default. Truth "
+        "is `model_features` rather than the map the check itself uses, which is "
+        "what lets it fail: the old check accepted a HAQ-DI for "
+        "`baseline_disease_activity` and certified a defaulted DAS28. Recall and "
+        "precision are separate because a certificate that refused every record "
+        "would score perfect recall. "
+        f"{identification['cases_the_data_contract_warned_about']} of "
+        f"{identification['cases']} of these records draw any contract "
+        "diagnostic at all — the family check accepts an ESR for a CRP and a "
+        "rheumatoid factor for an anti-CCP, so the covariate is missing and "
+        "Layer 1 says nothing."
     )
     if realized_differs == 0:
         section.notes.append(
@@ -178,6 +197,188 @@ def audit_ingestion(n: int = 40, seed: int = AUDIT_SEED) -> Section:
             "default is the only thing being read."
         )
     return section
+
+
+# Each case is a pair of records differing in one observation, and the pair is
+# what supplies the truth: if the covariate the estimators read does not move
+# when the record does, the model is not reading the record. That is the
+# module docstring's own phrasing — "whether the estimator conditions on the
+# variable" — measured rather than asserted, and it owes nothing to
+# `dag.OBSERVED_AS`, which is the map under test.
+#
+# Comparing the value against `FEATURE_DEFAULTS` instead would not work:
+# `anti_ccp` defaults to 0.0 and a recorded *negative* is also 0.0, so "never
+# tested" and "tested negative" would be one number. Those are the two rows this
+# has to keep apart.
+#
+# Four of the six are ordinary RA records rather than corrupt ones — an ESR
+# instead of a CRP, a rheumatoid factor instead of an anti-CCP, a HAQ-DI instead
+# of a DAS28. Each satisfies the data contract's *family* check, so Layer 1
+# raises nothing and the estimators run on a default.
+_ADJUSTER_CASES = (
+    # label, withheld, variant A, variant B, covariate, the adjuster to name
+    (
+        "complete record",
+        (),
+        (("DAS28", 5.2),),
+        (("DAS28", 7.4),),
+        "das28",
+        None,
+    ),
+    (
+        "anti-CCP recorded negative",
+        ("anti_ccp",),
+        (("anti_CCP", False),),
+        (("anti_CCP", True),),
+        "anti_ccp",
+        None,
+    ),
+    (
+        "DAS28 absent, HAQ-DI present",
+        ("das28",),
+        (("HAQ-DI", 1.4),),
+        (("HAQ-DI", 2.8),),
+        "das28",
+        "baseline_disease_activity",
+    ),
+    (
+        "DAS28 recorded as free text",
+        ("das28",),
+        (("DAS28", "high"),),
+        (("DAS28", "low"),),
+        "das28",
+        "baseline_disease_activity",
+    ),
+    (
+        "CRP absent, ESR present",
+        ("crp",),
+        (("ESR", 30.0),),
+        (("ESR", 90.0),),
+        "crp",
+        "crp",
+    ),
+    (
+        "anti-CCP absent, RF present",
+        ("anti_ccp",),
+        (("rheumatoid_factor", True),),
+        (("rheumatoid_factor", False),),
+        "anti_ccp",
+        "anti_ccp",
+    ),
+)
+
+_ESR_UNITS = {"ESR": "mm/hr"}
+
+
+def _record_without(codes: tuple, added: tuple):
+    """The demo bundle with observations withheld and replacements substituted."""
+    bundle = copy.deepcopy(sample_ra_bundle())
+    withheld = {code.lower() for code in codes} | {code.lower() for code, _ in added}
+    bundle["entry"] = [
+        entry
+        for entry in bundle["entry"]
+        if not (
+            entry["resource"].get("resourceType") == "Observation"
+            and (entry["resource"].get("code", {}).get("text") or "").lower() in withheld
+        )
+    ]
+    for code, value in added:
+        if isinstance(value, bool):
+            key, payload = "valueBoolean", value
+        elif isinstance(value, str):
+            key, payload = "valueString", value
+        else:
+            key = "valueQuantity"
+            payload = {"value": value, "unit": _ESR_UNITS.get(code, "score")}
+        bundle["entry"].append(
+            {
+                "resource": {
+                    "resourceType": "Observation",
+                    "code": {"text": code},
+                    key: payload,
+                    "effectiveDay": 365,
+                }
+            }
+        )
+    return bundle
+
+
+def _identification_against_the_features() -> dict[str, object]:
+    """Does the certificate refuse exactly the records the estimators cannot read?
+
+    The check the DAG performs and the thing it certifies were written in two
+    vocabularies. `MODELLED_BY` says `baseline_disease_activity` is carried as
+    `das28_std`; the old `_has_adjuster` accepted `cdai`, `sdai` or `haq_di`,
+    none of which produces a DAS28. So a patient with a HAQ-DI and no DAS28 was
+    certified **identified** while `estimation.features` handed the estimators
+    `FEATURE_DEFAULTS["das28"]` — the case `data/dag.py`'s own docstring names as
+    the one it exists to catch.
+
+    Recall and precision are separate for Layer 4's reason: a certificate that
+    refused every record would score perfect recall and be useless. The
+    precision half is the one that keeps a recorded negative serostatus from
+    being read as a missing one.
+    """
+    from treatmentrx.estimation.features import model_features
+
+    layer = DataLayer()
+    refused = should_refuse = certified = should_certify = 0
+    reasons_checked = reasons_named = 0
+    cases = 0
+    unreadable_but_certified: dict[str, str] = {}
+    refused_a_readable_record: dict[str, str] = {}
+    contract_warned = 0
+
+    for label, withheld, variant_a, variant_b, covariate, adjuster in _ADJUSTER_CASES:
+        try:
+            state = layer.build_patient_state(_record_without(withheld, variant_a))
+            other = layer.build_patient_state(_record_without(withheld, variant_b))
+        except DataContractError:
+            # A record the contract rejects never reaches the certificate, so it
+            # cannot answer this question either way.
+            continue
+        cases += 1
+        # The perturbation: if the covariate does not move when the record does,
+        # the estimators are not reading this record for it.
+        readable = model_features(state.stages)[covariate] != model_features(
+            other.stages
+        )[covariate]
+        identified = state.dag_validation.identified
+        reason = state.dag_validation.blocked_reason or ""
+        if any(
+            diagnostic.name.startswith("data_contract")
+            for diagnostic in state.diagnostics
+        ):
+            contract_warned += 1
+
+        if readable:
+            should_certify += 1
+            if identified:
+                certified += 1
+            else:
+                refused_a_readable_record[label] = reason
+        else:
+            should_refuse += 1
+            if identified:
+                unreadable_but_certified[label] = (
+                    f"{covariate} does not move with the record"
+                )
+            else:
+                refused += 1
+                reasons_checked += 1
+                reasons_named += bool(adjuster and adjuster in reason)
+
+    return {
+        "cases": cases,
+        "records_the_estimators_cannot_read": should_refuse,
+        "identification_recall": _rate(refused, should_refuse),
+        "records_the_estimators_can_read": should_certify,
+        "identification_precision": _rate(certified, should_certify),
+        "reason_names_the_adjuster": _rate(reasons_named, reasons_checked),
+        "unreadable_but_certified": unreadable_but_certified,
+        "refused_a_readable_record": refused_a_readable_record,
+        "cases_the_data_contract_warned_about": contract_warned,
+    }
 
 
 # ---------------------------------------------------------------- Layer 2

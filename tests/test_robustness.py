@@ -457,13 +457,20 @@ class CausalCertificateTests(unittest.TestCase):
         A record with no disease-activity measurement runs the estimators on a
         default; the effect is not identified for that patient, and the old
         check would have passed them on a `birthDate`.
+
+        **Dropping the DAS28 alone is enough, and it did not used to be.** This
+        test withheld the HAQ-DI as well, because `_has_adjuster` accepted it for
+        `baseline_disease_activity` — a code that produces no DAS28 at all, so
+        the estimators ran on `FEATURE_DEFAULTS["das28"]` under a certificate
+        saying the effect was identified. The record kept here is the ordinary
+        one: a HAQ-DI recorded and no DAS28.
         """
         import copy
 
         from treatmentrx.data import DataLayer
         from treatmentrx.data.dag import CausalDAGRegistry
-        from treatmentrx.data.fhir import FHIRAdapter
         from treatmentrx.demo_data import sample_ra_bundle
+        from treatmentrx.estimation.features import FEATURE_DEFAULTS, model_features
 
         bundle = copy.deepcopy(sample_ra_bundle())
         bundle["entry"] = [
@@ -471,13 +478,26 @@ class CausalCertificateTests(unittest.TestCase):
             for entry in bundle["entry"]
             if not (
                 entry["resource"].get("resourceType") == "Observation"
-                and entry["resource"]["code"]["text"].upper() in {"DAS28", "HAQ-DI"}
+                and entry["resource"]["code"]["text"].upper() == "DAS28"
             )
         ]
-        patient = FHIRAdapter().parse_bundle(bundle)
-        result = CausalDAGRegistry().validate(patient, treatment="methotrexate")
+        haq = [
+            entry for entry in bundle["entry"]
+            if entry["resource"].get("resourceType") == "Observation"
+            and entry["resource"]["code"]["text"].upper() == "HAQ-DI"
+        ]
+        self.assertTrue(haq, "the point of this record is that a family member survives")
+
+        patient = DataLayer().fhir.parse_bundle(bundle)
+        stages = DataLayer().stage_builder.build(patient)
+        result = CausalDAGRegistry().validate(patient, stages)
         self.assertFalse(result.identified)
         self.assertIn("baseline_disease_activity", result.blocked_reason)
+        # And the reason it must not be identified, measured rather than assumed:
+        # the covariate the estimators read is the default.
+        self.assertEqual(
+            model_features(stages)["das28"], FEATURE_DEFAULTS["das28"]
+        )
 
 
 class JointBootstrapTests(unittest.TestCase):

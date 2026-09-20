@@ -12,7 +12,11 @@ Two lists now, and the distinction is the point:
 * `adjustment_set` — confounders the model *does* condition on. `identified`
   requires every one of them to be present in the record, and it can fail: a
   patient with no disease-activity measurement is running the estimators on a
-  default, and the effect genuinely is not identified for them.
+  default, and the effect genuinely is not identified for them. "Present" means
+  present *as the estimators read it* — `OBSERVED_AS` names the record key each
+  term is built from, because a hand-written list of observation codes is how
+  this check came to accept a HAQ-DI in place of a DAS28 and certify a defaulted
+  covariate as identified.
 * `unmodelled_confounders` — nodes the DAG believes affect both treatment and
   outcome that no basis carries. This is a standing limitation of the model
   rather than a property of any record, so it is reported once, as a warning, for
@@ -25,7 +29,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from treatmentrx.domain import DAGValidationResult, PatientRecord
+from treatmentrx.domain import DAGValidationResult, PatientRecord, StageRecord
 
 # DAG node -> the basis term the estimators actually condition on. Anything not
 # in here is unmodelled by construction, whatever the record contains.
@@ -34,6 +38,35 @@ MODELLED_BY = {
     "crp": "crp_std",
     "anti_ccp": "anti_ccp",
     "prior_biologic_exposure": "prior_tnf",
+}
+
+# DAG node -> the record keys that basis term is built from, and whether the
+# covariate is read as a number.
+#
+# `MODELLED_BY` says which term the estimators carry; this says which
+# observation the term is *built from*, which is the thing a record either has
+# or does not. They were the same question asked in two vocabularies, and the
+# second one was a hand-written list of observation codes that had drifted:
+# `baseline_disease_activity` accepted `cdai`, `sdai` and `haq_di`, none of
+# which produces a `das28`. A patient with a HAQ-DI and no DAS28 was certified
+# identified while `estimation.features` handed the estimators
+# `FEATURE_DEFAULTS["das28"]` — the exact case this check exists to catch.
+#
+# `prior_biologic_exposure` is deliberately absent: it is read from the
+# medication history rather than from an observation, and "no prior biologic" is
+# a value of that variable rather than a missing one. The contract already makes
+# a record with no treatment history an error, so the adjuster is present by the
+# time this runs.
+#
+# The numeric flag mirrors `estimation.features.numeric_feature`, which falls
+# back to the default for a non-numeric or boolean value. Serostatus is read for
+# truth rather than magnitude, so a recorded negative is an observation and not
+# an absence — which is the distinction invariant 28 is about, one covariate
+# over.
+OBSERVED_AS = {
+    "baseline_disease_activity": (("das28",), True),
+    "crp": (("crp",), True),
+    "anti_ccp": (("anti_ccp", "anti_ccp_positive"), False),
 }
 
 
@@ -68,15 +101,25 @@ class CausalDAGRegistry:
                 return dag
         raise ValueError(f"No causal DAG registered for disease: {patient.disease}")
 
-    def validate(self, patient: PatientRecord, treatment: str, outcome: str = "RA response") -> DAGValidationResult:
+    def validate(
+        self,
+        patient: PatientRecord,
+        stages: list[StageRecord],
+        outcome: str = "RA response",
+    ) -> DAGValidationResult:
+        """Is the effect identified for the patient *as the model will read them*?
+
+        `stages` rather than `patient.observations`, because the estimators read
+        the decision point's carried-forward feature map and nothing else. The
+        treatment is taken from the same place for the same reason: two
+        arguments describing one stage are two things that can disagree.
+        """
         dag = self.match(patient)
-        observed_features = {
-            observation.code.lower().replace("-", "_").replace(" ", "_")
-            for observation in patient.observations
-        }
+        latest = stages[-1]
+        treatment = latest.treatment
         missing_adjusters = [
             node for node in dag.adjustment_set
-            if not self._has_adjuster(node, observed_features, patient)
+            if not self._has_adjuster(node, latest, patient)
         ]
         identified = len(missing_adjusters) == 0
         blocked_reason = None
@@ -102,22 +145,38 @@ class CausalDAGRegistry:
         """
         return list(self.match(patient).unmodelled_confounders)
 
-    def _has_adjuster(self, node: str, observed_features: set[str], patient: PatientRecord) -> bool:
-        """Is this adjuster actually available for this patient?
+    def _has_adjuster(self, node: str, stage: StageRecord, patient: PatientRecord) -> bool:
+        """Does the record carry the value the estimators will actually read?
 
         Only called for nodes in `adjustment_set`, which by construction are the
         ones the model conditions on. A node the model cannot use is never asked
         about here — it is in `unmodelled_confounders` instead.
+
+        The question is deliberately narrow: not "does the bundle mention
+        something in this family" but "will `estimation.features` find a usable
+        value under the key this term is built from, or fall back to a default".
+        The family question belongs to the data contract and is a warning there;
+        answering it here is what certified a defaulted DAS28 as identified.
         """
-        if node == "baseline_disease_activity":
-            return bool(observed_features & {"das28", "cdai", "sdai", "haq_di"})
         if node == "prior_biologic_exposure":
-            # The adjuster is *known* whenever a medication history exists —
+            # Read from the medication history rather than an observation, and
             # "no prior biologic" is a value of this variable, not a missing one.
             # Requiring a biologic to appear blocked every csDMARD-only patient
             # for having been treated conservatively.
             return bool(patient.medications)
-        return node in observed_features or node in patient.demographics
+        keys, numeric = OBSERVED_AS[node]
+        for key in keys:
+            if key not in stage.features:
+                continue
+            if not numeric:
+                return True
+            value = stage.features[key]
+            # Same test `numeric_feature` applies before falling back: a DAS28
+            # recorded as the string "high" is not a disease-activity measurement
+            # the estimators can use, however present it looks.
+            if not isinstance(value, bool) and isinstance(value, (int, float)):
+                return True
+        return False
 
     def causal_path_text(self, dag: CausalDAG, treatment: str, outcome: str) -> str:
         return (

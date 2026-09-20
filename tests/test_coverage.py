@@ -626,6 +626,81 @@ class IngestionAuditTests(unittest.TestCase):
         self.assertGreater(int(total), 0)
         self.assertLessEqual(int(flagged), int(total))
 
+    def test_the_gate_is_scored_on_records_built_to_fail(self):
+        """Every other metric in this section is a round-trip on a well-formed
+        record, so the only thing they can report is that the fixture is well
+        formed. This one is scored on records that are not."""
+        block = self.metrics["identification_matches_the_features"]
+        self.assertEqual(block["identification_recall"], 1.0)
+        self.assertEqual(block["identification_precision"], 1.0)
+        self.assertEqual(block["reason_names_the_adjuster"], 1.0)
+        self.assertEqual(block["unreadable_but_certified"], {})
+        self.assertEqual(block["refused_a_readable_record"], {})
+        # Both denominators are real, which is the Layer 4 discipline: a
+        # certificate that refused every record would score perfect recall.
+        self.assertGreaterEqual(block["records_the_estimators_cannot_read"], 3)
+        self.assertGreaterEqual(block["records_the_estimators_can_read"], 2)
+
+    def test_the_contract_is_silent_on_most_of_those_records(self):
+        """The finding behind the metric, stated as a number rather than prose.
+
+        The contract checks variable *families* and the families are broader
+        than the covariates: a HAQ-DI satisfies `disease_activity`, an ESR
+        satisfies `inflammation`, a rheumatoid factor satisfies `serostatus`.
+        Each is an ordinary RA record that leaves a default in the estimators
+        and draws no diagnostic at Layer 1.
+        """
+        block = self.metrics["identification_matches_the_features"]
+        self.assertLess(
+            block["cases_the_data_contract_warned_about"],
+            block["records_the_estimators_cannot_read"],
+            "if the contract caught them all, this metric has nothing to add",
+        )
+
+    def test_the_old_check_is_caught_and_the_other_metrics_are_blind_to_it(self):
+        """The point is not that the new metric works — it is that nothing else
+        here can see the defect. `_has_adjuster` used to accept a HAQ-DI for
+        `baseline_disease_activity`, certifying a defaulted DAS28 as identified,
+        and every other Layer 1 number reads exactly the same either way.
+        """
+        from treatmentrx.data.dag import CausalDAGRegistry
+        from treatmentrx.feedback.audit import _identification_against_the_features
+
+        def old(self, node, stage, patient):
+            observed = set(stage.features)
+            if node == "baseline_disease_activity":
+                return bool(observed & {"das28", "cdai", "sdai", "haq_di"})
+            if node == "prior_biologic_exposure":
+                return bool(patient.medications)
+            return node in observed
+
+        fixed = CausalDAGRegistry._has_adjuster
+        try:
+            CausalDAGRegistry._has_adjuster = old
+            injected = _identification_against_the_features()
+            unchanged = audit_ingestion()
+        finally:
+            CausalDAGRegistry._has_adjuster = fixed
+
+        self.assertLess(injected["identification_recall"], 1.0)
+        self.assertIn(
+            "DAS28 absent, HAQ-DI present", injected["unreadable_but_certified"]
+        )
+        # Precision does not move: the defect lets records through rather than
+        # holding them back, and one counter standing in for two properties is
+        # how a partial regression passes.
+        self.assertEqual(injected["identification_precision"], 1.0)
+
+        for key in (
+            "stage_count_exact",
+            "visit_interval_exact",
+            "arm_change_always_flagged",
+            "switches_beyond_arm_change",
+            "stages_where_realized_differs",
+        ):
+            with self.subTest(metric=key):
+                self.assertEqual(unchanged.metrics[key], self.metrics[key])
+
 
 class FinalTestFeasibilityTests(unittest.TestCase):
     """`evaluation_partition()` reports there is no final test; this prices one.

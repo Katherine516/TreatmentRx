@@ -97,7 +97,7 @@ class DataLayer:
         care_goal = self.infer_care_goal(stages)
         stages = [replace(stage, care_goal=care_goal) for stage in stages]
 
-        dag_result = self.dag.validate(patient, treatment=stages[-1].treatment)
+        dag_result = self.dag.validate(patient, stages)
         # One encode, one object. There were two: a GRU-shaped wrapper whose
         # vector nothing read, and the handcrafted encoder it called internally —
         # so this ran twice per request and the expensive result was discarded.
