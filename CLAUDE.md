@@ -8,7 +8,7 @@ test fixture, not evidence.
 ## Commands
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests    # 606 tests, ~6.5 min
+PYTHONPATH=src python3 -m unittest discover -s tests    # 611 tests, ~6.5 min
 PYTHONPATH=src python3 -m treatmentrx.cli demo          # one patient end to end
 PYTHONPATH=src python3 -m treatmentrx.cli evaluate      # estimator scorecard
 PYTHONPATH=src python3 -m treatmentrx.cli stability     # k-fold + seed sweep (~10s)
@@ -2002,6 +2002,68 @@ produced a real clinical divergence, and the notes below are the scar tissue.
    wall-clock here was useless again: `training.fitted()` timed 5.20s, 4.00s and
    15.64s across runs of code that differed by one line. The counts are the
    evidence; the milliseconds are a price list.
+
+67. **Half of every dot product in the propensity fit was the same dot product,
+   and the sparse solver that would have fixed the rest was already there with
+   no callers.** `PropensityModel._fit` is 44% of a cold fit. Two findings, and
+   the second is the one worth reading.
+
+   **The redundant half.** Each IRLS pass computes every row's linear predictor
+   inside `_probabilities`, then the arm loop recomputes it:
+   `eta = linalg.dot(row, beta)` where `beta is coefficients[arm]` — which this
+   pass has *not yet replaced* for the arm being fit, so it is bit-for-bit the
+   `scores[arm]` already in hand. Counted: **409,690 dot products, of which
+   204,845 were repeats** — exactly `773 rows x 5 arms x 53 iterations x 2`.
+   `_probabilities` is split into `_linear_scores` and `_softmax`, the pass keeps
+   both halves, and the count halves to 204,845.
+
+   **The duplicate very nearly committed.** The remaining cost was
+   `weighted_least_squares`, which re-derives the design's sparsity pattern on
+   every call — 773 rows x 265 calls = **204,845 reconstructions of a pattern
+   fixed at construction**, worth 29% of the fit's least-squares time and
+   bit-identical when hoisted. A `weighted_least_squares_sparse` was written to
+   take pre-sparsified rows. `linalg` already contained
+   **`sparse_weighted_least_squares`**, character-for-character the same
+   accumulation, with a per-coefficient ridge vector as a superset — and
+   **zero callers anywhere in the package**. A hand-optimised solver sitting
+   unused, and therefore unpinned, in the one module invariant 23 says must be
+   kept exact.
+
+   It was caught by listing the module's functions after the edit, not before.
+   The lesson is invariant 3's at a different granularity: *read the module you
+   are adding to*. A near-duplicate under a transposed name would have been two
+   implementations of the normal equations, and the drift would have moved
+   standard errors without failing anything.
+
+   The new function is deleted. `weighted_least_squares` is now the **dense
+   front door** — it sparsifies and delegates — so there is one implementation,
+   the existing tests reach it for the first time, and the propensity fit
+   sparsifies once and calls it directly.
+
+   **Nothing moved, at three levels.** The propensity coefficients hash to
+   `50c99a25254b`, the fitted covariances to `6170c6241c15`, and the served
+   output over 40 patients to `b94e28ce8b93` — all identical before and after,
+   and 53 iterations to convergence either way. That matters here because these
+   coefficients are the denominator of every IPW weight in the system.
+
+   **A stale `eta` would not raise; it would converge somewhere else.** So the
+   guard is not the identity but the *solution*: the multinomial score equation
+   `sum_i x_i (1{a_i = arm} - p_i(arm)) ~ 0`, which is a property of the fit and
+   owes nothing to how the pass is arranged. At the deployed fit it is **0.0119**
+   over 773 rows; with `eta` forced to zero it is **359.85**, a 30,000x
+   discrimination. A second test asserts the fit never takes the dense front
+   door, because that call is what carries the sparsity cost, and
+   `tests/test_linalg.py` now pins the sparse solver directly — including the
+   per-coefficient ridge vector, which the dense door cannot reach and nothing
+   had ever exercised.
+
+   **What is deliberately not touched.** The fit takes 53 IRLS passes at
+   tolerance 1e-4 under a block-diagonal Hessian approximation whose docstring
+   already says it "converges more slowly and to the same place". Loosening the
+   tolerance or switching to a full Newton step would be faster and would move
+   the coefficients, which is a numerical decision about a served quantity, not
+   an optimisation. Everything in invariants 65-67 is arithmetic-preserving and
+   asserted to be; keep that boundary.
 
 ## What is real vs. still a placeholder
 

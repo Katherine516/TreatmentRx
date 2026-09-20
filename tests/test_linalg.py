@@ -82,6 +82,58 @@ class WeightedLeastSquaresTests(unittest.TestCase):
         for a, b in zip(actual, expected):
             self.assertAlmostEqual(a, b, places=9)
 
+    def test_the_dense_front_door_is_the_sparse_solver(self):
+        """One implementation, not two.
+
+        `sparse_weighted_least_squares` already existed with **no callers at
+        all** — a hand-optimised solver sitting unused, and so unpinned, in the
+        module invariant 23 says must be kept exact. A second copy was very
+        nearly added beside it under a transposed name. `weighted_least_squares`
+        sparsifies and delegates, so the test above covers both and they cannot
+        drift.
+        """
+        rng = random.Random(11)
+        design, targets, weights = [], [], []
+        for _ in range(40):
+            row = [1.0] + [rng.uniform(-2, 2) if rng.random() < 0.6 else 0.0 for _ in range(5)]
+            design.append(row)
+            targets.append(rng.uniform(0, 1))
+            weights.append(rng.uniform(0.2, 2.0))
+        sparse = [[(i, v) for i, v in enumerate(row) if v != 0.0] for row in design]
+
+        dense = linalg.weighted_least_squares(design, targets, weights, ridge=1e-3)
+        direct = linalg.sparse_weighted_least_squares(
+            sparse, targets, weights, len(design[0]), ridge=1e-3
+        )
+        # Bit-identical, not merely close: same arithmetic in the same order.
+        self.assertEqual(dense, direct)
+
+    def test_a_per_coefficient_ridge_penalises_only_its_own_column(self):
+        """The one capability the dense front door cannot reach, and the reason
+        the sparse form takes a vector: the penalized Q-shared fit shrinks the
+        blip block without touching the treatment-free block."""
+        rng = random.Random(12)
+        rows, targets, weights = [], [], []
+        for _ in range(50):
+            x1, x2 = rng.uniform(-1, 1), rng.uniform(-1, 1)
+            rows.append([(0, 1.0), (1, x1), (2, x2)])
+            targets.append(0.4 + 0.9 * x1 - 0.7 * x2 + rng.gauss(0, 0.01))
+            weights.append(1.0)
+
+        light = linalg.sparse_weighted_least_squares(rows, targets, weights, 3, ridge=1e-6)
+        heavy = linalg.sparse_weighted_least_squares(
+            rows, targets, weights, 3, ridge=[1e-6, 1e-6, 1e3]
+        )
+        # The penalised column shrinks toward zero; the others barely move.
+        self.assertLess(abs(heavy[2]), abs(light[2]) / 10)
+        self.assertAlmostEqual(heavy[1], light[1], places=2)
+
+    def test_a_mismatched_ridge_vector_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "one entry per feature"):
+            linalg.sparse_weighted_least_squares(
+                [[(0, 1.0)]], [1.0], [1.0], 3, ridge=[1e-6, 1e-6]
+            )
+
 
 class InverseTests(unittest.TestCase):
     def test_inverse_reproduces_the_identity(self):

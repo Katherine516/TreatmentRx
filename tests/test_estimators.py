@@ -426,6 +426,81 @@ class PropensityTests(unittest.TestCase):
         self.assertAlmostEqual(sum(probabilities.values()), 1.0, places=9)
         self.assertTrue(all(p > 0.0 for p in probabilities.values()))
 
+    def test_the_fit_solves_the_score_equations(self):
+        """The property that survives the IRLS pass being rearranged.
+
+        Each pass computes every row's linear predictor once and the arm loop
+        *reads* it — `eta` is the `scores[arm]` already in hand, because the arm
+        being fit has not had its coefficients replaced yet in this pass.
+        Recomputing it was half of every dot product in the fit, 204,845 of
+        409,690.
+
+        That identity is what would break if someone moved the probability
+        update inside the arm loop, and a stale `eta` does not raise — it
+        converges somewhere else. So the guard is the multinomial score
+        equation, `sum_i x_i (1{a_i = arm} - p_i(arm)) ~ 0`, which is a property
+        of the solution and not of the implementation. Measured at the deployed
+        fit it is **0.0119** over 773 rows; with `eta` forced to zero it is
+        **359.85**.
+        """
+        from treatmentrx.estimation.basis import blip_basis
+
+        rows = [
+            (blip_basis(stage.features), stage.arm)
+            for trajectory in self.fit.train
+            for stage in trajectory.stages
+        ]
+        coefficients = self.model.fit.coefficients
+        probabilities = [self.model._probabilities(row, coefficients) for row, _ in rows]
+
+        worst = 0.0
+        for arm in coefficients:
+            score = [0.0] * self.model._width
+            for (row, observed), probability in zip(rows, probabilities):
+                residual = (1.0 if observed == arm else 0.0) - probability[arm]
+                for index, value in enumerate(row):
+                    score[index] += value * residual
+            worst = max(worst, max(abs(value) for value in score))
+
+        self.assertLess(
+            worst,
+            0.05,
+            "the fit is not at the stationary point of the likelihood it claims",
+        )
+
+    def test_the_fit_does_not_rebuild_the_sparsity_pattern(self):
+        """The design is fixed at construction; only the working response and
+        the weights move between passes.
+
+        Taking the dense front door meant re-deriving an identical
+        `(index, value)` list for all 773 rows on each of 265 calls. Asserted
+        structurally rather than by timing, because it is the call that carries
+        the cost.
+        """
+        from treatmentrx.estimation import linalg
+        from treatmentrx.estimation.propensity import PropensityModel
+        import treatmentrx.estimation.propensity as propensity_module
+
+        dense_calls = []
+        real = linalg.weighted_least_squares
+
+        def counted(*args, **kwargs):
+            dense_calls.append(1)
+            return real(*args, **kwargs)
+
+        try:
+            propensity_module.linalg.weighted_least_squares = counted
+            PropensityModel(self.fit.train[:60])
+        finally:
+            propensity_module.linalg.weighted_least_squares = real
+
+        self.assertEqual(
+            dense_calls,
+            [],
+            "the propensity fit sparsifies once; it must not go through the "
+            "dense entry point, which sparsifies per call",
+        )
+
     def test_it_reports_convergence_honestly(self):
         """`converged` has to mean the fixed point, not the iteration budget."""
         self.assertTrue(self.model.fit.converged)

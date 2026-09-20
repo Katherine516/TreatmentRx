@@ -40,26 +40,31 @@ def weighted_least_squares(
     """Return beta minimizing sum_i w_i (y_i - x_i . beta)^2 via the normal equations.
 
     A tiny ridge term stabilizes near-collinear designs.
+
+    The dense designs here are half structural zeros — one-hot arm indicators and
+    their interactions in the censoring model, the untaken arm's blip block in
+    dWOLS — so walking every pair costs several times what the row contains.
+
+    This is the dense front door: it sparsifies the rows and hands them to
+    `sparse_weighted_least_squares`, which is the arithmetic. That function
+    already existed and had **no callers at all** — a hand-optimised solver
+    sitting unused, and therefore unpinned, in the one module invariant 23 says
+    must be kept exact. Routing through it means one implementation rather than
+    two, and every test of this function now covers it.
+
+    A caller that fits the **same design repeatedly** should sparsify once and
+    call the sparse form directly; the propensity model's IRLS does, and that
+    removed 204,845 reconstructions of a pattern fixed at construction.
     """
     if not design:
         return []
-    p = len(design[0])
-    xtwx = [[0.0 for _ in range(p)] for _ in range(p)]
-    xtwy = [0.0 for _ in range(p)]
-    # The dense designs here are half structural zeros — one-hot arm indicators
-    # and their interactions in the censoring model, the untaken arm's blip block
-    # in dWOLS — so walking every pair costs several times what the row contains.
-    for row, y, w in zip(design, targets, weights):
-        active = [(i, value) for i, value in enumerate(row) if value != 0.0]
-        for i, xi in active:
-            wxi = w * xi
-            xtwy[i] += wxi * y
-            target_row = xtwx[i]
-            for j, xj in active:
-                target_row[j] += wxi * xj
-    for i in range(p):
-        xtwx[i][i] += ridge
-    return solve(xtwx, xtwy)
+    return sparse_weighted_least_squares(
+        [[(i, value) for i, value in enumerate(row) if value != 0.0] for row in design],
+        targets,
+        weights,
+        len(design[0]),
+        ridge,
+    )
 
 
 SparseRow = list  # list[tuple[int, float]] — (column index, value) pairs
