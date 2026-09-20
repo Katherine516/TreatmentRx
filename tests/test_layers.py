@@ -1440,6 +1440,22 @@ class ExplanationAuditTests(unittest.TestCase):
         self.assertGreater(block["patients"], 0)
         self.assertTrue(block["sources"])
 
+    def test_the_note_describes_the_source_it_measured(self):
+        """The note under this metric said psi could not be averaged across
+        members for a while after invariant 60 averaged them — three lines below
+        a `sources` field reading `BMA Ensemble`. It is written from the measured
+        value now, and this is what keeps the two from parting again."""
+        from treatmentrx.decision.bma import BMA_ENSEMBLE
+
+        block = self.section.metrics["attribution_matches_its_source_model"]
+        note = " ".join(self.section.notes)
+        if block["sources"] == [BMA_ENSEMBLE]:
+            self.assertIn("BMA-weighted blip", note)
+            self.assertNotIn("one member's blip", note)
+        else:
+            self.assertIn("one member's blip", note)
+            self.assertNotIn("BMA-weighted blip", note)
+
     def test_the_phi_guard_is_scored_where_the_channel_runs(self):
         """It scanned 30 cards for a patient hash while the two sections that
         carry patient-specific free text — both fed from episodic memory — were

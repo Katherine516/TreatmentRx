@@ -1112,12 +1112,24 @@ def audit_explanation(n: int = 30, seed: int = AUDIT_SEED) -> Section:
         "Memory is expected to change the narrative and nothing else; that asymmetry "
         "is the whole boundary."
     )
+    # Written from the measured `sources` rather than stated, because this note
+    # described the pre-averaging behaviour for a while after the averaging
+    # landed: it said psi could not be averaged, three lines under a metric
+    # reporting that it was.
+    ensemble_sourced = sorted(sources) == [BMA_ENSEMBLE]
     section.notes.append(
-        "`attribution_matches_its_source_model` is the faithfulness figure. psi cannot "
-        "be averaged across members that parameterise it differently, so the card "
-        "decomposes one member's blip and names it; `sources` is which. On the "
-        "deployed fit that choice turns on a BMA weight margin of 0.003 while the two "
-        "members' blips differ by up to 0.041 for the same patient."
+        "`attribution_matches_its_source_model` is the faithfulness figure: the "
+        "card's decomposition recomputed from the fitted models rather than read "
+        "back from the coefficients the estimate carries. "
+        + (
+            "psi is on one scale across members since the horizon division, so "
+            "the card decomposes the BMA-weighted blip — the same weighting the "
+            "gap beside it is built from — and `sources` says so."
+            if ensemble_sourced
+            else "The card decomposes one member's blip and names it; `sources` "
+            "is which, and a single-member source means the ensemble average was "
+            "not available for these patients."
+        )
     )
     return section
 
