@@ -107,18 +107,21 @@ class ArmFit:
         sparse = [[(i, value) for i, value in enumerate(row) if value != 0.0] for row in design]
         residuals = [y - linalg.dot(row, beta) for row, y in zip(design, targets)]
         normal = linalg.sparse_normal_matrix(sparse, weights, n_features, _RIDGE)
+        # Inverted once and used twice. `sandwich_covariance` used to do this
+        # inversion itself and then be handed the same matrix again below.
+        self._bread = linalg.inverse(normal)
         self.covariance = sandwich_covariance(
-            sparse, residuals, weights, self.clusters, normal, n_features
+            sparse, residuals, weights, self.clusters, self._bread, n_features
         )
 
-        # Kept for the *cross*-arm covariance. Each arm is fit one-vs-reference,
-        # so two arms share every reference-arm row and their estimates are
+        # The bread above is also kept for the *cross*-arm covariance. Each arm
+        # is fit one-vs-reference, so two arms share every reference-arm row and
+        # their estimates are
         # correlated — measured at +0.20 to +0.51 on this cohort. A contrast that
         # adds their variances as if independent is therefore too wide by 15-29%,
         # which is pure lost precision: it buys no validity and it feeds straight
         # into the abstention rate. `cross_covariance` needs the bread and the
         # per-cluster scores, and recomputing them later would mean refitting.
-        self._bread = linalg.inverse(normal)
         self._scores: dict[int, list[float]] = {}
         distinct = len(set(self.clusters))
         self._cluster_scale = distinct / max(distinct - 1, 1)

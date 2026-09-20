@@ -8,7 +8,7 @@ test fixture, not evidence.
 ## Commands
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests    # 604 tests, ~6.5 min
+PYTHONPATH=src python3 -m unittest discover -s tests    # 606 tests, ~6.5 min
 PYTHONPATH=src python3 -m treatmentrx.cli demo          # one patient end to end
 PYTHONPATH=src python3 -m treatmentrx.cli evaluate      # estimator scorecard
 PYTHONPATH=src python3 -m treatmentrx.cli stability     # k-fold + seed sweep (~10s)
@@ -1941,6 +1941,67 @@ produced a real clinical divergence, and the notes below are the scar tissue.
    aliasing risk of handing out a cached mutable dict, or the subtlety of a
    matrix whose shape no longer matches what `cross_covariance` documents, for
    under a millisecond in a research prototype whose request is already 3ms.
+
+66. **The same matrix was inverted twice, fifteen lines apart, and one of them
+   was 98x98.** Invariant 65 took the per-request redundancy; this is the same
+   defect on the fit path, which is where the remaining time actually was —
+   `cli audit` and every Monte Carlo study refit through here.
+
+   `sandwich_covariance` took the normal matrix X'WX and inverted it. Both
+   callers that need the inverse for anything else then inverted it again
+   themselves:
+
+   * `QLearningModel._fit` factors X'WX once for the fixed point — there is a
+     comment above it saying exactly why, *"only the pseudo-outcomes do... which
+     is what makes the bootstrap's hundreds of refits affordable"* — and then
+     handed the **un-inverted** matrix to `_sandwich`, which redid it. At 98
+     parameters that is a **277ms** Gauss-Jordan, repeated.
+   * `ArmFit._fit` let `sandwich_covariance` compute the bread, discarded it,
+     and rebuilt the identical 10x10 for `_bread` on the next line.
+
+   The parameter is the **bread** now, not the matrix. That makes the
+   redundancy structurally impossible rather than merely fixed: there is one
+   object to pass, so a caller cannot hold the inverse and hand over the
+   original. `specification.py`, the one caller with no other use for it,
+   inverts at its own call site.
+
+   Exact, from counting rather than timing (see invariant 65 on why):
+
+   | inversion | before | after |
+   | --- | --- | --- |
+   | 98x98 | 2 | **1** |
+   | 78x78 | 2 | **1** |
+   | 38x38 | 2 | **1** |
+   | 10x10, five arm fits | 10 | **5** |
+   | 11x11, `specification` | 15 | 15 |
+
+   Priced with dense inversions measured at 277ms / 116ms / 13ms / 0.3ms, that
+   is about **407ms removed from every full fit**, and one 98x98 plus five 10x10
+   from every study replication that computes a covariance — roughly 2.2s of an
+   8-replication `decision_rule_coverage`.
+
+   **Nothing moved, and this is the change where that mattered most.** Every
+   standard error in the system flows from these matrices. The fitted
+   covariances — all five dWOLS arm fits, their breads, and the Q-learning
+   models' — hash to `6170c6241c15` **before and after**, at twelve decimal
+   places, and the served output over 40 patients hashes unchanged too.
+
+   The risk the signature creates is a caller passing X'WX where the bread
+   belongs, which would fail *silently*: a plausible covariance built from the
+   wrong matrix, shifting every interval without raising anything. So
+   `tests/test_estimators.py` pins `sandwich_covariance` against
+   `A^-1 (sum_g s_g s_g') A^-1 . G/(G-1)` computed the long way on a case small
+   enough to check by hand — invariant 23's rule applied to the argument that
+   changed — and asserts it *disagrees* when handed the un-inverted matrix. A
+   second test counts inversions per fit, because the identity would still hold
+   if the redundancy came back.
+
+   **Two honest notes on the measurement.** A *diagonal* 98x98 inverts in 5ms,
+   not 277ms, because `linalg.inverse` skips zero factors — the first attempt to
+   price this used a diagonal matrix and understated it fifty-fold. And the
+   wall-clock here was useless again: `training.fitted()` timed 5.20s, 4.00s and
+   15.64s across runs of code that differed by one line. The counts are the
+   evidence; the milliseconds are a price list.
 
 ## What is real vs. still a placeholder
 

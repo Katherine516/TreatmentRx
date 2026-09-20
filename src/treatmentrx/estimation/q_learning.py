@@ -326,8 +326,11 @@ class QLearningModel:
         # Bootstrap replicates only need the point estimate; the covariance is
         # the expensive part and nothing asks a replicate for its own interval.
         if self.compute_covariance:
+            # `normal_inverse` above, not `normal_matrix`: the fixed point
+            # already paid for this inversion, and at 98 parameters a second
+            # Gauss-Jordan is 272ms of pure repetition.
             self._covariance = self._sandwich(
-                rows, targets, weights, cluster_of_row, normal_matrix
+                rows, targets, weights, cluster_of_row, normal_inverse
             )
 
     def _future_terms(self, features: dict[str, float], stage_index: int):
@@ -388,14 +391,18 @@ class QLearningModel:
         self.censoring = CensoringModel(cohort)
         return self.censoring
 
-    def _sandwich(self, rows, targets, weights, clusters, normal_matrix) -> list[list[float]]:
-        """Cluster-robust covariance of the fitted parameters, clustered by patient."""
+    def _sandwich(self, rows, targets, weights, clusters, bread) -> list[list[float]]:
+        """Cluster-robust covariance of the fitted parameters, clustered by patient.
+
+        `bread` is the inverted X'WX the fixed point already factored, not the
+        matrix itself — see `sandwich_covariance`.
+        """
         residuals = [
             target - sum(self._beta[index] * value for index, value in row)
             for row, target in zip(rows, targets)
         ]
         return sandwich_covariance(
-            rows, residuals, weights, clusters, normal_matrix, self.n_features
+            rows, residuals, weights, clusters, bread, self.n_features
         )
 
     # ------------------------------------------------------------- prediction

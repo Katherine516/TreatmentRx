@@ -202,7 +202,9 @@ def _augmented_fit(
         residuals,
         weights,
         clusters,
-        linalg.sparse_normal_matrix(sparse, weights, n_features, _RIDGE),
+        # This caller has no other use for the bread, so it inverts here; the
+        # two that do now pass an inverse they already hold.
+        linalg.inverse(linalg.sparse_normal_matrix(sparse, weights, n_features, _RIDGE)),
         n_features,
     )
     index = n_features - 1

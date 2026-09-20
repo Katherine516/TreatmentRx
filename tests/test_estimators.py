@@ -604,6 +604,105 @@ class DWOLSContrastCovarianceTests(unittest.TestCase):
             places=9,
         )
 
+    def test_the_sandwich_matches_its_textbook_form(self):
+        """Invariant 23's rule, applied to the argument that changed.
+
+        `sandwich_covariance` takes the *inverted* normal matrix now. The one
+        thing that can go wrong is a caller handing it X'WX instead of its
+        inverse — and that fails silently, producing a plausible covariance
+        built from the wrong bread, which would shift every standard error in
+        the system without raising anything.
+
+        So it is pinned against `A^-1 (sum_g s_g s_g') A^-1 . G/(G-1)` computed
+        the long way on a case small enough to check by hand, and asserted to
+        *disagree* when handed the un-inverted matrix.
+        """
+        from treatmentrx.estimation import linalg
+        from treatmentrx.estimation.inference import sandwich_covariance
+
+        design = [[1.0, 0.5], [1.0, -1.5], [1.0, 2.0], [1.0, 0.25]]
+        residuals = [0.3, -0.2, 0.15, -0.05]
+        weights = [1.0, 0.8, 1.2, 0.9]
+        clusters = [0, 0, 1, 2]
+        rows = [[(i, v) for i, v in enumerate(row) if v != 0.0] for row in design]
+        normal = linalg.sparse_normal_matrix(rows, weights, 2, 0.0)
+        bread = linalg.inverse(normal)
+
+        scores = {}
+        for row, residual, weight, cluster in zip(design, residuals, weights, clusters):
+            score = scores.setdefault(cluster, [0.0, 0.0])
+            for index, value in enumerate(row):
+                score[index] += weight * value * residual
+        meat = [[0.0, 0.0], [0.0, 0.0]]
+        for score in scores.values():
+            for i in range(2):
+                for j in range(2):
+                    meat[i][j] += score[i] * score[j]
+        groups = len(scores)
+        scale = groups / (groups - 1)
+        expected = linalg.matmul(linalg.matmul(bread, meat), bread)
+
+        measured = sandwich_covariance(rows, residuals, weights, clusters, bread, 2)
+        for i in range(2):
+            for j in range(2):
+                with self.subTest(entry=(i, j)):
+                    self.assertAlmostEqual(measured[i][j], expected[i][j] * scale, places=12)
+
+        # And the failure mode the signature change exists to prevent.
+        wrong = sandwich_covariance(rows, residuals, weights, clusters, normal, 2)
+        self.assertNotAlmostEqual(
+            wrong[0][0],
+            measured[0][0],
+            places=6,
+            msg="passing X'WX where the bread belongs went unnoticed",
+        )
+
+    def test_one_fit_inverts_its_normal_matrix_once(self):
+        """The quantity the signature change buys, counted rather than timed.
+
+        `sandwich_covariance` used to invert the matrix itself, and both callers
+        that needed the inverse for anything else inverted it again fifteen
+        lines away. For `QLearningModel` that second Gauss-Jordan is 98x98 and
+        cost 272ms of pure repetition on every fit that computes a covariance.
+        """
+        from treatmentrx.estimation import linalg
+        from treatmentrx.estimation.dwols import DWOLSModel
+        from treatmentrx.estimation.q_learning import QLearningModel
+        from treatmentrx.estimation import training
+
+        cohort = training.training_cohort()[:120]
+        sizes = []
+        real = linalg.inverse
+
+        def counted(matrix):
+            sizes.append(len(matrix))
+            return real(matrix)
+
+        import treatmentrx.estimation.dwols as dwols_module
+        import treatmentrx.estimation.inference as inference_module
+        import treatmentrx.estimation.q_learning as ql_module
+
+        patched = (linalg, dwols_module.linalg, inference_module.linalg, ql_module.linalg)
+        try:
+            for module in patched:
+                module.inverse = counted
+            sizes.clear()
+            model = DWOLSModel(cohort)
+            self.assertEqual(
+                len(sizes),
+                len(model.fits),
+                "each arm fit must invert its normal matrix exactly once",
+            )
+            sizes.clear()
+            QLearningModel(cohort)
+            self.assertEqual(
+                len(sizes), 1, "the fixed point already factored X'WX; the "
+                "sandwich must not invert it again"
+            )
+        finally:
+            for module in patched:
+                module.inverse = real
+
     def test_the_memoised_covariance_is_the_one_it_replaced(self):
         """The cache is behaviour-preserving, asserted rather than assumed.
 

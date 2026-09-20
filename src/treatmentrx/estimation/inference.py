@@ -279,16 +279,24 @@ def sandwich_covariance(
     residuals: list[float],
     weights: list[float],
     clusters: list[int],
-    normal_matrix: list[list[float]],
+    bread: list[list[float]],
     n_features: int,
 ) -> list[list[float]]:
     """Cluster-robust covariance of a weighted least-squares fit.
 
-    `normal_matrix` is the X'WX (plus ridge) already accumulated by the fit;
     `clusters` assigns each row to a patient.
-    """
-    bread = linalg.inverse(normal_matrix)
 
+    **`bread` is the already-inverted normal matrix, not the normal matrix.**
+    This used to take X'WX and invert it here, and both callers that needed the
+    inverse for anything else inverted it a second time themselves — the same
+    matrix, fifteen lines apart. `QLearningModel._fit` factors a 98x98 X'WX once
+    for the fixed point and then handed the un-inverted matrix to this function,
+    which redid a 272ms Gauss-Jordan; `ArmFit._fit` let this compute the bread,
+    discarded it, and rebuilt the identical 10x10 for `_bread`. Taking the
+    inverse as the argument makes that impossible rather than merely fixed:
+    there is now only one object to pass, so a caller cannot hold one and hand
+    over the other.
+    """
     scores: dict[int, list[float]] = {}
     for row, residual, weight, cluster in zip(rows, residuals, weights, clusters):
         score = scores.setdefault(cluster, [0.0] * n_features)
