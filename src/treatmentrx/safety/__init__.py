@@ -147,9 +147,21 @@ class SafetyLayer:
                         "recommended_arm_infeasible",
                         "block",
                         (
-                            f"{decision.recommended_arm} scored highest but is not feasible for this patient. "
-                            "Routed to clinical review rather than substituting the next-best arm."
+                            f"{decision.recommended_arm} scored highest but is not feasible "
+                            "for this patient. No arm has been substituted."
                         ),
+                        # Same rule as the branch above, which this one missed:
+                        # the message said "Routed to clinical review", and this
+                        # branch returns **BLOCKED**. The card then read
+                        # "BLOCKED — no treatment is being suggested" in its
+                        # heading and "routed to clinical review" four lines
+                        # down — two different outcomes, since BLOCKED stops and
+                        # REVIEW routes. Measured with pregnancy injected, both
+                        # of the two blocked cards in 60 carried it, as does
+                        # every allergy block. What survives is what the flag
+                        # observed, plus invariant 2's guarantee that nothing
+                        # was promoted — which is a statement about this layer's
+                        # own action rather than about the status.
                         decision.recommended_arm,
                     )
                 ],

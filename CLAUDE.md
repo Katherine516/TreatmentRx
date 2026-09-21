@@ -8,7 +8,7 @@ test fixture, not evidence.
 ## Commands
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests    # 625 tests, ~6.5 min
+PYTHONPATH=src python3 -m unittest discover -s tests    # 632 tests, ~6.5 min
 PYTHONPATH=src python3 -m treatmentrx.cli demo          # one patient end to end
 PYTHONPATH=src python3 -m treatmentrx.cli evaluate      # estimator scorecard
 PYTHONPATH=src python3 -m treatmentrx.cli stability     # k-fold + seed sweep (~10s)
@@ -114,10 +114,10 @@ has already gone wrong on it. Read the row before the diff, not after.
 | policy value and off-policy evaluation | 30, 39, 41, 42, 43 |
 | the validation gate | 14, 25, 41 |
 | the blip basis | 57, 68 |
-| the safety layer | 1, 54, 61 |
+| the safety layer | 1, 35, 54, 61, 70 |
 | `cli audit` and the layer sections | 2, 36, 62, 65, 66, 69 |
 
-It reaches **46 of 69**. The rest are one-offs — a single
+It reaches **48 of 70**. The rest are one-offs — a single
 component, found once, unlikely to be what you are holding — and they are not
 listed here because a row of one is not an index, it is a search result.
 `tests/test_docs.py` derives this table from the invariant bodies and fails when
@@ -507,6 +507,13 @@ it goes stale, which is the only thing that makes an index worth having.
    mentions, which stopped distinguishing "memory leaked in" from "safety said
    why the arm went" the moment removals appeared on the card. It now asserts
    against the memory sections themselves, which is what it was always about.
+
+   **The fix reached one of the two branches, and invariant 70 found the other.**
+   `SafetyLayer._status` carries the lesson in a comment beside its REVIEW
+   branch; the BLOCKED branch fifteen lines below still said *"Routed to
+   clinical review rather than substituting the next-best arm."* on the status
+   that **stops**. The sweep that now guards it reads every flag the pipeline
+   can raise rather than any one message.
 
 36. **A rate is meaningless without the denominator it was computed over.**
    `audit_decision` reported `oracle_arm_rate` and `mean_regret_vs_oracle` as
@@ -2266,6 +2273,63 @@ it goes stale, which is the only thing that makes an index worth having.
    is the only thing that shows the change was the one that mattered. A test
    named `test_a_leaking_record_cannot_produce_a_patient_state` never called
    `build_patient_state`; it does now, under a name that says what it does.
+
+70. **Two card lines that misstated what they described.** Found by running the
+   whole workflow and rendering all four statuses side by side — the method that
+   found invariants 35 and 54, and the one that keeps working because a card is
+   read, not executed.
+
+   **The interval's level was truncated.** Both renderings computed
+   `int((1 - alpha) * 100)`. The deployed alpha is `0.05/15`, so the interval is
+   a **99.6667%** one and the clinician card printed **99%**:
+
+   | arms | pairs | alpha | true level | printed | z used | z from the label |
+   | --- | --- | --- | --- | --- | --- | --- |
+   | 4 | 6 | 0.00833 | 99.167% | **99%** | 2.638 | 2.576 |
+   | 5 | 10 | 0.00500 | 99.500% | **99%** | 2.807 | 2.576 |
+   | **6 (deployed)** | 15 | 0.00333 | **99.667%** | **99%** | **2.935** | **2.576** |
+   | 7 | 21 | 0.00238 | 99.762% | **99%** | 3.038 | 2.576 |
+
+   One label for four different corrections, printed directly beside a sentence
+   saying the alpha is Bonferroni-adjusted over every unordered arm pair — so the
+   number could not identify the object the line beside it was explaining. And
+   truncation errs the **unsafe** way for anyone who reconstructs the interval:
+   at six arms the printed 99% implies `z = 2.576` against the 2.935 actually
+   used, a **12.2% narrower** interval than the one drawn. Nothing pinned it;
+   no test mentioned a level.
+
+   `inference.confidence_label` is the one renderer now, at `%.4g` — enough to
+   separate 99.17 from 99.5 from 99.67, while an ordinary pointwise interval
+   still reads "95" rather than "95.00". `tests/test_inference.py` asserts every
+   family size gets a distinct label *and* that deriving a critical value from
+   the printed level lands on the one the interval used, which is the property
+   truncation broke rather than the formatting.
+
+   **The BLOCKED flag promised a routing that does not happen**, which is
+   invariant 35's defect in the sibling branch of the function whose comment
+   records the lesson. `SafetyLayer._status` returns BLOCKED with a flag reading
+   *"Routed to clinical review rather than substituting the next-best arm."* —
+   so the card said "BLOCKED — no treatment is being suggested" in its heading
+   and "routed to clinical review" four lines down. BLOCKED stops; REVIEW
+   routes; they are different outcomes. Measured with pregnancy injected, **both
+   of the two blocked cards in 60** carried it, as does every allergy block.
+
+   What survives is what the flag observed, plus *"No arm has been
+   substituted"* — invariant 2's guarantee, which is a statement about this
+   layer's own action rather than about the status.
+
+   **The guard is a sweep, not a spot check**, because the defect is not in any
+   one message: writing an outcome into a flag reads naturally while being
+   wrong. `tests/test_safety_review.py` raises every flag the pipeline can —
+   16 bundles across five injected conditions, reaching all six codes — and
+   asserts no message contains `routed`, `blocked`, `not blocked`, `escalat` or
+   `equipoise`. It also asserts the sweep reached at least five codes, because
+   otherwise it passes by finding nothing. `review` is deliberately absent from
+   that list: *"manual review is required"* is legitimate on the out-of-support
+   **warn**, which recommends an action without claiming the status took it.
+
+   Nothing else moved — the two changes are a label and a sentence, and no
+   number, status or arm differs.
 
 ## What is real vs. still a placeholder
 

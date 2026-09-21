@@ -21,6 +21,7 @@ from treatmentrx.decision import DecisionLayer
 from treatmentrx.demo_data import sample_ra_bundle
 from treatmentrx.domain import RecommendationStatus
 from treatmentrx.estimation import EstimationLayer
+from treatmentrx.orchestrator import TreatmentRxOrchestrator
 from treatmentrx.safety import SafetyLayer
 from treatmentrx.simulation.fhir_export import simulated_bundles
 
@@ -398,6 +399,101 @@ class DelayedToxicitySubjectTests(unittest.TestCase):
             1,
             "the argmax gate should no longer be suppressing these warnings",
         )
+
+class FlagMessagesReportObservationsTests(unittest.TestCase):
+    """Invariant 35's rule as a property, not a spot check.
+
+    A flag says what it observed; the status is decided after it and says
+    itself. That was fixed once in `_status`'s REVIEW branch — whose comment
+    records the lesson — and missed in the BLOCKED branch fifteen lines below,
+    which still read *"Routed to clinical review rather than substituting the
+    next-best arm."* on a status that **stops**. The card then said
+    "BLOCKED — no treatment is being suggested" in its heading and "routed to
+    clinical review" four lines down. Measured with pregnancy injected, both of
+    the two blocked cards in 60 carried it, and so did every allergy block.
+
+    Sweeping every flag the pipeline can raise is what would catch the next one,
+    because the defect is not in any single message — it is that writing an
+    outcome into a flag reads naturally while being wrong.
+    """
+
+    # Words that assert an outcome rather than an observation. `review` alone is
+    # absent deliberately: "manual review is required" is legitimate on an
+    # out-of-support *warning*, which recommends an action without claiming the
+    # status took it.
+    OUTCOME_WORDS = ("routed", "blocked", "not blocked", "escalat", "equipoise")
+
+    @classmethod
+    def setUpClass(cls):
+        import copy
+
+        from treatmentrx.simulation.fhir_export import trajectory_to_bundle
+        from treatmentrx.simulation.ra_cohort import generate_ra_cohort
+
+        def add(bundle, resource):
+            bundle = copy.deepcopy(bundle)
+            bundle["entry"].append({"resource": resource})
+            return bundle
+
+        variants = (
+            lambda b: b,
+            lambda b: add(b, {"resourceType": "Observation", "code": {"text": "pregnant"},
+                              "valueBoolean": True, "effectiveDay": 365}),
+            lambda b: add(b, {"resourceType": "AllergyIntolerance",
+                              "code": {"text": "rituximab"}}),
+            lambda b: add(b, {"resourceType": "Observation", "code": {"text": "ALT"},
+                              "valueQuantity": {"value": 400}, "effectiveDay": 365}),
+            lambda b: add(b, {"resourceType": "Observation", "code": {"text": "eGFR"},
+                              "valueQuantity": {"value": 12}, "effectiveDay": 365}),
+        )
+        orchestrator = TreatmentRxOrchestrator()
+        bundles = [trajectory_to_bundle(t) for t in generate_ra_cohort(15, seed=4242)]
+        bundles.append(sample_ra_bundle())
+        cls.flags = [
+            flag
+            for bundle in bundles
+            for variant in variants
+            for flag in orchestrator.run(variant(bundle)).safety_flags
+        ]
+
+    def test_the_sweep_actually_raises_the_flags_it_checks(self):
+        """Otherwise this passes by finding nothing."""
+        codes = {flag.code for flag in self.flags}
+        self.assertGreaterEqual(len(codes), 5, f"only reached {sorted(codes)}")
+        self.assertIn("recommended_arm_infeasible", codes)
+
+    def test_no_flag_message_asserts_a_status_or_a_routing(self):
+        offenders = [
+            (flag.code, word, flag.message)
+            for flag in self.flags
+            for word in self.OUTCOME_WORDS
+            if word in flag.message.lower()
+        ]
+        self.assertEqual(
+            offenders,
+            [],
+            "a flag message names an outcome the status decides: "
+            + "; ".join(f"{code} says {word!r}" for code, word, _ in offenders[:3]),
+        )
+
+    def test_a_blocked_card_does_not_promise_a_routing(self):
+        """End to end, because the contradiction is between two lines of one
+        card rendered from two different objects."""
+        import copy
+
+        bundle = copy.deepcopy(sample_ra_bundle())
+        bundle["entry"].append(
+            {"resource": {"resourceType": "AllergyIntolerance", "code": {"text": "rituximab"}}}
+        )
+        recommendation = TreatmentRxOrchestrator().run(bundle)
+        self.assertIs(recommendation.status, RecommendationStatus.BLOCKED)
+        card = recommendation.clinician_card
+        self.assertTrue(card.startswith("BLOCKED"))
+        self.assertNotIn("Routed to clinical review", card)
+        # The guarantee that must survive: nothing was promoted in its place.
+        self.assertIn("No arm has been substituted", card)
+        self.assertIsNone(recommendation.recommended_arm)
+
 
 if __name__ == "__main__":
     unittest.main()

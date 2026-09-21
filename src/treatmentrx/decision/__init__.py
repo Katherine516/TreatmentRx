@@ -395,6 +395,8 @@ class DecisionLayer:
         return simultaneous_alpha(number_of_arms, DEFAULT_ALPHA)
 
     def _status(self, state, uncertainty: Uncertainty, goal_decision, contrast):
+        from treatmentrx.estimation.inference import confidence_label
+
         if not state.diagnostics_passed:
             return (
                 RecommendationStatus.BLOCKED,
@@ -428,7 +430,7 @@ class DecisionLayer:
                 RecommendationStatus.EQUIPOISE,
                 (
                     f"{contrast.arm} scores {contrast.difference:+.3f} over {contrast.comparator}, "
-                    f"but the {int((1 - contrast.alpha) * 100)}% interval "
+                    f"but the {confidence_label(contrast.alpha)}% interval "
                     f"[{contrast.lower:+.3f}, {contrast.upper:+.3f}] includes zero: the data cannot "
                     "separate these arms for this patient."
                 ),

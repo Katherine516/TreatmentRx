@@ -37,6 +37,33 @@ Z_QUANTILE = {0.10: 1.6449, 0.05: 1.9600, 0.01: 2.5758}
 DEFAULT_ALPHA = 0.05
 
 
+def confidence_label(alpha: float) -> str:
+    """The interval's level, with enough precision to identify which alpha it is.
+
+    Both places that render an interval used `int((1 - alpha) * 100)`, which
+    **truncates**. The deployed level is `1 - 0.05/15 = 99.6667%` and the card
+    printed **99%** — and so did four, five and seven arms, at 99.167%, 99.5%
+    and 99.762%. One label for four different corrections, printed directly
+    beside a sentence saying the alpha is Bonferroni-adjusted over every
+    unordered arm pair.
+
+    Truncation also errs in the unsafe direction for anyone who reconstructs the
+    interval from the label. At six arms the rule uses `z = 2.935`; the printed
+    99% implies 2.576, which is a **12.2% narrower** interval than the one
+    actually drawn.
+
+        arms  pairs    alpha   true level  printed   z used  z from label
+           4      6  0.00833      99.167%      99%    2.638         2.576
+           5     10  0.00500      99.500%      99%    2.807         2.576
+           6     15  0.00333      99.667%      99%    2.935         2.576
+           7     21  0.00238      99.762%      99%    3.038         2.576
+
+    `%.4g` rounds and keeps the digits that distinguish them, while leaving an
+    ordinary pointwise interval reading "95" rather than "95.00".
+    """
+    return f"{100.0 * (1.0 - alpha):.4g}"
+
+
 def simultaneous_alpha(number_of_arms: int, alpha: float = DEFAULT_ALPHA) -> float:
     """Bonferroni family-wise alpha over all unordered pairs of `number_of_arms`.
 

@@ -12,6 +12,7 @@ from treatmentrx.demo_data import sample_ra_bundle
 from treatmentrx.domain import RecommendationStatus
 from treatmentrx.estimation import EstimationLayer, training
 from treatmentrx.estimation.features import model_features, stage_index
+from treatmentrx.estimation import inference
 from treatmentrx.estimation.inference import ContrastTest, contrast_test
 from treatmentrx.estimation.q_learning import QLearningModel
 from treatmentrx.feedback.stability import (
@@ -314,3 +315,66 @@ class StudentTCriticalValueTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ConfidenceLabelTests(unittest.TestCase):
+    """The number printed beside an interval has to identify that interval.
+
+    Both renderings used `int((1 - alpha) * 100)`, which truncates. The deployed
+    level is `1 - 0.05/15 = 99.6667%` and the clinician card printed **99%** —
+    and so did four, five and seven arms, at 99.167%, 99.5% and 99.762%. One
+    label for four different corrections, sitting directly under a sentence
+    saying the alpha is Bonferroni-adjusted over every unordered arm pair.
+    """
+
+    def test_it_distinguishes_every_family_size(self):
+        labels = {
+            arms: inference.confidence_label(inference.simultaneous_alpha(arms, 0.05))
+            for arms in (3, 4, 5, 6, 7)
+        }
+        self.assertEqual(
+            len(set(labels.values())),
+            len(labels),
+            f"two family sizes render the same label: {labels}",
+        )
+
+    def test_a_pointwise_interval_still_reads_plainly(self):
+        """95, not 95.00 — the precision is there to separate the corrected
+        levels, not to decorate the uncorrected one."""
+        self.assertEqual(inference.confidence_label(0.05), "95")
+
+    def test_the_label_reconstructs_the_interval_it_describes(self):
+        """The property that matters, and the one truncation broke.
+
+        A reader who takes the printed level and derives a critical value must
+        land on the one the interval was drawn with. At six arms the rule uses
+        z = 2.935; the old label implied 2.576, a 12.2% narrower interval — the
+        understating direction is the unsafe one here.
+        """
+        for arms in (3, 4, 5, 6, 7):
+            alpha = inference.simultaneous_alpha(arms, 0.05)
+            label = float(inference.confidence_label(alpha))
+            with self.subTest(arms=arms):
+                self.assertAlmostEqual(
+                    inference.normal_critical_value(1.0 - label / 100.0),
+                    inference.normal_critical_value(alpha),
+                    places=2,
+                )
+
+    def test_the_card_prints_the_level_of_the_interval_beside_it(self):
+        """End to end, because the two are rendered in different layers and the
+        defect was that they had drifted."""
+        from treatmentrx.demo_data import sample_ra_bundle
+        from treatmentrx.orchestrator import TreatmentRxOrchestrator
+
+        recommendation = TreatmentRxOrchestrator().run(sample_ra_bundle())
+        contrast = recommendation.audit_event["contrast"]
+        self.assertIsNotNone(contrast)
+        expected = inference.confidence_label(contrast["alpha"])
+        separation = [
+            line
+            for line in recommendation.clinician_card.splitlines()
+            if line.startswith("Separation:")
+        ]
+        self.assertTrue(separation, "the card has no separation line to check")
+        self.assertIn(f"{expected}% CI", separation[0])

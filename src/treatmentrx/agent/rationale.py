@@ -164,7 +164,9 @@ class RationaleGenerator:
         contrast = decision.contrast
         if contrast is None:
             return ""
-        confidence = int((1 - contrast.alpha) * 100)
+        from treatmentrx.estimation.inference import confidence_label
+
+        confidence = confidence_label(contrast.alpha)
         if contrast.robustly_distinguishable:
             verdict = "separable at this sample size"
         elif contrast.distinguishable:
