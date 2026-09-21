@@ -8,7 +8,7 @@ test fixture, not evidence.
 ## Commands
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests    # 617 tests, ~6.5 min
+PYTHONPATH=src python3 -m unittest discover -s tests    # 620 tests, ~6.5 min
 PYTHONPATH=src python3 -m treatmentrx.cli demo          # one patient end to end
 PYTHONPATH=src python3 -m treatmentrx.cli evaluate      # estimator scorecard
 PYTHONPATH=src python3 -m treatmentrx.cli stability     # k-fold + seed sweep (~10s)
@@ -91,6 +91,37 @@ agent. It is gone. If you are tempted to add a parallel path, don't — the fork
 produced a real clinical divergence, and the notes below are the scar tissue.
 
 ## Invariants — do not break these silently
+
+### Where to look first
+
+The invariants below are one defect each, in the order each was found. That is
+the right order for the record and the wrong one for a reader about to change
+something — `q_values` alone has bitten **twelve** times, spread from 5 to 68.
+So this is the other index: the thing you are touching, and every invariant that
+has already gone wrong on it. Read the row before the diff, not after.
+
+| touching | read |
+| --- | --- |
+| `q_values`, and anything that ranks from them | 5, 9, 32, 40, 45, 46, 53, 54, 55, 56, 58, 68 |
+| `recommended_arm` / `top_scored_arm` | 2, 5, 36, 46, 48, 59 |
+| what the card decomposes | 32, 54, 56, 57, 58, 60 |
+| standard errors and the covariance | 38, 58, 65, 66, 68 |
+| `linalg` | 23, 38, 66, 67, 68 |
+| the serving ensemble | 16, 18, 19, 42, 46, 53, 56 |
+| the candidate set and the abstention rate | 21, 22, 24, 32, 55 |
+| the arm and molecule vocabularies | 3, 62, 63 |
+| Layer 1 ingestion and the contract | 6, 13, 51, 64 |
+| policy value and off-policy evaluation | 30, 39, 41, 42, 43 |
+| the validation gate | 14, 25, 41 |
+| the blip basis | 57, 68 |
+| the safety layer | 1, 54, 61 |
+| `cli audit` and the layer sections | 2, 36, 62, 65, 66 |
+
+It reaches **45 of 68**. The rest are one-offs — a single
+component, found once, unlikely to be what you are holding — and they are not
+listed here because a row of one is not an index, it is a search result.
+`tests/test_docs.py` derives this table from the invariant bodies and fails when
+it goes stale, which is the only thing that makes an index worth having.
 
 1. **Safety runs before explanation.** `SafetyLayer` and `safety/rules.py` are
    code, not prompts. An LLM layer may render a block; it may never lift one.
@@ -2244,6 +2275,32 @@ three lines below credited `anti_ccp`, which the selector could not have chosen.
 Selection now happens where the model is, in
 `estimation.features.top_tailoring_variables`, ranked by `|psi_k * h_k(X)|`. Do
 not reintroduce a Layer 1 quantity that no estimator consumes.
+
+**Carry-forward is unbounded, its age is discarded, and on this cohort it costs
+nothing — all three measured.** `StageHistoryBuilder._features_until` takes every
+observation recorded up to the decision day, last one wins, with no recency
+bound; `StageRecord.features` is then a plain `{name: value}` map, so the
+measurement date is gone and nothing downstream could flag a stale covariate if
+it wanted to. Nothing in `data/` or `safety/` mentions recency at all.
+
+Measured over 60 simulated patients, **every covariate the estimators read is 0
+days old** — min, median and max. That is the simulator writing a fresh
+observation at every visit, not a property of the code: the demo bundle in every
+test already carries an `anti_CCP` drawn at baseline and **365 days old** at the
+decision point.
+
+Priced by removing the most recent DAS28, CRP or anti-CCP so the previous value
+carries forward — a median of **122 days** old, which is a lab not redrawn this
+visit — it changed **0 of 60** statuses and **0 of 60** ranked arms, for each of
+the three. The reason is worth keeping rather than the number: `das28` moves
+0.551 between visits against a cohort spread of 1.828, which is real movement,
+but it carries little weight in the blip; `anti_ccp` carries the most and
+**never changes** (visit-to-visit delta exactly 0.000), correctly, because
+serostatus is stable. So the zero is a property of the blip basis as much as of
+the fixture, and on a cohort where disease activity drove the effect harder it
+would not hold. Reported rather than acted on, and the adapter *does* sort
+observations by date (`data/fhir.py`), so "most recent" is not decided by bundle
+order — that was checked before it was assumed.
 
 `AdaptiveRegimeSelector` is gone. It ran on every request, its `RegimeAssignment`
 was passed to every estimator and read by none (`RegimeEstimate.regime_type`
