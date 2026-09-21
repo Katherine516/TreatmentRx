@@ -26,7 +26,7 @@ class RationaleGenerator:
         context: ContextBundle,
         safe: SafeDecision,
         safety_text: str,
-        guideline_text: str,
+        evidence_text: str,
     ) -> str:
         decision = safe.decision
         arm = decision.recommended_arm
@@ -49,7 +49,7 @@ class RationaleGenerator:
             self._why_not(safe),
             self._attribution(safe),
             safety_text,
-            f"Evidence: {guideline_text}",
+            f"Evidence: {evidence_text}",
             f"Uncertainty: {self.uncertainty_text(decision.uncertainty)}",
         ]
         sections.extend(self._memory_sections(context))
@@ -120,7 +120,7 @@ class RationaleGenerator:
                 "team should review the case without relying on the model's ranking."
             )
         # Only RECOMMEND reaches here — EQUIPOISE and REVIEW returned above, and
-        # BLOCKED never calls this method (`AgentLayer.run_agents` branches on
+        # BLOCKED never calls this method (`AgentLayer.compose` branches on
         # `hard_block` first). This used to append " ...because the options are
         # close" when `goal_decision.act` was False, and that cannot happen:
         # `DecisionLayer._status` returns RECOMMEND only after `act` is True, so

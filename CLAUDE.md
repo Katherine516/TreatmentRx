@@ -8,7 +8,7 @@ test fixture, not evidence.
 ## Commands
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests    # 637 tests, ~6.5 min
+PYTHONPATH=src python3 -m unittest discover -s tests    # 642 tests, ~6.5 min
 PYTHONPATH=src python3 -m treatmentrx.cli demo          # one patient end to end
 PYTHONPATH=src python3 -m treatmentrx.cli evaluate      # estimator scorecard
 PYTHONPATH=src python3 -m treatmentrx.cli stability     # k-fold + seed sweep (~10s)
@@ -106,18 +106,18 @@ has already gone wrong on it. Read the row before the diff, not after.
 | `recommended_arm` / `top_scored_arm` | 2, 5, 36, 46, 48, 59 |
 | what the card decomposes | 32, 54, 56, 57, 58, 60, 71 |
 | standard errors and the covariance | 38, 58, 65, 66, 68 |
-| `linalg` | 23, 38, 66, 67, 68 |
+| `linalg` | 23, 38, 66, 67, 68, 72 |
 | the serving ensemble | 16, 18, 19, 42, 46, 53, 56, 71 |
 | the candidate set and the abstention rate | 21, 22, 24, 32, 55 |
 | the arm and molecule vocabularies | 3, 62, 63 |
 | Layer 1 ingestion and the contract | 6, 13, 51, 64 |
 | policy value and off-policy evaluation | 30, 39, 41, 42, 43 |
 | the validation gate | 14, 25, 41 |
-| the blip basis | 57, 68 |
+| the blip basis | 57, 68, 72 |
 | the safety layer | 1, 35, 54, 61, 70 |
 | `cli audit` and the layer sections | 2, 36, 62, 65, 66, 69 |
 
-It reaches **49 of 71**. The rest are one-offs — a single
+It reaches **50 of 72**. The rest are one-offs — a single
 component, found once, unlikely to be what you are holding — and they are not
 listed here because a row of one is not an index, it is a search result.
 `tests/test_docs.py` derives this table from the invariant bodies and fails when
@@ -2112,13 +2112,50 @@ it goes stale, which is the only thing that makes an index worth having.
    per-coefficient ridge vector, which the dense door cannot reach and nothing
    had ever exercised.
 
-   **What is deliberately not touched.** The fit takes 53 IRLS passes at
-   tolerance 1e-4 under a block-diagonal Hessian approximation whose docstring
-   already says it "converges more slowly and to the same place". Loosening the
-   tolerance or switching to a full Newton step would be faster and would move
-   the coefficients, which is a numerical decision about a served quantity, not
-   an optimisation. Everything in invariants 65-67 is arithmetic-preserving and
-   asserted to be; keep that boundary.
+   **What is deliberately not touched, and this is now measured rather than
+   deferred.** The fit takes 53 IRLS passes at tolerance 1e-4 under a
+   block-diagonal Hessian approximation whose docstring says it "converges more
+   slowly and to the same place". Two levers were considered and both are
+   declined on evidence.
+
+   *The tolerance is not over-tight.* Capping the pass count and watching what
+   actually reads the propensity — the held-out IPW value that feeds the
+   estimands, the BMA weights and `best_score()`:
+
+   | cap | max \|coef - final\| | IPW value | change |
+   | --- | --- | --- | --- |
+   | 12 | 8.1e-02 | 0.738700 | -8e-04 |
+   | 20 | 3.2e-02 | 0.739200 | -3e-04 |
+   | 30 | 9.8e-03 | 0.739400 | -1e-04 |
+   | 40 | 2.7e-03 | 0.739500 | **0** |
+   | 53 (converged) | 0 | 0.739500 | 0 |
+
+   It is flat to six decimals by pass 40, so the last 13 passes buy nothing — but
+   stopping at 30 moves the **fourth** decimal, which the scorecard prints. The
+   setting is right and loosening it would change a reported number for 0.5s.
+
+   *A full Newton step is the only remaining lever, and it is the wrong trade.*
+   It would reach the same fixed point in fewer passes, so unlike truncation it
+   would not move the coefficients meaningfully — at a drift of 1e-4 the table
+   above says the value does not move at all. The prize is roughly **1.2s off a
+   once-per-process fit**. Against that: a multinomial Newton step needs the
+   cross-arm Hessian blocks the block-diagonal approximation exists to avoid, in
+   the module invariant 23 says must be kept exact, and its failure mode is the
+   dangerous one — a subtly wrong Hessian converges *fast* to the wrong place,
+   where the current iteration's failure mode is merely being slow. That is
+   invariant 23's argument, and the smallest payoff left in the repo is not what
+   buys an exception to it.
+
+   **Where the propensity actually reaches, since that decides the risk.**
+   `ArmFit._propensities` fits its own linear probability model per arm pair —
+   *"Only used to form weights, so a simple model is adequate"* — so the
+   multinomial `PropensityModel` never touches dWOLS's weights. It reaches
+   `Recommendation.estimands` through `training.holdout_estimands` (cached: 13ms
+   once, 0ms after), plus the held-out policy values, the DR estimate, the OPE
+   effective samples and the validation blockers. It does **not** reach the
+   recommended arm, the Q-values, the contrast, the candidate set, the
+   abstention rate or the clinician card. An earlier note here implied it moved
+   what the agent recommends; it does not.
 
 68. **Gauss-Jordan on a matrix that was symmetric positive definite all along.**
    The last item in the 65-67 sequence and the only one that is *not*
@@ -2414,6 +2451,43 @@ it goes stale, which is the only thing that makes an index worth having.
    reads 125.34 with `fitted` True, so the branch is unreachable, on a feature
    `USE_VISIT_INTENSITY` turns off by default — doubly out of reach, and a real
    0 would be a division by zero rather than a clinical value.
+
+72. **Three method names claimed an agent, and there is none.** The last of the
+   three items this file had been carrying as deferred. The other two are
+   resolved as amendments rather than new entries — invariant 67 now carries the
+   measured case for leaving the propensity's IRLS alone, and the `cli
+   specification` sections carry `das28_squared`'s null distribution and a
+   correction to the false-positive rate.
+
+   `AgentLayer` exposed `run_agents` and called `_safety_agent` and
+   `_guideline_agent`. What those named is a `"; ".join` over the safety flags
+   and a lookup in a five-passage keyword index. **This package has never
+   contained a model call.** That is invariants 27, 45 and 51's rule — a name may
+   not claim more than the arithmetic supports — in the one file a reader opens
+   expecting to find an agent, and it had gone unexamined because those three are
+   about *numbers* wearing a statistic's name and these are only strings.
+
+   `compose`, `_safety_section`, `_evidence_section`, and `AgentLayer` has a
+   class docstring for the first time, saying what the layer is and is not.
+
+   **The package name stays, and that is the judgement rather than an
+   oversight.** `agent/` is a layer in a decision-support *agent*, ordinary usage
+   for a clinical DSS and not a claim about how the text is produced. Renaming it
+   touches 31 import sites and would churn seventy invariants that say "Layer 5",
+   to fix something the three methods were already saying wrong. The overstatement
+   was local; the fix is local.
+
+   **What is pinned is the claim, not the names.** A test that asserts a method
+   is not called `_safety_agent` is the plumbing this repo's conventions warn
+   about. The substantive property is that no model call can appear, so
+   `tests/test_docs.py` walks every module, resolves each top-level import, and
+   asserts every one is `treatmentrx` or the standard library — which also closes
+   a gap that had nothing to do with naming: `dependencies = []` is a **hard
+   constraint** in this file and `pyproject.toml` declared it, but nothing
+   checked it. Declaring is not checking, and a package that imports only the
+   standard library cannot acquire an LLM SDK quietly. The sweep asserts it
+   reached `linalg.py`, `dwols.py`, `rationale.py` and `contract.py`, because a
+   path change would otherwise make it pass by parsing nothing.
 
 ## What is real vs. still a placeholder
 
@@ -2783,8 +2857,12 @@ characteristics are measured, not assumed:
 | 0.10 | 10/10 | 10.95 |
 | 0.20 | 10/10 | 19.70 |
 
-False positives over 30 null cohorts: **0/30** against a nominal 5%. Getting
-there took two corrections, both found by measuring rather than reasoning. The
+False positives over null cohorts: **2 of 60**, which is 3.3% against a nominal
+5%. This said **0/30** and that figure was a single seed block: seeds 7000-7029
+give 0/30 and 9900-9929 give 2/30. The rate is *near nominal*, which is what a
+calibrated test should read — a different and weaker claim than zero, and the
+tests span both blocks now so neither can be picked. Getting there took two
+corrections, both found by measuring rather than reasoning. The
 first working version rejected on **33%** of null cohorts: it corrected
 multiplicity over arms while running covariates-times-arms tests, and took the
 sandwich at face value where `cli coverage` measures it at 0.86-0.90 of the
@@ -2802,7 +2880,31 @@ it.
 **The near-flag on `das28_squared` is real and acting on it would be wrong.**
 It tests at max|z| = **3.367** against a **3.669** threshold — 92% of the way to
 firing, on the same covariate where `cli subgroups` finds 96% abstention and the
-worst standard error in the cohort. That is not a coincidence and the mechanism is
+worst standard error in the cohort.
+
+**Read that 92% against this candidate's own null distribution, not against the
+threshold alone**, because the two obvious readings are both wrong. Measured over
+60 null cohorts:
+
+| candidate | null mean \|z\| | sd | deployed | percentile of its own null |
+| --- | --- | --- | --- | --- |
+| `crp_std` | 1.475 / 1.601 | 0.48 / 0.60 | 2.302 | 87-93 |
+| `egfr_std` | 1.816 / 1.725 | 0.64 / 0.68 | 2.726 | 90-93 |
+| **`das28_squared`** | **1.905 / 2.013** | 0.65 / 0.83 | **3.367** | **90-100** |
+
+It is *not* "where this candidate always sits": the null mean is 1.905, so 3.367
+is about two standard deviations above it and above every draw in one block of
+30. And it is *not* a clean covariate-specific tail either — **the deployed seed
+reads at the 87th to 93rd percentile for the other two candidates as well**, so
+part of the elevation is a cohort that runs high across the board.
+
+What the max-composition mechanism does explain is the **baseline**: this
+candidate's null mean is 1.905 against 1.475 for `crp_std`, about 0.43 of z, and
+that gap is the curvature backward induction creates. It is not the 1.46 that
+separates 1.905 from 3.367. So the margin decomposes into three parts — a
+structurally higher baseline for a curved candidate, a generally high-reading
+cohort, and a genuine excess on top — and "92% of the way to firing" invites
+reading all of it as the third. That is not a coincidence and the mechanism is
 not noise: the estimators target the blip, which is linear in `das28_std` by
 construction, but the quantity the *decision* uses is the value-to-go contrast,
 and backward induction composes the blip with a `max` over arms, which is curved

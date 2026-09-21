@@ -86,7 +86,7 @@ class TreatmentRxOrchestrator:
         decision = workflow.decision.decide(state, estimates)
         safe = workflow.safety.apply(decision, state)
         context = workflow.agent.build_context(safe)
-        recommendation = workflow.agent.run_agents(context, safe)
+        recommendation = workflow.agent.compose(context, safe)
         receipt = workflow.feedback.enqueue(state, recommendation, safe)
 
         return replace(

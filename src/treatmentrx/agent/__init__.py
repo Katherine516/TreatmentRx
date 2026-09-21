@@ -19,6 +19,32 @@ from treatmentrx.domain import RecommendationStatus
 
 
 class AgentLayer:
+    """Layer 5 — renders a `SafeDecision` as a `Recommendation`. No LLM, no agents.
+
+    Three method names claimed otherwise and are gone: `run_agents`,
+    `_safety_agent` and `_guideline_agent`. What they named is a `"; ".join`
+    over the safety flags and a lookup in a five-passage keyword index. This
+    package has never contained a model call, and nothing here plans, chooses or
+    acts — Layer 3 decides, Layer 4 may remove, and this composes what they
+    produced into text.
+
+    That matters more here than it would elsewhere, because refusing to let a
+    name claim more than the arithmetic supports is what invariants 27, 45 and
+    51 are each about. A method called `_safety_agent` that concatenates strings
+    is the same defect in the one file a reader opens expecting to find an
+    agent.
+
+    The layer name stays. `agent/` is a layer in a decision-support *agent*,
+    which is ordinary usage for a clinical DSS and is not a claim about how the
+    text is produced; renaming the package would churn seventy invariants that
+    say "Layer 5" to fix something the methods were already saying wrong.
+
+    What it does hold that is worth reading: `apply_memory` deep-copies the
+    statistical output and raises if anything numeric moved (invariant 5), and
+    the safety text is formatted verbatim with no authority to reword a block
+    (invariant 1).
+    """
+
     def __init__(self) -> None:
         self.memory = EpisodicMemory()
         self.knowledge_base = SemanticKnowledgeBase()
@@ -74,12 +100,12 @@ class AgentLayer:
             versions=VersionSet(**safe.provenance.get("versions", {})),
         )
 
-    def run_agents(self, context: ContextBundle, safe: SafeDecision) -> Recommendation:
-        safety_text = self._safety_agent(safe)
+    def compose(self, context: ContextBundle, safe: SafeDecision) -> Recommendation:
+        safety_text = self._safety_section(safe)
         if safe.hard_block:
             return self._blocked(context, safe, safety_text)
 
-        guideline_text = self._guideline_agent(context)
+        evidence_text = self._evidence_section(context)
         published_arm = (
             safe.decision.recommended_arm
             if safe.status is RecommendationStatus.RECOMMEND
@@ -91,7 +117,7 @@ class AgentLayer:
             recommended_arm=published_arm,
             top_scored_arm=safe.decision.recommended_arm,
             q_values=safe.decision.q_values,
-            clinician_card=self.rationale.clinician_card(context, safe, safety_text, guideline_text),
+            clinician_card=self.rationale.clinician_card(context, safe, safety_text, evidence_text),
             patient_summary=self.rationale.patient_summary(context, safe),
             uncertainty=self.rationale.uncertainty_text(safe.decision.uncertainty),
             evidence=context.evidence,
@@ -100,7 +126,7 @@ class AgentLayer:
             provenance=safe.provenance | {"agent_layer": "treatmentrx.agent", "schema_validated": True},
         )
 
-    def _safety_agent(self, safe: SafeDecision) -> str:
+    def _safety_section(self, safe: SafeDecision) -> str:
         """Formats safety findings verbatim. It has no authority to reword a block."""
         if not safe.safety_flags:
             return "No safety concern was identified by the safety layer."
@@ -108,7 +134,7 @@ class AgentLayer:
             f"{flag.severity}: {flag.message}" for flag in safe.safety_flags
         )
 
-    def _guideline_agent(self, context: ContextBundle) -> str:
+    def _evidence_section(self, context: ContextBundle) -> str:
         if not context.evidence:
             return "No retrieved guideline evidence was available for this arm."
         return " ".join(citation.text for citation in context.evidence)

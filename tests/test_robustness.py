@@ -295,15 +295,83 @@ class SpecificationTestCalibrationTests(unittest.TestCase):
         # And the sandwich correction is in there, not just multiplicity.
         self.assertGreater(rejection_threshold(0.05, 1, 1), 1.96 * SANDWICH_INFLATION * 0.99)
 
-    def test_it_is_silent_when_the_basis_is_correct(self):
+    # Two independent blocks, because a single one is a lucky draw. The
+    # documented "0/30" held on 7000-7029 and read 2/30 on 9900-9929 — the rate
+    # is near nominal, not zero, and asserting zero would pin an accident.
+    NULL_SEEDS = tuple(range(7000, 7020)) + tuple(range(9900, 9920))
+
+    def _null_reports(self):
         from treatmentrx.estimation.specification import specification_report
 
-        flagged = 0
-        for seed in (7000, 7001, 7002, 7003, 7004, 7005):
-            report = specification_report(generate_ra_cohort(280, seed=seed))
-            if report["flagged"]:
-                flagged += 1
-        self.assertLessEqual(flagged, 1, "the null false-positive rate has drifted up")
+        return [
+            specification_report(generate_ra_cohort(280, seed=seed))
+            for seed in self.NULL_SEEDS
+        ]
+
+    def test_it_is_silent_when_the_basis_is_correct(self):
+        """Near nominal, over both seed blocks rather than one.
+
+        Measured over 60 null cohorts: 0/30 on 7000-7029 and 2/30 on
+        9900-9929, so 2/60 = 3.3% against a nominal 5%. That is the right
+        answer and a *different* claim from "0/30", which is what a single
+        block happened to give.
+        """
+        flagged = sum(1 for report in self._null_reports() if report["flagged"])
+        rate = flagged / len(self.NULL_SEEDS)
+        self.assertLessEqual(
+            rate, 0.15, f"the null false-positive rate has drifted up: {flagged}/{len(self.NULL_SEEDS)}"
+        )
+
+    def test_the_curved_candidate_runs_higher_under_the_null(self):
+        """`das28_squared` is elevated by construction, and that is the
+        mechanism — not a missing modifier.
+
+        Backward induction composes a blip that is linear in `das28_std` with a
+        `max` over arms, which is curved. So this candidate should test higher
+        than one with no such route, and it does: null means 1.905 against
+        1.475 for `crp_std` over 7000-7029.
+        """
+        import statistics
+
+        reports = self._null_reports()
+        means = {
+            name: statistics.mean(
+                report["candidates"][name]["max_abs_z"] for report in reports
+            )
+            for name in ("crp_std", "das28_squared")
+        }
+        self.assertGreater(
+            means["das28_squared"],
+            means["crp_std"],
+            "the curved candidate no longer runs higher, so the stated mechanism "
+            "is not what the statistic is seeing",
+        )
+
+    def test_the_deployed_reading_exceeds_its_own_null(self):
+        """What makes 92% of threshold worth documenting rather than dismissing.
+
+        The elevation above is real but small — it moves the null mean from
+        1.475 to 1.905, about 0.43 of z, not the 1.46 that separates 1.905 from
+        the deployed 3.367. So the deployed reading is not "where this candidate
+        always sits": it is above the null mean by roughly two standard
+        deviations and above every draw in one block of 30.
+        """
+        import statistics
+
+        from treatmentrx.estimation.specification import specification_report
+
+        reports = self._null_reports()
+        null = [report["candidates"]["das28_squared"]["max_abs_z"] for report in reports]
+        deployed = specification_report()["candidates"]["das28_squared"]["max_abs_z"]
+        spread = statistics.pstdev(null)
+        self.assertGreater(
+            deployed,
+            statistics.mean(null) + 1.0 * spread,
+            "the deployed reading has fallen into its own null distribution, so "
+            "the documented margin describes nothing",
+        )
+        # And it has not crossed, which is the other half of the claim.
+        self.assertLess(deployed, specification_report()["bonferroni_z_threshold"])
 
     def test_it_finds_a_modifier_that_is_really_there(self):
         """Silence is only worth something if the test can speak."""

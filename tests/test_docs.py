@@ -95,6 +95,75 @@ class QuotedConstantTests(unittest.TestCase):
         self.assertIn("SERVED_STAGE_INDICES", CLAUDE_MD.read_text())
 
 
+class ZeroDependencyTests(unittest.TestCase):
+    """`dependencies = []` is a hard constraint, and nothing asserted it.
+
+    CLAUDE.md calls it deliberate — it is what keeps the prototype auditable and
+    installable anywhere — and `pyproject.toml` declares it, but declaring is not
+    checking. This walks every module and resolves each top-level import, which
+    also pins the claim `AgentLayer`'s docstring makes: there is no model call
+    here, and a package that imports only the standard library cannot acquire one
+    quietly.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import ast
+
+        cls.imports = {}
+        for path in sorted((ROOT / "src" / "treatmentrx").rglob("*.py")):
+            tree = ast.parse(path.read_text())
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        cls.imports.setdefault(alias.name.split(".")[0], set()).add(path.name)
+                elif isinstance(node, ast.ImportFrom):
+                    if node.level == 0 and node.module:
+                        cls.imports.setdefault(node.module.split(".")[0], set()).add(path.name)
+
+    @staticmethod
+    def _is_stdlib(name: str) -> bool:
+        """Python 3.9 has no `sys.stdlib_module_names`, so resolve the spec and
+        look at where it lives."""
+        import importlib.util
+        import sys
+        import sysconfig
+
+        if name in sys.builtin_module_names:
+            return True
+        try:
+            spec = importlib.util.find_spec(name)
+        except (ImportError, ValueError):
+            return False
+        if spec is None or spec.origin in (None, "built-in", "frozen"):
+            return spec is not None
+        stdlib = sysconfig.get_paths()["stdlib"]
+        return spec.origin.startswith(stdlib) and "site-packages" not in spec.origin
+
+    def test_the_package_imports_only_the_standard_library(self):
+        self.assertTrue(self.imports, "no imports were parsed, so this proves nothing")
+        third_party = {
+            name: sorted(files)
+            for name, files in self.imports.items()
+            if name != "treatmentrx" and not self._is_stdlib(name)
+        }
+        self.assertEqual(
+            third_party,
+            {},
+            f"a third-party import has appeared: {third_party}",
+        )
+
+    def test_pyproject_still_declares_none(self):
+        self.assertIn("dependencies = []", (ROOT / "pyproject.toml").read_text())
+
+    def test_the_sweep_reaches_the_modules_it_claims_to(self):
+        """Otherwise a path change makes this pass by parsing nothing."""
+        seen = {name for files in self.imports.values() for name in files}
+        for expected in ("linalg.py", "dwols.py", "rationale.py", "contract.py"):
+            with self.subTest(module=expected):
+                self.assertIn(expected, seen)
+
+
 class InvariantIndexTests(unittest.TestCase):
     """The index at the top of the invariants has to be derived, not curated.
 

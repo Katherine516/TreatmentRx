@@ -413,7 +413,7 @@ class AgentLayerTests(unittest.TestCase):
                 preference="strongly prefers JAK-inhibitor",
             ),
         )
-        recommendation = agent.run_agents(agent.build_context(blocked), blocked)
+        recommendation = agent.compose(agent.build_context(blocked), blocked)
         self.assertEqual(recommendation.status, RecommendationStatus.BLOCKED)
         self.assertIsNone(recommendation.recommended_arm)
         card = recommendation.clinician_card
@@ -470,7 +470,7 @@ class AgentLayerTests(unittest.TestCase):
         )
         _, _, safe = _pipeline_upto_safety(bundle)
         agent = AgentLayer()
-        recommendation = agent.run_agents(agent.build_context(safe), safe)
+        recommendation = agent.compose(agent.build_context(safe), safe)
         self.assertEqual(recommendation.status, RecommendationStatus.BLOCKED)
         self.assertIsNone(recommendation.recommended_arm)
         self.assertIn("blocked", recommendation.clinician_card.lower())
@@ -479,7 +479,7 @@ class AgentLayerTests(unittest.TestCase):
     def test_clinician_card_renders_the_model_not_prose(self):
         _, _, safe = _pipeline_upto_safety()
         agent = AgentLayer()
-        card = agent.run_agents(agent.build_context(safe), safe).clinician_card
+        card = agent.compose(agent.build_context(safe), safe).clinician_card
         self.assertIn(safe.decision.recommended_arm, card)
         self.assertIn("Why not the alternatives", card)
         self.assertIn("Estimated advantage", card)
@@ -684,7 +684,7 @@ class FeedbackLayerTests(unittest.TestCase):
     def test_feedback_reports_all_three_estimands(self):
         state, _, safe = _pipeline_upto_safety()
         agent = AgentLayer()
-        recommendation = agent.run_agents(agent.build_context(safe), safe)
+        recommendation = agent.compose(agent.build_context(safe), safe)
         receipt = FeedbackLayer().enqueue(state, recommendation, safe)
         self.assertEqual(
             {result.estimand for result in receipt.estimands},
@@ -695,7 +695,7 @@ class FeedbackLayerTests(unittest.TestCase):
     def test_full_system_track_represents_abstention_as_usual_care(self):
         state, _, safe = _pipeline_upto_safety()
         agent = AgentLayer()
-        recommendation = agent.run_agents(agent.build_context(safe), safe)
+        recommendation = agent.compose(agent.build_context(safe), safe)
         abstention = replace(
             recommendation,
             status=RecommendationStatus.EQUIPOISE,
@@ -717,7 +717,7 @@ class FeedbackLayerTests(unittest.TestCase):
     def test_retraining_is_never_automatically_enabled(self):
         state, _, safe = _pipeline_upto_safety()
         agent = AgentLayer()
-        recommendation = agent.run_agents(agent.build_context(safe), safe)
+        recommendation = agent.compose(agent.build_context(safe), safe)
         self.assertFalse(FeedbackLayer().enqueue(state, recommendation, safe).retraining_allowed)
 
 
