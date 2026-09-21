@@ -135,40 +135,27 @@ class PooledQEstimator(_QLearningEstimator):
 from treatmentrx.estimation.dwols import DWOLS_METHOD, DWOLSSharedEstimator  # noqa: E402
 
 
-class PolicyValueSelector:
-    """Pick the most interpretable estimator among those it cannot separate.
+# `PolicyValueSelector` is gone, and it was worse than unused.
+#
+# It chose "the most interpretable estimator among those it cannot separate" —
+# the job `training.best_score()` does (invariant 30) with the same held-out
+# interval logic. Zero constructions anywhere, so its copy of the tie-break had
+# drifted invisibly, and the two no longer described the same preference:
+#
+#     PolicyValueSelector            training.INTERPRETABILITY_ORDER
+#     0  Q-Shared + Penalized        0  dWOLS-Shared
+#     1  dWOLS-Shared                1  Q-Pooled
+#     2  Bayesian Hierarchical Q     2  Stage-Specific Q-learning
+#     3  Stage-Specific Q-learning   3  Q-Shared + Penalized
+#     4  Survival Forest DTR
+#
+# Every shared name disagrees on position, and the reversal is the one that
+# matters: it ranked `Q-Shared + Penalized` **first** where the live order ranks
+# it last. That is the shared-blip fit invariant 18 keeps out of the ensemble and
+# `cli coverage` measures at 28% pooled, 0% at the worst patient. It also named
+# two estimators this package has never contained and omitted `Q-Pooled`, an
+# actual `SERVING_ENSEMBLE` member, which `.get(name, 99)` would have ranked
+# behind everything. Had anything called it, it would have selected the estimator
+# with the worst measured coverage in the repo.
 
-    Used when a single named method is wanted instead of a model average.
 
-    The tolerance is no longer a hand-set 0.02. It comes from the held-out
-    bootstrap intervals in `training`: two estimators are contenders unless the
-    leader's interval clears the other's. A fixed tolerance answers "is the gap
-    smaller than a number I chose"; this answers "can the holdout tell these
-    apart", which is the question. Where an interval is unavailable the estimator
-    is treated as a contender, because an unmeasured difference is not a
-    demonstrated one.
-    """
-
-    interpretability_order = {
-        Q_SHARED_METHOD: 0,
-        DWOLS_METHOD: 1,
-        "Bayesian Hierarchical Q": 2,
-        STAGE_SPECIFIC_METHOD: 3,
-        "Survival Forest DTR": 4,
-    }
-
-    def choose(self, results: list[RegimeEstimate]) -> RegimeEstimate:
-        if not results:
-            raise ValueError("No method results to select from")
-        ranked = sorted(results, key=lambda result: result.policy_value, reverse=True)
-        leader = training.score_for(ranked[0].estimator)
-        contenders = [
-            result
-            for result in ranked
-            if result is ranked[0]
-            or leader is None
-            or not leader.beats(training.score_for(result.estimator) or leader)
-        ]
-        return sorted(
-            contenders, key=lambda result: self.interpretability_order.get(result.estimator, 99)
-        )[0]

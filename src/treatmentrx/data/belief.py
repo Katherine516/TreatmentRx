@@ -5,9 +5,15 @@ This produces a *belief* over the hidden state from observed proxies — a
 filtered estimate b(latent | H_j) with its own uncertainty. The state carries
 the belief, not a false point value.
 
-`POMDPInterface` is a deliberate seam: today the belief is a filter feeding the
-existing estimators; later it can become an explicit belief-state policy without
-a rewrite.
+`BeliefStateFilter` is the whole module. A `POMDPInterface` sat beside it as "a
+deliberate seam ... so swapping in a real POMDP solver is not a rewrite" — the
+same argument invariant 37 rejected for `GRUBaselineEncoder`, and it failed the
+same way: **zero constructions anywhere in the package or its tests.** A seam is
+a thing something passes through; this one had nothing on either side of it. Its
+fallback also read `float(latest.outcome)` as the belief's "activity", and at the
+open decision point `outcome` is `UNKNOWN` (0.5) by construction, so the one
+branch that ran without a belief reported the missing-outcome sentinel as a
+disease-activity estimate.
 """
 
 from __future__ import annotations
@@ -61,18 +67,3 @@ class BeliefStateFilter:
 
     def _replace(self, stage: StageRecord, **updates: object) -> StageRecord:
         return StageRecord(**(stage.__dict__ | updates))
-
-
-class POMDPInterface:
-    """Seam for a future explicit belief-state policy.
-
-    Today this just exposes the current belief as the policy input. The contract
-    exists now so swapping in a real POMDP solver is not a rewrite.
-    """
-
-    def belief_input(self, stages: list[StageRecord]) -> dict[str, float]:
-        latest = stages[-1]
-        belief = latest.belief
-        if belief is None:
-            return {"activity": float(latest.outcome), "uncertainty": 0.3}
-        return {"activity": belief.activity, "uncertainty": belief.uncertainty}

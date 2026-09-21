@@ -375,6 +375,40 @@ class PolicyValueTests(unittest.TestCase):
             )
             self.assertEqual(training.best_score().estimator, expected)
 
+    def test_the_tie_break_names_exactly_the_estimators_that_exist(self):
+        """The drift that made a dead copy of this dangerous.
+
+        `PolicyValueSelector` carried a second `interpretability_order`, had zero
+        callers, and had drifted out of sight: it named `Bayesian Hierarchical Q`
+        and `Survival Forest DTR`, which this package has never contained, and
+        omitted `Q-Pooled`, which serves. `.get(name, 99)` would therefore have
+        ranked a `SERVING_ENSEMBLE` member behind every phantom. It is deleted,
+        but the same two failures can happen to the surviving order, and the
+        `99` default is what makes them silent.
+        """
+        fitted = set(training.fitted().scores)
+        order = set(training.INTERPRETABILITY_ORDER)
+        self.assertEqual(
+            order - fitted,
+            set(),
+            "the tie-break names estimators that are not fitted",
+        )
+        self.assertEqual(
+            fitted - order,
+            set(),
+            "a fitted estimator has no interpretability rank and would sort at 99",
+        )
+        for member in training.SERVING_ENSEMBLE:
+            with self.subTest(member=member):
+                self.assertIn(member, training.INTERPRETABILITY_ORDER)
+
+    def test_the_tie_break_is_a_strict_ordering(self):
+        """Two estimators sharing a rank would make `best_score` fall through to
+        whatever `min` saw first — the dictionary-order defect invariant 46 is
+        about, one level up."""
+        ranks = list(training.INTERPRETABILITY_ORDER.values())
+        self.assertEqual(len(ranks), len(set(ranks)), "two estimators share a rank")
+
     def test_an_estimator_only_beats_another_when_the_intervals_separate(self):
         scores = list(training.fitted().scores.values())
         for score in scores:

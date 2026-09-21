@@ -84,7 +84,7 @@ class ModelExplainer:
         return ExplanationBundle(
             attributions=self._attributions(selected, stages),
             why_not=self._why_not(selected, stages, arm_contrasts),
-            counterfactuals=self._counterfactuals(selected, stages),
+            counterfactuals=self._counterfactuals(selected, stages, contrast),
             sensitivity=self._sensitivity(contrast),
         )
 
@@ -255,12 +255,42 @@ class ModelExplainer:
             reason += f", partly offset by {BLIP_TERM_LANGUAGE.get(offset, offset)} {offset_value:+.3f}"
         return reason
 
-    def _counterfactuals(self, selected: RegimeEstimate, stages: list[StageRecord]) -> list[CounterfactualProbe]:
+    def _counterfactuals(
+        self, selected: RegimeEstimate, stages: list[StageRecord], contrast=None
+    ) -> list[CounterfactualProbe]:
+        """Whether a plausible covariate change could move the recommendation.
+
+        **The gap is the decision's own contrast, and it used to be a sixth
+        re-derivation from the display quantity.** `q_values` are clamped to
+        `[Q_FLOOR, Q_CEILING]` and rounded to 3dp, and invariants 46, 53, 54 and
+        55 removed exactly this from five other places — including the two
+        siblings in this function's own signature, where `_sensitivity` takes
+        `contrast` and `_why_not` takes `arm_contrasts`. This one was left
+        sorting the dict.
+
+        It decides `recommendation_changes` on `gap < 0.05`, so the clamp
+        reaches a boolean rather than a rounding. Measured over 120 patients: 6
+        had a display gap of exactly 0.0000 while the model distinguished the
+        arms, the two gaps differ by up to **0.0648** — more than the threshold
+        itself — and **2** patients got a different verdict.
+
+        Nothing renders these today, which is why nothing caught it;
+        `ExplanationBundle.counterfactuals` is served on the `Recommendation` all
+        the same. That is invariant 45's position exactly: a quantity a consumer
+        can read, built from arithmetic that could not support it, in a place no
+        card happened to print.
+        """
         latest = stages[-1]
         crp = latest.features.get("crp")
         probes: list[CounterfactualProbe] = []
-        ordered = sorted(selected.q_values.values(), reverse=True)
-        gap = ordered[0] - ordered[1] if len(ordered) > 1 else 1.0
+        if contrast is not None:
+            gap = abs(contrast.difference)
+        else:
+            # Same fallback the care-goal bar keeps for callers that construct an
+            # estimate directly (`cli misspecification`, the subgroup sweep) and
+            # hold no contrast: the old behaviour, clamp and all.
+            ordered = sorted(selected.q_values.values(), reverse=True)
+            gap = ordered[0] - ordered[1] if len(ordered) > 1 else 1.0
         if isinstance(crp, (int, float)) and not isinstance(crp, bool):
             flips = float(crp) > 20 and gap < 0.05
             probes.append(

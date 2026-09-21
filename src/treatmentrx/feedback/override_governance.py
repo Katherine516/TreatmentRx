@@ -103,8 +103,13 @@ class OverrideRouter:
         return f"Routed to {channel.value}: informs review/usability, never the causal policy."
 
 
-class OverrideValidator:
-    """An override becomes a modeling signal only after its outcome confirms it."""
-
-    def is_modeling_signal(self, record: OverrideRecord) -> bool:
-        return record.outcome_confirmed_clinician is True
+# `OverrideValidator` is gone. Its one method, `is_modeling_signal`, returned
+# `record.outcome_confirmed_clinician is True` — which is one of the three
+# conjuncts `OverrideRouter.route` already requires for `influences_model`, and
+# so a strictly more permissive answer to the same question. It would have called
+# an outcome-confirmed override a modelling signal even when the reason routed to
+# SAFETY_REVIEW or USABILITY, which is exactly what invariant 26 exists to
+# refuse: `influences_model` requires the channel to have been *positively*
+# identified as POSSIBLE_MISSPECIFICATION. Zero constructions anywhere, so the
+# looser gate never ran — but a second, weaker copy of a safety-relevant
+# predicate is the thing to delete rather than leave for someone to find and use.

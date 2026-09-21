@@ -1418,6 +1418,91 @@ class AttributionSourceTests(unittest.TestCase):
         )
 
 
+class CounterfactualGapTests(unittest.TestCase):
+    """The sixth place a display quantity reached a served field.
+
+    `q_values` are clamped to `[Q_FLOOR, Q_CEILING]` and rounded to 3dp.
+    Invariants 46, 53, 54 and 55 removed a ranking re-derived from them in five
+    places; `_counterfactuals` was the sixth, and it sat in the same function
+    signature as two that were fixed — `_sensitivity` takes `contrast`,
+    `_why_not` takes `arm_contrasts`, and this one sorted the dict.
+
+    It decides `recommendation_changes` on `gap < 0.05`, so the clamp reached a
+    boolean rather than a rounding. Measured over 120 patients: 6 had a display
+    gap of exactly 0.0000 while the model distinguished the arms, the two gaps
+    differ by up to 0.0648 — more than the threshold — and 2 patients got a
+    different verdict.
+    """
+
+    THRESHOLD = 0.05
+
+    @classmethod
+    def setUpClass(cls):
+        from treatmentrx.orchestrator import TreatmentRxOrchestrator
+        from treatmentrx.simulation.fhir_export import trajectory_to_bundle
+        from treatmentrx.simulation.ra_cohort import generate_ra_cohort
+
+        orchestrator = TreatmentRxOrchestrator()
+        cls.scored = []
+        for trajectory in generate_ra_cohort(60, seed=4242):
+            recommendation = orchestrator.run(trajectory_to_bundle(trajectory))
+            contrast = recommendation.audit_event.get("contrast")
+            if contrast is None:
+                continue
+            probes = {
+                probe.covariate: probe
+                for probe in recommendation.explanation.counterfactuals
+            }
+            cls.scored.append((recommendation, contrast, probes))
+
+    def test_the_sweep_reaches_the_probe(self):
+        self.assertGreater(len(self.scored), 20)
+        self.assertTrue(any("crp" in probes for _, _, probes in self.scored))
+
+    def test_the_probe_reads_the_decisions_own_gap(self):
+        """Asserted against the contrast, not against the sorted dict — the two
+        disagree by up to 0.0648 and the threshold is 0.05."""
+        for recommendation, contrast, probes in self.scored:
+            probe = probes.get("crp")
+            if probe is None:
+                continue
+            crp = recommendation.audit_event.get("features", {}).get("crp")
+            if not isinstance(crp, (int, float)):
+                continue
+            expected = float(crp) > 20 and abs(contrast["difference"]) < self.THRESHOLD
+            with self.subTest(patient=recommendation.patient_hash):
+                self.assertEqual(probe.recommendation_changes, expected)
+
+    def test_the_two_gaps_genuinely_disagree_on_this_fixture(self):
+        """Otherwise the test above passes by there being nothing to get wrong.
+
+        The clamp does not only zero a gap — that is the case invariant 53
+        measured, where *both* top arms saturate. When only the leader does, the
+        display gap is **compressed** rather than zeroed, and compression alone
+        crosses a 0.05 threshold. Measured over 120 patients, the two disagreeing
+        cases both have the leader at exactly 0.99, the ceiling, with the
+        runner-up at 0.989 and 0.980 — display gaps of 0.0010 and 0.0100 against
+        contrasts of 0.0658 and 0.0715, a factor of seven on the *same* pair of
+        arms.
+        """
+        disagreements = []
+        for recommendation, contrast, _ in self.scored:
+            ranked = sorted(recommendation.q_values.values(), reverse=True)
+            display_gap = ranked[0] - ranked[1]
+            if (display_gap < self.THRESHOLD) != (
+                abs(contrast["difference"]) < self.THRESHOLD
+            ):
+                disagreements.append((display_gap, abs(contrast["difference"])))
+        self.assertTrue(
+            disagreements,
+            "no patient here distinguishes the display gap from the contrast, so "
+            "the probe would read the same either way",
+        )
+        for display_gap, real in disagreements:
+            with self.subTest(display_gap=round(display_gap, 4)):
+                self.assertLess(display_gap, real, "the clamp compresses, never widens")
+
+
 class ExplanationAuditTests(unittest.TestCase):
     """Layer 5's audit read 1.0 / 0.0 / 0 and two of those could not do otherwise."""
 

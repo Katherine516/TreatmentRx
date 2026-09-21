@@ -8,7 +8,7 @@ test fixture, not evidence.
 ## Commands
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests    # 632 tests, ~6.5 min
+PYTHONPATH=src python3 -m unittest discover -s tests    # 637 tests, ~6.5 min
 PYTHONPATH=src python3 -m treatmentrx.cli demo          # one patient end to end
 PYTHONPATH=src python3 -m treatmentrx.cli evaluate      # estimator scorecard
 PYTHONPATH=src python3 -m treatmentrx.cli stability     # k-fold + seed sweep (~10s)
@@ -96,18 +96,18 @@ produced a real clinical divergence, and the notes below are the scar tissue.
 
 The invariants below are one defect each, in the order each was found. That is
 the right order for the record and the wrong one for a reader about to change
-something — `q_values` alone has bitten **twelve** times, spread from 5 to 68.
+something — `q_values` alone has bitten **thirteen** times, spread from 5 to 68.
 So this is the other index: the thing you are touching, and every invariant that
 has already gone wrong on it. Read the row before the diff, not after.
 
 | touching | read |
 | --- | --- |
-| `q_values`, and anything that ranks from them | 5, 9, 32, 40, 45, 46, 53, 54, 55, 56, 58, 68 |
+| `q_values`, and anything that ranks from them | 5, 9, 32, 40, 45, 46, 53, 54, 55, 56, 58, 68, 71 |
 | `recommended_arm` / `top_scored_arm` | 2, 5, 36, 46, 48, 59 |
-| what the card decomposes | 32, 54, 56, 57, 58, 60 |
+| what the card decomposes | 32, 54, 56, 57, 58, 60, 71 |
 | standard errors and the covariance | 38, 58, 65, 66, 68 |
 | `linalg` | 23, 38, 66, 67, 68 |
-| the serving ensemble | 16, 18, 19, 42, 46, 53, 56 |
+| the serving ensemble | 16, 18, 19, 42, 46, 53, 56, 71 |
 | the candidate set and the abstention rate | 21, 22, 24, 32, 55 |
 | the arm and molecule vocabularies | 3, 62, 63 |
 | Layer 1 ingestion and the contract | 6, 13, 51, 64 |
@@ -117,7 +117,7 @@ has already gone wrong on it. Read the row before the diff, not after.
 | the safety layer | 1, 35, 54, 61, 70 |
 | `cli audit` and the layer sections | 2, 36, 62, 65, 66, 69 |
 
-It reaches **48 of 70**. The rest are one-offs — a single
+It reaches **49 of 71**. The rest are one-offs — a single
 component, found once, unlikely to be what you are holding — and they are not
 listed here because a row of one is not an index, it is a search result.
 `tests/test_docs.py` derives this table from the invariant bodies and fails when
@@ -2330,6 +2330,90 @@ it goes stale, which is the only thing that makes an index worth having.
 
    Nothing else moved — the two changes are a label and a sentence, and no
    number, status or arm differs.
+
+71. **Three dead classes, and the sixth place a display quantity reached a served
+   field.** Two passes: delete what nothing constructs, then go looking for the
+   *sibling* of each fix that landed on one call site. Invariants 69 and 70 were
+   both recurrences — a rule applied to one branch and not the one beside it — so
+   the second pass is the one that paid.
+
+   **Deleted, and each was worse than unused.**
+
+   `POMDPInterface` (`data/belief.py`) was "a deliberate seam ... so swapping in
+   a real POMDP solver is not a rewrite", which is the argument invariant 37
+   rejected for `GRUBaselineEncoder`, failing the same way: zero constructions
+   anywhere. A seam is a thing something passes through; this had nothing on
+   either side. Its fallback also read `float(latest.outcome)` as the belief's
+   activity, and at the open decision point `outcome` is the `UNKNOWN` sentinel.
+
+   `PolicyValueSelector` (`estimation/estimators.py`) picked "the most
+   interpretable estimator among those it cannot separate" — `best_score()`'s job
+   (invariant 30). With no callers its copy of the tie-break had drifted out of
+   sight, and the two no longer described the same preference:
+
+   | `PolicyValueSelector` | `training.INTERPRETABILITY_ORDER` |
+   | --- | --- |
+   | 0 Q-Shared + Penalized | 0 dWOLS-Shared |
+   | 1 dWOLS-Shared | 1 Q-Pooled |
+   | 2 Bayesian Hierarchical Q | 2 Stage-Specific Q-learning |
+   | 3 Stage-Specific Q-learning | 3 Q-Shared + Penalized |
+   | 4 Survival Forest DTR | |
+
+   Every shared name disagrees on position, and the reversal is the one that
+   matters: it ranked `Q-Shared + Penalized` **first** where the live order ranks
+   it last. That is the shared-blip fit invariant 18 keeps out of the ensemble
+   and `cli coverage` measures at **28% pooled, 0% at the worst patient**. It
+   also named two estimators this package has never contained and omitted
+   `Q-Pooled`, a `SERVING_ENSEMBLE` member, which `.get(name, 99)` would have
+   ranked behind every phantom. Had anything called it, it would have selected
+   the estimator with the worst measured coverage in the repo.
+   `tests/test_estimators.py` now pins the surviving order against the fitted set
+   in both directions, because the `99` default is what makes that drift silent.
+
+   `OverrideValidator` (`feedback/override_governance.py`) returned
+   `record.outcome_confirmed_clinician is True` — one of the three conjuncts
+   `OverrideRouter.route` already requires for `influences_model`, and so a
+   strictly more permissive answer to the same question. It would have called an
+   outcome-confirmed override a modelling signal even when the reason routed to
+   SAFETY_REVIEW, which is what invariant 26 exists to refuse. A second, weaker
+   copy of a safety-relevant predicate is the thing to delete rather than leave
+   for someone to find and use.
+
+   **The sibling: `_counterfactuals`.** `q_values` are clamped and rounded, and
+   invariants 46, 53, 54 and 55 removed a ranking re-derived from them in five
+   places. The sixth sat in the same function signature as two that were fixed —
+   `explain()` hands `contrast` to `_sensitivity` and `arm_contrasts` to
+   `_why_not`, and `_counterfactuals(selected, stages)` got neither and sorted
+   the dict. It decides `recommendation_changes` on `gap < 0.05`, so the clamp
+   reached a **boolean** rather than a rounding.
+
+   Measured over 120 patients: the two gaps differ by up to **0.0648**, more than
+   the threshold itself, and **2** patients got a different verdict.
+   `ExplanationBundle.counterfactuals` is served on the `Recommendation` and
+   nothing renders it — invariant 45's position exactly, a quantity a consumer
+   can read built from arithmetic that could not support it, in a place no card
+   happened to print.
+
+   **It sharpens invariant 53 rather than repeating it.** That one measured nine
+   patients whose top-two gap was *exactly* 0.0000, which is what happens when
+   **both** leading arms saturate. Here only the leader does: both disagreeing
+   patients have `rituximab` at exactly 0.99 with the runner-up at 0.989 and
+   0.980, so the display gap is **compressed** to 0.0010 and 0.0100 rather than
+   zeroed — against contrasts of 0.0658 and 0.0715, a factor of seven on the
+   *same* pair of arms. Compression alone crosses a threshold; the gap never has
+   to reach zero. The first version of the guarding test asserted the exact-zero
+   case and found none, which is how the distinction got measured.
+
+   **Checked and deliberately left.** `power.py` passes the literal `"Q-Pooled"`
+   to `evaluate_policy`, but `model = fit.pooled` on the line above, so the
+   string labels the model actually handed over rather than filtering a
+   membership — not invariant 19's collapse. And
+   `visit_intensity.expected_interval` ends `return self.mean_interval or 90.0`,
+   invariant 28's forbidden shape: `mean_interval` is 0.0 until `_fit` sets it,
+   so the truthiness is standing in for "not computed". On the deployed cohort it
+   reads 125.34 with `fitted` True, so the branch is unreachable, on a feature
+   `USE_VISIT_INTENSITY` turns off by default — doubly out of reach, and a real
+   0 would be a division by zero rather than a clinical value.
 
 ## What is real vs. still a placeholder
 
