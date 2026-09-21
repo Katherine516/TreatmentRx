@@ -8,7 +8,7 @@ test fixture, not evidence.
 ## Commands
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests    # 642 tests, ~6.5 min
+PYTHONPATH=src python3 -m unittest discover -s tests    # 645 tests, ~6.5 min
 PYTHONPATH=src python3 -m treatmentrx.cli demo          # one patient end to end
 PYTHONPATH=src python3 -m treatmentrx.cli evaluate      # estimator scorecard
 PYTHONPATH=src python3 -m treatmentrx.cli stability     # k-fold + seed sweep (~10s)
@@ -481,6 +481,32 @@ it goes stale, which is the only thing that makes an index worth having.
 34. **No cross-disease fallback.** `DiseaseRegistry` must resolve exactly one
     registered definition before Layer 1 runs. A missing disease workflow is a
     typed error; it must never reuse RA arms, models, safety rules or evidence.
+
+    **That guarantee rested on two upstream guards and nothing at the point of
+    use, which was measured by trying it.** Registering a second disease and
+    walking the pipeline: the registry routes correctly and the contract fails
+    closed on the diagnosis, then `data/dag.py` fails closed on the graph — both
+    right. But patch only those two and a record reading **Breast Cancer** is
+    served a **rituximab** recommendation, scored over the **RA arm vocabulary**,
+    while the definition declared an entirely different menu.
+
+    The mechanism is that `DiseaseDefinition.treatment_arms` is decorative on
+    the serving path. `state.feasible_arms` comes from
+    `RADataContract.treatment_arms`, a class attribute hardcoded to
+    `arms.TREATMENT_ARMS`; the definition's own tuple is carried, reported in
+    `capability()`, and reaches neither Layer 1 nor the estimators. The
+    `EstimandContract` does carry the declared menu and is stamped on every
+    estimate, and nothing compared it to what was being scored — invariant 3's
+    rule left to curation, and invariant 42's shape on a field that *is*
+    constructed. Today all three agree only because all three read
+    `arms.TREATMENT_ARMS`.
+
+    `EstimationLayer.estimate` now refuses a menu the contract does not declare,
+    which is one comparison at the place the models are used.
+    `tests/test_scientific_contracts.py` asserts the three declarations agree,
+    that a mismatched contract raises, and that the breast-cancer case is
+    refused **with both upstream guards deliberately disabled** — because the
+    point is that this invariant must not rest on them alone.
 
 35. **A card block may not contradict the status at the top of it, and BLOCKED
    is not an excuse to say nothing.** Two defects, both found by rendering all

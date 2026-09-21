@@ -224,5 +224,128 @@ class ModeBoundaryTests(unittest.TestCase):
             )
 
 
+class DeclaredMenuTests(unittest.TestCase):
+    """The menu the estimators score must be the one the contract declares.
+
+    `state.feasible_arms` comes from `RADataContract.treatment_arms`, a class
+    attribute hardcoded to `arms.TREATMENT_ARMS`. `DiseaseDefinition.treatment_arms`
+    is carried, reported in `capability()`, and reaches neither Layer 1 nor the
+    estimators. So a second disease could declare its own menu while these models
+    scored the RA one — measured, patching only the contract's diagnosis check and
+    the DAG registry served a **Breast Cancer** record a **rituximab**
+    recommendation over the RA arm vocabulary.
+
+    Invariant 34 says an unregistered disease must never reuse RA arms or models.
+    That held on two fail-closed guards upstream rather than on anything asserting
+    it where the models are used.
+    """
+
+    def test_the_three_declarations_agree_for_the_registered_disease(self):
+        """Invariant 3 at this level. They agree today because all three read
+        `arms.TREATMENT_ARMS`; nothing had checked that they must."""
+        from treatmentrx.data.contract import RADataContract
+        from treatmentrx.diseases import rheumatoid_arthritis_definition
+
+        definition = rheumatoid_arthritis_definition()
+        declared = set(definition.treatment_arms)
+        estimand = set(definition.estimand_contracts[0].treatment_strategies)
+        scored = set(RADataContract.treatment_arms)
+        self.assertEqual(declared, estimand)
+        self.assertEqual(declared, scored)
+        self.assertEqual(declared, set(TREATMENT_ARMS))
+
+    def test_a_contract_declaring_another_menu_is_refused(self):
+        """The check, exercised directly: the estimators are fit on one arm
+        vocabulary and must not be asked about another."""
+        from dataclasses import replace
+
+        state = DataLayer().build_patient_state(sample_ra_bundle())
+        other = ra_dtr_estimand(
+            ("continue-current", "endocrine-therapy", "CDK4/6-inhibitor")
+        )
+        mismatched = replace(state, estimand_contract=other)
+        with self.assertRaises(ValueError) as raised:
+            EstimationLayer().estimate(mismatched)
+        message = str(raised.exception)
+        self.assertIn("declares a different menu", message)
+        self.assertIn("CDK4/6-inhibitor", message)
+
+    def test_a_second_disease_cannot_reach_the_ra_models(self):
+        """End to end, with the two upstream guards removed.
+
+        This is the scenario that served `rituximab` to a breast-cancer record.
+        Both guards are disabled deliberately, because the point is that
+        invariant 34 must not rest on them alone.
+        """
+        import copy
+
+        from treatmentrx.data import contract as contract_module
+        from treatmentrx.data import dag as dag_module
+        from treatmentrx.diseases import (
+            DiseaseDefinition, DiseaseRegistry, DiseaseWorkflow,
+            rheumatoid_arthritis_definition,
+        )
+        from treatmentrx.orchestrator import TreatmentRxOrchestrator
+
+        arms = ("continue-current", "endocrine-therapy", "CDK4/6-inhibitor")
+
+        def workflow():
+            from treatmentrx.agent import AgentLayer
+            from treatmentrx.decision import DecisionLayer
+            from treatmentrx.estimation import training
+            from treatmentrx.feedback import FeedbackLayer
+            from treatmentrx.safety import SafetyLayer
+
+            return DiseaseWorkflow(
+                DataLayer(), EstimationLayer(), DecisionLayer(),
+                SafetyLayer(), AgentLayer(), FeedbackLayer(), training,
+            )
+
+        registry = DiseaseRegistry((
+            rheumatoid_arthritis_definition(),
+            DiseaseDefinition(
+                disease_id="other_disease", display_name="Other Disease",
+                diagnosis_terms=("othercondition",), treatment_arms=arms,
+                endpoint="n/a", dag="n/a", model_family="n/a",
+                safety_policy="n/a", knowledge_base="n/a",
+                workflow_factory=workflow,
+                operating_modes=(ScientificMode.DTR_RESEARCH,),
+                estimand_contracts=(ra_dtr_estimand(arms),),
+            ),
+        ))
+
+        bundle = copy.deepcopy(sample_ra_bundle())
+        for entry in bundle["entry"]:
+            if entry["resource"].get("resourceType") == "Condition":
+                entry["resource"]["code"] = {"text": "othercondition"}
+
+        original_validate = contract_module.RADataContract.validate
+        original_match = dag_module.CausalDAGRegistry.match
+
+        def permissive(self, patient):
+            report = original_validate(self, patient)
+            kept = [
+                issue for issue in report.issues
+                if "rheumatoid arthritis diagnosis" not in issue.message
+            ]
+            return type(report)(
+                report.disease, report.primary_endpoint, report.treatment_arms,
+                kept, report.missing_variable_families,
+            )
+
+        try:
+            contract_module.RADataContract.validate = permissive
+            dag_module.CausalDAGRegistry.match = (
+                lambda self, patient: self._dags["rheumatoid arthritis"]
+            )
+            with self.assertRaises(ValueError) as raised:
+                TreatmentRxOrchestrator(registry).run(bundle)
+        finally:
+            contract_module.RADataContract.validate = original_validate
+            dag_module.CausalDAGRegistry.match = original_match
+
+        self.assertIn("declares a different menu", str(raised.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -53,6 +53,32 @@ class EstimationLayer:
         if state.estimand_contract is None:
             raise ValueError("PatientState is missing its estimand contract")
         menu = tuple(state.feasible_arms)
+        # The menu about to be scored must be the one the contract declares.
+        #
+        # It was not checked, and that is how a second disease reaches these
+        # estimators. `state.feasible_arms` comes from
+        # `RADataContract.treatment_arms`, a class attribute hardcoded to
+        # `arms.TREATMENT_ARMS`; `DiseaseDefinition.treatment_arms` is carried,
+        # reported in `capability()`, and reaches neither Layer 1 nor here. So a
+        # definition could declare an oncology menu while these models scored the
+        # RA one — measured, patching only the contract's diagnosis check and the
+        # DAG registry served a **Breast Cancer** record a **rituximab**
+        # recommendation over the RA arm vocabulary.
+        #
+        # Invariant 34 says a missing disease workflow must never reuse RA arms
+        # or models. That held on two fail-closed guards upstream rather than on
+        # anything asserting it here, which is invariant 3's rule — one arm
+        # vocabulary — left to curation. Today all three declarations agree
+        # because all three read `arms.TREATMENT_ARMS`; this is what makes them
+        # agree by construction.
+        declared = tuple(state.estimand_contract.treatment_strategies)
+        if set(menu) != set(declared):
+            raise ValueError(
+                "estimand contract declares a different menu than the one being "
+                f"scored: contract={sorted(declared)} scored={sorted(menu)}. The "
+                "estimators are fit on one arm vocabulary and must not be asked "
+                "about another."
+            )
         return [
             self._with_diagnostic(
                 replace(
