@@ -1,6 +1,7 @@
 """Layer 1 — ingestion, stage construction, and the guards that must raise."""
 
 import copy
+import dataclasses
 import unittest
 
 from treatmentrx.contracts import PatientState
@@ -125,6 +126,28 @@ class ClinicalRealismTests(unittest.TestCase):
         self.assertEqual(DataLayer().infer_care_goal(stages), CareGoal.TOXICITY_CONTROL)
 
 
+def _future_observation_bundle():
+    """The demo record plus an observation dated long after the decision.
+
+    Ingests cleanly as it stands — `_features_until` never admits it — and is
+    the record that exposes the firewall once that filter is broken.
+    """
+    import copy
+
+    bundle = copy.deepcopy(sample_ra_bundle())
+    bundle["entry"].append(
+        {
+            "resource": {
+                "resourceType": "Observation",
+                "code": {"text": "future marker"},
+                "valueQuantity": {"value": 1.0},
+                "effectiveDay": 10_000,
+            }
+        }
+    )
+    return bundle
+
+
 class LeakageTests(unittest.TestCase):
     def test_firewall_catches_a_future_feature(self):
         patient, stages = _stages()
@@ -151,8 +174,141 @@ class LeakageTests(unittest.TestCase):
         patient, stages = _stages()
         self.assertTrue(LeakageTestSuite().run(patient, stages).passed)
 
+    def test_every_assertion_fires_on_its_own(self):
+        """Invariant 25's rule, on the module whose whole claim is that it stops
+        things. Each check guards a different upstream guarantee, so each is
+        broken separately — and breaking one must not be reported as another.
+        """
+        from dataclasses import replace
+
+        patient, stages = _stages()
+        suite = LeakageTestSuite()
+        self.assertTrue(suite.run(patient, stages).passed)
+
+        # Firewall: a stage whose decision day precedes every observation.
+        early = [replace(stages[0], start_day=-1)] + list(stages[1:])
+        report = suite.run(patient, early)
+        self.assertFalse(report.temporal_firewall_passed)
+        self.assertTrue(report.immortal_time_passed)
+        self.assertTrue(report.timestamp_monotonic_passed)
+
+        # Immortal time: medication starts out of order.
+        unsorted_meds = replace(patient, medications=list(reversed(patient.medications)))
+        report = suite.run(unsorted_meds, stages)
+        self.assertFalse(report.immortal_time_passed)
+        self.assertTrue(report.temporal_firewall_passed)
+
+        # Monotonic: stages out of order.
+        report = suite.run(patient, list(reversed(stages)))
+        self.assertFalse(report.timestamp_monotonic_passed)
+        self.assertTrue(report.temporal_firewall_passed)
+
+    def test_any_violation_raises_out_of_the_pipeline(self):
+        """It used to be only the firewall's.
+
+        `build_patient_state` read `temporal_firewall_passed` while the suite ran
+        four checks, so the rest were computed, appended to `violations`, and
+        reduced to a warning-severity diagnostic nothing reads — three of the
+        four booleans were written and never read anywhere in the package.
+
+        Broken at the guarantee rather than at the check, because these are
+        assertions on properties enforced upstream: unfilter `_features_until`
+        and the firewall is what catches it.
+        """
+        from treatmentrx.data.stages import StageHistoryBuilder
+
+        layer = DataLayer()
+        original = StageHistoryBuilder._features_until
+
+        def unfiltered(self, observations, day):
+            return {
+                self._feature_name(observation.code): observation.value
+                for observation in observations
+            }
+
+        try:
+            StageHistoryBuilder._features_until = unfiltered
+            with self.assertRaises(LeakageError) as raised:
+                layer.build_patient_state(_future_observation_bundle())
+        finally:
+            StageHistoryBuilder._features_until = original
+
+        self.assertIn("only available after decision day", str(raised.exception))
+        # And the guarantee restored, the same record is served.
+        self.assertTrue(layer.build_patient_state(_future_observation_bundle()).stages)
+
+    def test_a_non_firewall_violation_also_raises(self):
+        """The discriminating case, and the one the old code let through.
+
+        `build_patient_state` read `temporal_firewall_passed`, so a record that
+        tripped only `_timestamp_monotonic` was served with the violation filed
+        in a diagnostic. Stage order is guarded by the adapter's medication sort,
+        so the guarantee is broken there — the contract checks *medications* for
+        chronology and would not see this.
+        """
+        from treatmentrx.data.stages import StageHistoryBuilder
+
+        layer = DataLayer()
+        original = StageHistoryBuilder.build
+
+        def reversed_stages(self, patient):
+            return list(reversed(original(self, patient)))
+
+        try:
+            StageHistoryBuilder.build = reversed_stages
+            with self.assertRaises(LeakageError) as raised:
+                layer.build_patient_state(sample_ra_bundle())
+        finally:
+            StageHistoryBuilder.build = original
+
+        message = str(raised.exception)
+        self.assertIn("precedes prior", message)
+        self.assertNotIn("only available after decision day", message)
+
+    def test_a_feature_named_outcome_is_history_not_leakage(self):
+        """The check that was removed rather than repaired.
+
+        `_outcome_in_features` flagged any feature whose *name* contained
+        "outcome". `_features_until` has already excluded everything after the
+        decision, so the only thing it could catch is a legitimately recorded
+        past outcome. It was also the one check in the module that could fire,
+        and firing it changed nothing — the record was served anyway.
+        """
+        import copy
+
+        bundle = copy.deepcopy(sample_ra_bundle())
+        bundle["entry"].append(
+            {
+                "resource": {
+                    "resourceType": "Observation",
+                    "code": {"text": "outcome"},
+                    "valueQuantity": {"value": 0.9},
+                    "effectiveDay": 0,
+                }
+            }
+        )
+        state = DataLayer().build_patient_state(bundle)
+        self.assertIn("outcome", state.stages[-1].features)
+        self.assertTrue(state.diagnostics)
+
+    def test_the_report_names_which_guarantee_broke(self):
+        """Three booleans, because the repairs are different. A single `passed`
+        would say a record leaked without saying how."""
+        patient, stages = _stages()
+        report = LeakageTestSuite().run(patient, stages)
+        self.assertEqual(
+            sorted(f.name for f in dataclasses.fields(report)),
+            [
+                "immortal_time_passed",
+                "temporal_firewall_passed",
+                "timestamp_monotonic_passed",
+                "violations",
+            ],
+        )
+
     def test_a_leaking_record_cannot_produce_a_patient_state(self):
-        """The guard raises out of the pipeline; it is never a soft diagnostic."""
+        """The firewall raises when asserted directly, which is the seam a
+        cohort builder would use outside the pipeline."""
         bundle = sample_ra_bundle()
         bundle["entry"].append(
             {

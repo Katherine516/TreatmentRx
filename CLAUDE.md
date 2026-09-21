@@ -8,7 +8,7 @@ test fixture, not evidence.
 ## Commands
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests    # 620 tests, ~6.5 min
+PYTHONPATH=src python3 -m unittest discover -s tests    # 625 tests, ~6.5 min
 PYTHONPATH=src python3 -m treatmentrx.cli demo          # one patient end to end
 PYTHONPATH=src python3 -m treatmentrx.cli evaluate      # estimator scorecard
 PYTHONPATH=src python3 -m treatmentrx.cli stability     # k-fold + seed sweep (~10s)
@@ -115,9 +115,9 @@ has already gone wrong on it. Read the row before the diff, not after.
 | the validation gate | 14, 25, 41 |
 | the blip basis | 57, 68 |
 | the safety layer | 1, 54, 61 |
-| `cli audit` and the layer sections | 2, 36, 62, 65, 66 |
+| `cli audit` and the layer sections | 2, 36, 62, 65, 66, 69 |
 
-It reaches **45 of 68**. The rest are one-offs — a single
+It reaches **46 of 69**. The rest are one-offs — a single
 component, found once, unlikely to be what you are holding — and they are not
 listed here because a row of one is not an index, it is a search result.
 `tests/test_docs.py` derives this table from the invariant bodies and fails when
@@ -175,8 +175,11 @@ it goes stale, which is the only thing that makes an index worth having.
    guard only held because `apply_memory` happens to replace containers rather
    than edit them, and that stops being true the moment a real memory component
    gets a handle on the bundle. Memory shapes narrative and retrieval only.
-6. **Leakage guards raise.** A temporal-firewall violation raises `LeakageError`
-   out of `DataLayer.build_patient_state`. Never downgrade it to a diagnostic.
+6. **Leakage guards raise — all of them, which was not true until invariant 69.**
+   Any violation from `LeakageTestSuite` raises `LeakageError` out of
+   `DataLayer.build_patient_state`. Never downgrade one to a diagnostic. It used
+   to read `temporal_firewall_passed` alone while the suite ran four checks, so
+   the other three annotated the record and it was served.
 7. **Estimators see only the training split, and `training.py` is the only
    thing that fits one.** Never fit on `fitted().holdout`, and never fit an
    estimator ad hoc in a layer that consumes one — but also never cache a model
@@ -2190,6 +2193,79 @@ it goes stale, which is the only thing that makes an index worth having.
    served output `b94e28ce8b93`. **A failing test on a numerical change is
    evidence to read, not a threshold to adjust**, and here it was pointing at a
    defect older than the change that surfaced it.
+
+69. **"Assertions, not warnings" — one of four raised, and the only one that
+   could fire was measuring the wrong thing.** `data/leakage.py` opens with the
+   strongest claim in the package: *"These are assertions, not warnings: a
+   cohort build that puts any post-decision information into H_j fails."*
+   Measured over 60 cohort patients, **none of its four checks has ever fired**,
+   and three of them cannot:
+
+   | check | can it fire from the pipeline? | what happened if it did |
+   | --- | --- | --- |
+   | `temporal_firewall` | **no — structurally** | raised |
+   | `immortal_time` | **no** | nothing |
+   | `outcome_not_in_features` | yes | **nothing** |
+   | `timestamp_monotonic` | **no** | nothing |
+
+   `build_patient_state` read `temporal_firewall_passed` and nothing else, so the
+   rest were computed, appended to `violations`, and reduced to a
+   warning-severity diagnostic — and **three of the four booleans were written
+   and never read anywhere in the package.**
+
+   **The firewall cannot fire**, and the demonstration is the useful part.
+   `StageHistoryBuilder._features_until` admits only observations at
+   `days_from_baseline <= start_day`; the firewall then asks whether any
+   observation for a present feature exists at or before that day, which is true
+   by construction. Measured, every feature's earliest source is at most 0 days
+   relative to its own decision day. Moving the demo patient's CRP to day 9999
+   does **not** trip it — the value drops out of the feature map and the patient
+   is blocked by invariant 64's adjuster check instead, a different mechanism
+   reporting a different reason. `immortal_time` and `timestamp_monotonic` are
+   guarded by `FHIRAdapter.parse_bundle` sorting medications and by the contract
+   raising on unsorted starts before either runs.
+
+   **That is not a reason to delete them.** Each re-verifies a property
+   something upstream enforces, and the firewall reads `stage.features` and
+   `patient.observations` as two independently produced objects — change
+   `_features_until` to a window, or to last-value-wins regardless of date, and
+   it fires. They are invariant 59's structural tripwires, and the defect was
+   that nothing said so and two thirds of them could not stop anything. All
+   three raise now, `cli audit` reports them under `leakage_assertions` with the
+   count that is expected to be zero and the reason it is, and the module
+   docstring names the upstream guarantee each one guards.
+
+   **The fourth is deleted rather than repaired.** `_outcome_in_features`
+   flagged any feature whose *name* contained `outcome`. It could not do the job
+   its name claims: `_features_until` has already excluded everything after the
+   decision, so anything it saw was pre-decision by construction, and the one
+   thing it could catch is a legitimately recorded *past* outcome — history, not
+   leakage. Measured, it was also the only check here that could fire, and
+   firing it changed nothing: a record carrying an observation coded `outcome`
+   was served a **recommendation** with the violation filed in a diagnostic
+   nobody reads. A name match was never a leakage statistic, which is why this
+   is deleted the way invariant 37 deleted the out-of-distribution vector term
+   rather than recalibrating it.
+
+   The property it gestured at is real and is held elsewhere: a stage's outcome
+   must not be computable from its own covariates, and `data/endpoints.py` keeps
+   the windows strictly disjoint — baseline at `days <= start_day`, attained at
+   `start_day < days <= end_day`, and `None` for an open stage, because *"the
+   patient is standing at the decision and the outcome has not happened"*.
+   Measured over 153 stages, no observation feeds both. Re-checking that in
+   `leakage.py` would have been vacuous — restating the two window conditions
+   and intersecting them is `set() & set()` — which is the trap that made
+   deleting the check the honest answer rather than replacing it.
+
+   `tests/test_data_layer.py` fires each of the three on its own and asserts the
+   others stay clean, because a report that says a record leaked without saying
+   *which* guarantee broke names three different repairs. The pipeline test
+   breaks the **guarantee** rather than the check — reversing stage order trips
+   only `_timestamp_monotonic`, which the contract cannot see because it checks
+   medications — and reverting the one-line `passed` change makes it fail, which
+   is the only thing that shows the change was the one that mattered. A test
+   named `test_a_leaking_record_cannot_produce_a_patient_state` never called
+   `build_patient_state`; it does now, under a name that says what it does.
 
 ## What is real vs. still a placeholder
 

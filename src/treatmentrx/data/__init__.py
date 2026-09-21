@@ -88,10 +88,19 @@ class DataLayer:
         stages = self.belief.apply(stages)
         stages = self.competing_risk.apply(stages)
 
-        # Non-negotiable: a temporal-firewall violation raises out of the whole
-        # pipeline. It is never downgraded to a diagnostic the caller can ignore.
+        # Non-negotiable: a leakage violation raises out of the whole pipeline.
+        # It is never downgraded to a diagnostic the caller can ignore.
+        #
+        # **Any** violation, not only the firewall's. This read
+        # `temporal_firewall_passed` while the suite ran four checks, so the
+        # other three were computed, appended to `violations`, and reduced to a
+        # warning-severity diagnostic that nothing in the package reads — three
+        # of the four booleans were written and never read anywhere. They are
+        # structural assertions on properties enforced upstream (see
+        # `leakage.py`), so one firing means an upstream guarantee has broken,
+        # and that is exactly the case that must stop rather than annotate.
         leakage_report = self.leakage.run(patient, stages)
-        if not leakage_report.temporal_firewall_passed:
+        if not leakage_report.passed:
             raise LeakageError("; ".join(leakage_report.violations))
 
         care_goal = self.infer_care_goal(stages)
@@ -183,12 +192,15 @@ class DataLayer:
                     ),
                 )
             )
+        # Always `info` and always passing: a failing report raised above and
+        # never reached here. Kept so the record says the suite ran, which is
+        # the difference between "checked and clean" and "not checked".
         diagnostics.append(
             LayerDiagnostic(
                 name="leakage_suite",
-                passed=leakage_report.passed,
-                severity="warning" if not leakage_report.passed else "info",
-                message="; ".join(leakage_report.violations) or "No leakage detected.",
+                passed=True,
+                severity="info",
+                message="No leakage detected.",
             )
         )
         return diagnostics

@@ -1,8 +1,38 @@
-"""v5.1 #10 — Leakage & immortal-time guards.
+"""Leakage and immortal-time guards — structural assertions, not detectors.
 
-The most common way longitudinal EHR models silently fail. These are
-*assertions*, not warnings: a cohort build that puts any post-decision
-information into H_j fails. Wired into the CI gate.
+The most common way longitudinal EHR models silently fail, and these are
+*assertions*: a violation raises out of `DataLayer.build_patient_state` and the
+record is refused. What they are not is live detectors. Every one of them
+re-verifies a property that something upstream already enforces, so **none can
+fire from the current pipeline** — measured, zero across 60 cohort patients —
+and each names the upstream guarantee it exists to catch failing:
+
+* `TemporalFirewall` guards `StageHistoryBuilder._features_until`, which admits
+  only observations at or before the decision day. Every feature present
+  therefore has a source at or before it, by construction. The firewall reads
+  `stage.features` and `patient.observations` as two independently produced
+  objects, so it is not vacuous: change that filter to a window, or to
+  last-value-wins regardless of date, and this is what fires.
+* `ImmortalTimeDetector` guards `FHIRAdapter.parse_bundle`, which sorts
+  medications by start day, and the data contract, which raises on unsorted
+  starts before this runs.
+* `_timestamp_monotonic` guards the same sorting, one object further on: stages
+  are built in order from those medications.
+
+**A fourth check was removed rather than repaired.** `_outcome_in_features`
+flagged any feature whose name contained "outcome", and it could not do the job
+its name claims. `_features_until` has already excluded everything after the
+decision, so anything this saw was pre-decision by construction — the one thing
+it could flag is a legitimately recorded *past* outcome, which is history rather
+than leakage. Measured, it was also the only check in this module that could
+fire at all, and firing it changed nothing: a record carrying an observation
+coded `outcome` was served a recommendation with the violation noted in a
+diagnostic nobody reads. A name match was never a leakage statistic, which is
+the same reason invariant 37 deleted the out-of-distribution vector term instead
+of recalibrating it. The property it gestured at — that a stage's outcome must
+not be computable from its own covariates — is held by `data/endpoints.py`,
+whose windows are strictly disjoint: baseline at `days <= start_day`, attained at
+`start_day < days <= end_day`, and `None` for an open stage.
 """
 
 from __future__ import annotations
@@ -18,9 +48,15 @@ class LeakageError(AssertionError):
 
 @dataclass(frozen=True)
 class LeakageReport:
+    """Which assertions held, and every violation across all of them.
+
+    The three booleans say *which* guarantee broke, which is what a reader needs
+    when one does: they name different upstream properties and the repairs are
+    different. `violations` carries the messages and is what the raise quotes.
+    """
+
     temporal_firewall_passed: bool
     immortal_time_passed: bool
-    outcome_not_in_features_passed: bool
     timestamp_monotonic_passed: bool
     violations: list[str]
 
@@ -79,7 +115,7 @@ class ImmortalTimeDetector:
 
 
 class LeakageTestSuite:
-    """CI suite run on every cohort build."""
+    """Every assertion, run on every record `DataLayer` builds."""
 
     def __init__(self) -> None:
         self.firewall = TemporalFirewall()
@@ -88,28 +124,14 @@ class LeakageTestSuite:
     def run(self, patient: PatientRecord, stages: list[StageRecord]) -> LeakageReport:
         firewall = self.firewall.check(patient, stages)
         immortal = self.immortal.check(patient, stages)
-        outcome_in_features = self._outcome_in_features(stages)
         monotonic = self._timestamp_monotonic(stages)
 
-        violations = list(firewall)
-        violations += immortal
-        violations += outcome_in_features
-        violations += monotonic
         return LeakageReport(
             temporal_firewall_passed=not firewall,
             immortal_time_passed=not immortal,
-            outcome_not_in_features_passed=not outcome_in_features,
             timestamp_monotonic_passed=not monotonic,
-            violations=violations,
+            violations=list(firewall) + immortal + monotonic,
         )
-
-    def _outcome_in_features(self, stages: list[StageRecord]) -> list[str]:
-        violations: list[str] = []
-        for stage in stages:
-            for key in stage.features:
-                if "outcome" in key or key in {"response_label", "endpoint"}:
-                    violations.append(f"stage {stage.stage}: outcome-like feature '{key}' present in H_j")
-        return violations
 
     def _timestamp_monotonic(self, stages: list[StageRecord]) -> list[str]:
         violations: list[str] = []

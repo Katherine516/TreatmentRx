@@ -93,17 +93,30 @@ def audit_ingestion(n: int = 40, seed: int = AUDIT_SEED) -> Section:
     layer = DataLayer()
     stage_matches = interval_matches = interval_total = 0
     ingested = 0
+    leakage_fired = {
+        "temporal_firewall": 0,
+        "immortal_time": 0,
+        "timestamp_monotonic": 0,
+    }
     flagged = definitional = stages_seen = 0
     realized_differs = 0
     adherence_values: set[float] = set()
     arm_change_stages = arm_change_flagged = 0
 
     for trajectory in trajectories:
+        bundle = trajectory_to_bundle(trajectory)
         try:
-            state = layer.build_patient_state(trajectory_to_bundle(trajectory))
+            state = layer.build_patient_state(bundle)
         except DataContractError:
             continue
         ingested += 1
+        # Re-run the assertions explicitly. A violation raises above, so this
+        # can only ever count zeros on a record that got here — the point is to
+        # say which guarantee was checked, not to discover a failure.
+        report = layer.leakage.run(layer.fhir.parse_bundle(bundle), state.stages)
+        leakage_fired["temporal_firewall"] += not report.temporal_firewall_passed
+        leakage_fired["immortal_time"] += not report.immortal_time_passed
+        leakage_fired["timestamp_monotonic"] += not report.timestamp_monotonic_passed
         # +1 for the open decision point the exporter appends.
         if len(state.stages) == trajectory.n_observed + 1:
             stage_matches += 1
@@ -153,6 +166,17 @@ def audit_ingestion(n: int = 40, seed: int = AUDIT_SEED) -> Section:
         # only thing they can report is that the fixture is well formed. This is
         # the one Layer 1 number scored on records built to fail.
         "identification_matches_the_features": _identification_against_the_features(),
+        "leakage_assertions": {
+            "patients": ingested,
+            **leakage_fired,
+            "note": (
+                "structural assertions, not detectors: each re-verifies a "
+                "property something upstream already enforces, so zero is the "
+                "expected reading and the number that matters is that they are "
+                "run at all. A violation raises out of `build_patient_state` — "
+                "all three of them now, where only the firewall used to."
+            ),
+        },
     }
     section.notes.append(
         "Timing and stage structure are reconstructed from dates and drug names, "
@@ -166,6 +190,15 @@ def audit_ingestion(n: int = 40, seed: int = AUDIT_SEED) -> Section:
         f"saying so. Of {flagged} flagged stages, "
         f"{flagged - definitional} rest on conditions the simulator carries no "
         f"ground truth for."
+    )
+    section.notes.append(
+        "The leakage suite is three assertions on guarantees held elsewhere — "
+        "`_features_until` for the firewall, the adapter's medication sort for "
+        "the other two — so they cannot fire from this pipeline and their zeros "
+        "say the guarantees held, not that a detector looked. A fourth check was "
+        "removed rather than repaired: it flagged features whose *name* contained "
+        "`outcome`, which `_features_until` has already filtered to pre-decision "
+        "values, so the only thing it could catch was legitimate history."
     )
     identification = section.metrics["identification_matches_the_features"]
     section.notes.append(
