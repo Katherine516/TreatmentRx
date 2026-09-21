@@ -135,6 +135,69 @@ class WeightedLeastSquaresTests(unittest.TestCase):
             )
 
 
+class CholeskyInverseTests(unittest.TestCase):
+    """The fast path for symmetric positive-definite matrices.
+
+    Every matrix this package inverts is X'WX plus a positive ridge, so it is
+    SPD by construction. Cholesky does not pivot and does not need to for such a
+    matrix, and it is 1.5x to 2.4x faster than the Gauss-Jordan on the real ones.
+
+    It is **not** more accurate — residuals of `max |A A^-1 - I|` are a wash —
+    so what these assert is agreement, the refusal on a matrix it may not
+    factor, and that the fallback still answers correctly.
+    """
+
+    def test_it_agrees_with_the_elimination_it_replaced(self):
+        for n in (2, 5, 12, 30):
+            matrix = _symmetric(n, seed=n + 3)
+            with self.subTest(n=n):
+                fast = linalg.cholesky_inverse(matrix)
+                self.assertIsNotNone(fast, "a symmetric positive-definite matrix was refused")
+                slow = linalg.gauss_jordan_inverse(matrix)
+                for i in range(n):
+                    for j in range(n):
+                        self.assertAlmostEqual(fast[i][j], slow[i][j], places=9)
+
+    def test_it_reproduces_the_identity(self):
+        n = 30
+        matrix = _symmetric(n, seed=33)
+        product = linalg.matmul(matrix, linalg.cholesky_inverse(matrix))
+        for i in range(n):
+            for j in range(n):
+                self.assertAlmostEqual(product[i][j], 1.0 if i == j else 0.0, places=9)
+
+    def test_it_refuses_a_matrix_it_may_not_factor(self):
+        """Returning `None` rather than a plausible wrong answer is what lets
+        `inverse` keep a general contract."""
+        indefinite = [[0.0, 1.0], [1.0, 0.0]]
+        self.assertIsNone(linalg.cholesky_inverse(indefinite))
+        negative = [[-2.0, 0.0], [0.0, -3.0]]
+        self.assertIsNone(linalg.cholesky_inverse(negative))
+
+    def test_the_fallback_still_answers(self):
+        """`inverse` must be right for anything, not only for what it prefers."""
+        indefinite = [[0.0, 1.0], [1.0, 0.0]]
+        product = linalg.matmul(indefinite, linalg.inverse(indefinite))
+        for i in range(2):
+            for j in range(2):
+                self.assertAlmostEqual(product[i][j], 1.0 if i == j else 0.0, places=9)
+
+    def test_inverse_takes_the_fast_path_on_a_normal_matrix(self):
+        """The claim that the fallback is dead on the real paths, asserted.
+
+        A normal-equations matrix is SPD by construction; if one ever were not,
+        the elimination would quietly pick it up and the speed would go with it.
+        """
+        rng = random.Random(21)
+        rows, weights = [], []
+        for _ in range(40):
+            row = [1.0] + [rng.uniform(-1, 1) for _ in range(4)]
+            rows.append([(i, v) for i, v in enumerate(row) if v != 0.0])
+            weights.append(rng.uniform(0.3, 1.7))
+        normal = linalg.sparse_normal_matrix(rows, weights, 5, 1e-6)
+        self.assertIsNotNone(linalg.cholesky_inverse(normal))
+
+
 class InverseTests(unittest.TestCase):
     def test_inverse_reproduces_the_identity(self):
         matrix = _symmetric(20, seed=7)

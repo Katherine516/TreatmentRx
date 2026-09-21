@@ -8,7 +8,7 @@ test fixture, not evidence.
 ## Commands
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests    # 611 tests, ~6.5 min
+PYTHONPATH=src python3 -m unittest discover -s tests    # 617 tests, ~6.5 min
 PYTHONPATH=src python3 -m treatmentrx.cli demo          # one patient end to end
 PYTHONPATH=src python3 -m treatmentrx.cli evaluate      # estimator scorecard
 PYTHONPATH=src python3 -m treatmentrx.cli stability     # k-fold + seed sweep (~10s)
@@ -560,6 +560,20 @@ produced a real clinical divergence, and the notes below are the scar tissue.
    `sqrt(scale_a * scale_b)`; without that it does not reduce to the variance
    when the two fits coincide, and `Var(x - x)` came out at a small positive
    residual instead of zero. `tests/test_estimators.py` pins that identity.
+
+   **That identity held by luck per arm until invariant 68, and the test was too
+   narrow to see it.** It checked `rituximab`, which returned exactly 0.0, while
+   `JAK-inhibitor` was returning **8.065e-10** at the same moment. Two causes,
+   both now removed. `Cov(beta, beta)` was recomputed through two plain
+   `matmul`s while `Var(beta)` came from `sandwich_product`, which exploits
+   symmetry and orders the same sums differently — `cross_covariance` returns
+   `self.covariance` outright when handed itself, because that *is* the
+   identity. And `contrast_standard_error` assembled the variance from
+   `blip_standard_error ** 2`, squaring a square root, which is not exact; it
+   now takes one loading vector through three quadratic forms and one final
+   square root. A residual near 1e-19 in a variance becomes 1e-9 in a standard
+   error, which is why a nine-place tolerance hid it. The test sweeps every arm
+   and asserts **exact** zero.
 
    The effect is system-wide, and all of it is recovered width rather than
    loosened standards: decision-rule coverage **98% -> 95.0%** (exactly nominal),
@@ -2064,6 +2078,87 @@ produced a real clinical divergence, and the notes below are the scar tissue.
    the coefficients, which is a numerical decision about a served quantity, not
    an optimisation. Everything in invariants 65-67 is arithmetic-preserving and
    asserted to be; keep that boundary.
+
+68. **Gauss-Jordan on a matrix that was symmetric positive definite all along.**
+   The last item in the 65-67 sequence and the only one that is *not*
+   arithmetic-preserving, so it is reported differently: what moved is measured
+   rather than asserted to be zero.
+
+   Every matrix this package inverts is a normal-equations matrix `X'WX` plus a
+   positive ridge — measured, all **23** built during a full fit are symmetric
+   and positive definite. That licenses Cholesky, which does not pivot and does
+   not need to for such a matrix. Three steps of about n^3/6 (factor, invert the
+   triangular factor, `A^-1 = (L^-1)'(L^-1)` with only the upper triangle
+   computed) against the elimination's ~2n^3 on the augmented `[A | I]`.
+
+   Interleaved A/B in one process, medians of nine, so machine drift hits both
+   arms equally:
+
+   | n | count per fit | Gauss-Jordan | Cholesky | ratio | removed |
+   | --- | --- | --- | --- | --- | --- |
+   | 10 | 5 | 0.63 ms | 0.31 ms | 2.00x | 1.6 ms |
+   | 11 | 15 | 0.81 ms | 0.40 ms | 2.01x | 6.1 ms |
+   | 38 | 1 | 21.90 ms | 9.49 ms | 2.31x | 12.4 ms |
+   | **78** | 1 | 76.62 ms | 75.58 ms | **1.01x** | 1.0 ms |
+   | 98 | 1 | 399.84 ms | 146.37 ms | **2.73x** | 253.5 ms |
+
+   **275ms off a full fit**, and about 255ms off every study replication that
+   computes a covariance. The n=78 row is the interesting one: that matrix is
+   **82.5% zeros** and `gauss_jordan_inverse` skips zero multipliers, so there is
+   nothing to win. Invariant 23's hand-optimisation is doing real work, and it
+   wins outright on the sparsest block.
+
+   **It is not more accurate, and that was worth checking rather than
+   assuming.** The first framing of this was "moves numbers toward the truth",
+   which the measurement did not support: residuals of `max |A A^-1 - I|` on the
+   real matrices run 1.8e-15 to 4.9e-14 for Cholesky against 1.8e-15 to 3.8e-14
+   for the elimination — better at n=38, slightly worse at n=78 and n=98, a wash.
+   The case for this is speed and nothing else.
+
+   **What moved, measured at full precision.** Refitting the whole ensemble both
+   ways and comparing every fitted covariance and bread entry unrounded: worst
+   absolute difference **2.767e-15**, on an entry of 0.0112. The worst *relative*
+   difference reads 3.1e-09 and is meaningless — it sits on an entry that is
+   itself near zero.
+
+   **What that reaches: nothing reported.** The fitted covariances agree to 12
+   decimal places (hash `6170c6241c15`), the served output over 40 patients is
+   identical including full card text (`b94e28ce8b93`), and over 120 audit
+   patients every figure is unchanged — status distribution 37/83, oracle-arm
+   rate 0.925, mean and max regret 0.0003 / 0.0101, true gaps 0.026 / 0.0775,
+   ECE 0.011, worst blip parameter error 0.0251, and `das28_squared` still at
+   **3.367**, the near-flag this file tracks at 92% of its threshold. A 2.8e-15
+   perturbation cannot survive `q_values` being rounded to three decimals, and
+   it does not.
+
+   That is the standard a change like this has to meet, and it is weaker than
+   the one invariants 65-67 met. **If any of those numbers had moved, the right
+   answer would have been to revert**, because a faster inverse is not worth an
+   argument about which abstention rate is correct.
+
+   `linalg.inverse` tries Cholesky and falls back to `gauss_jordan_inverse`,
+   which stays because the function's contract is general — an indefinite matrix
+   must still get a correct answer rather than a silent `None`.
+   `tests/test_linalg.py` asserts the two agree, that the refusal happens on an
+   indefinite and on a negative-definite matrix, that the fallback still
+   reproduces the identity, and that a normal matrix takes the fast path.
+
+   **It broke one test, and the test was right to break.**
+   `test_an_arm_against_itself_has_no_spread` pins invariant 38's `Var(x - x) = 0`
+   and failed at 5.46e-10. The reflex is to loosen a tolerance; measuring first
+   showed the opposite. Under the *old* inverse, `JAK-inhibitor` already returned
+   **8.065e-10** — larger than the failure — and three of five arms returned
+   exactly zero. The identity was holding per arm by accident, and the test
+   checked one arm and had picked a lucky one. Cholesky did not break it; it
+   reshuffled which arms were lucky.
+
+   The repair is in invariant 38 and makes the identity exact for every arm
+   under both inverses: `cross_covariance` returns `self.covariance` when handed
+   itself, and `contrast_standard_error` stops squaring a square root. Neither
+   moved a served number — the covariances still hash `6170c6241c15` and the
+   served output `b94e28ce8b93`. **A failing test on a numerical change is
+   evidence to read, not a threshold to adjust**, and here it was pointing at a
+   defect older than the change that surfaced it.
 
 ## What is real vs. still a placeholder
 

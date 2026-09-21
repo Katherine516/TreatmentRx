@@ -661,12 +661,47 @@ class DWOLSContrastCovarianceTests(unittest.TestCase):
 
     def test_an_arm_against_itself_has_no_spread(self):
         """Var(x - x) = 0. If the cross term were dropped this would return
-        sqrt(2) times the arm's own standard error instead."""
+        sqrt(2) times the arm's own standard error instead.
+
+        **Every arm, and exactly zero.** This checked `rituximab` alone and
+        passed at nine places because that arm happened to land on 0.0;
+        `JAK-inhibitor` was returning **8.065e-10** at the same moment. The
+        identity held per arm by luck rather than by construction, for two
+        reasons now removed: `Cov(beta, beta)` was recomputed through a different
+        matrix-multiplication path than `Var(beta)`, and the variance was
+        assembled from `blip_standard_error ** 2`, a square of a square root.
+        A residual near 1e-19 in the variance becomes 1e-9 once the final square
+        root is taken, which is why a tolerance hid it.
+        """
+        for arm in self.model.fits:
+            with self.subTest(arm=arm):
+                self.assertEqual(
+                    self.model.contrast_standard_error(arm, arm, self.features), 0.0
+                )
+
+    def test_a_self_contrast_still_needs_the_cross_term(self):
+        """The short-circuit must not be what makes the test above pass.
+
+        `cross_covariance` returns `self.covariance` when handed itself, which is
+        the identity rather than an optimisation. If the cross term were dropped
+        from `contrast_standard_error` entirely, this would be sqrt(2) times the
+        arm's own standard error — so that is asserted directly rather than
+        inferred from a zero.
+        """
+        from treatmentrx.estimation import linalg
+        from treatmentrx.estimation.basis import TREATMENT_FREE_BASIS, blip_basis
+
+        fit = self.model.fits["rituximab"]
+        loading = [0.0] * len(fit.covariance)
+        for offset, value in enumerate(blip_basis(self.features)):
+            loading[len(TREATMENT_FREE_BASIS) + offset] = value
+        without_cross = (2.0 * linalg.quadratic_form(loading, fit.covariance)) ** 0.5
         self.assertAlmostEqual(
-            self.model.contrast_standard_error("rituximab", "rituximab", self.features),
-            0.0,
-            places=9,
+            without_cross,
+            self.model.blip_standard_error("rituximab", self.features) * 2 ** 0.5,
+            places=12,
         )
+        self.assertGreater(without_cross, 0.01)
 
     def test_the_reference_arm_reduces_to_the_other_arm_alone(self):
         """The reference has no `ArmFit` and a blip identically zero, so the

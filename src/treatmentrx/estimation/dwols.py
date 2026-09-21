@@ -153,6 +153,23 @@ class ArmFit:
         """
         if not self._scores or not other._scores:
             return []
+        if other is self:
+            # `Cov(beta, beta)` *is* `Var(beta)`, so hand back the covariance
+            # already computed rather than recomputing it a different way.
+            #
+            # It is not an optimisation, it is the identity invariant 38 pins.
+            # `self.covariance` comes from `sandwich_product`, which exploits
+            # symmetry and computes half the second multiply; the general path
+            # below uses two plain `matmul`s. Both are correct and they order
+            # the same sums differently, so `Var + Var - 2 Cov` left a residual
+            # around 1e-19 — invisible until `contrast_standard_error` takes its
+            # square root, which turns 1e-19 into 1e-9.
+            #
+            # Measured before this short-circuit: `Var(x - x)` was **8.065e-10**
+            # for JAK-inhibitor and exactly zero for three of the five arms, so
+            # the identity held by luck per arm rather than by construction. The
+            # test that pins it checked one arm and happened to pick a lucky one.
+            return self.covariance
         size = len(self._bread)
         shared = self._scores.keys() & other._scores.keys()
         if not shared:
@@ -293,24 +310,27 @@ class DWOLSModel:
             present = mine or theirs
             return present.blip_standard_error(features) if present else 0.0
 
-        variance = (
-            mine.blip_standard_error(features) ** 2
-            + theirs.blip_standard_error(features) ** 2
+        # One loading vector, three quadratic forms, one square root at the end.
+        #
+        # This used to square `blip_standard_error`, which is itself a square
+        # root — and `sqrt(q) ** 2` is not `q` in floating point. For an arm
+        # against itself the three terms must cancel to exactly zero, and that
+        # round-trip left a variance residual near 1e-19 that the final square
+        # root turned into a standard error near **1e-9**. Measured before this,
+        # `Var(x - x)` ran to 8.065e-10 on one arm and was exactly zero on three
+        # others, so invariant 38's identity held per arm by luck; the test that
+        # pins it checked a single arm and happened to pick a lucky one.
+        n_free = len(TREATMENT_FREE_BASIS)
+        loading = [0.0] * len(mine.covariance)
+        for offset, value in enumerate(blip_basis(features)):
+            loading[n_free + offset] = value
+
+        variance = linalg.quadratic_form(loading, mine.covariance) + linalg.quadratic_form(
+            loading, theirs.covariance
         )
         cross = self._cross(arm, comparator, mine, theirs)
         if cross:
-            n_free = len(TREATMENT_FREE_BASIS)
-            loading = [0.0] * len(cross)
-            for offset, value in enumerate(blip_basis(features)):
-                loading[n_free + offset] = value
-            covariance = sum(
-                loading[i] * cross[i][j] * loading[j]
-                for i in range(len(loading))
-                if loading[i]
-                for j in range(len(loading))
-                if loading[j]
-            )
-            variance -= 2.0 * covariance
+            variance -= 2.0 * linalg.quadratic_form(loading, cross)
         return math.sqrt(max(variance, 0.0))
 
     def _cross(
