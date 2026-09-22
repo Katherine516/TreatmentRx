@@ -171,8 +171,11 @@ def blip_basis(features: dict[str, float]) -> list[float]:
 
 # How strongly the true treatment effect varies over a covariate the estimators'
 # blip basis does not contain. `curvature` bends the *nuisance* surface, which
-# double robustness is supposed to survive; this bends the **estimand**, which
-# nothing survives — it is the failure mode a real deployment actually has, since
+# double robustness is supposed to survive — measured, dWOLS's `|A - pi|` weight
+# removes 27-39% of the bias it creates (invariant 75) — while this bends the
+# **estimand** directly, which nothing survives. The contrast is real but not as
+# clean as it reads: the clamp in `expected_outcome` means curvature moves the
+# realised estimand too, for up to a quarter of arm-pairs. It is the failure mode a real deployment actually has, since
 # the true effect modifiers will not be exactly `anti_ccp` and `prior_tnf`.
 #
 # CRP is the natural choice: it is measured, it is in the treatment-free basis,
@@ -226,8 +229,32 @@ def treatment_free_value(features: dict[str, float], curvature: float = DEFAULT_
     how a stage-1 hepatotoxic choice is punished at stage 2.
 
     `curvature` adds a quadratic term in disease activity that the estimators'
-    linear basis cannot represent. It changes only this nuisance function; the
-    blips stay linear, so the estimand is untouched.
+    linear basis cannot represent. It changes only this function and
+    `true_blip` never reads it, so the **declared** blips stay linear.
+
+    **The realised estimand does move, and this docstring used to deny it.**
+    `expected_outcome` clamps `treatment_free_value + true_blip` to [0, 1] as a
+    sum, so once `curvature * severity^2` drives the baseline against a bound
+    both arms saturate together and the contrast between them collapses.
+    Measured on real stage covariates (3 cohorts of 400):
+
+    | curvature | rows clamped | arm-pairs whose blip drifts | worst drift |
+    | --- | --- | --- | --- |
+    | 0.00 | 3.8% | 1.1% | 0.0836 |
+    | 0.05 | 18.9% | 13.4% | 0.2294 |
+    | 0.10 | 26.0% | 21.3% | 0.2336 |
+    | 0.15 | 29.1% | 25.0% | 0.2357 |
+
+    That is the whole of `misspecification.DEFAULT_CURVATURES`, so the study
+    scoring fitted parameters against `TRUE_BLIPS` is comparing them to a
+    quantity a quarter of the cohort no longer has. See invariant 75: the
+    study's conclusion survives being rescored against the contrast the cohort
+    actually has, but the apparent crossover at 0.15 does not.
+
+    The clamp is **not** removed. It is what keeps the outcome a bounded
+    response, every other result in the repo is measured through it, and
+    re-tuning the generator to make a study read better is the thing this repo
+    keeps warning against. What is fixed is the claim.
     """
     severity = das28_std(features["das28"])
     return (

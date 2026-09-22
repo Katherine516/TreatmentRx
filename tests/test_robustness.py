@@ -20,9 +20,17 @@ from treatmentrx.simulation.ra_cohort import (
     REFERENCE_ARM,
     TREATMENT_ARMS,
     TRUE_BLIPS,
+    assignment_probabilities,
+    blip_basis,
+    expected_outcome,
     generate_ra_cohort,
     treatment_free_value,
+    true_blip,
 )
+import statistics
+
+import treatmentrx.estimation.dwols as dwols_module
+from treatmentrx.estimation.basis import BLIP_BASIS
 
 
 def _contrast(difference, half_width, caveat="sandwich"):
@@ -105,17 +113,164 @@ class VisitIntensityTests(unittest.TestCase):
 
 
 class MisspecificationTests(unittest.TestCase):
-    def test_curvature_leaves_the_estimand_untouched(self):
-        """Only the nuisance surface bends; the blips are what we estimate."""
+    def test_curvature_leaves_the_declared_blip_untouched(self):
+        """`true_blip` does not read curvature, so the declared estimand is
+        fixed by construction — asserted against the *signature* rather than by
+        comparing a call to itself, which is what this test used to do.
+
+        The old body was `assertEqual(true_blip(...), true_blip(...))` on a
+        function that takes no curvature argument: `x == x`, which cannot fail.
+        It guarded the claim invariant 75 refutes.
+        """
+        import inspect
+
+        self.assertNotIn("curvature", inspect.signature(true_blip).parameters)
         features = {"das28": 7.0, "crp": 20.0, "anti_ccp": 1.0, "prior_tnf": 0.0,
                     "egfr": 90.0, "alt": 25.0}
         self.assertNotEqual(
             treatment_free_value(features, curvature=0.0),
             treatment_free_value(features, curvature=0.15),
         )
-        from treatmentrx.simulation.ra_cohort import true_blip
 
-        self.assertEqual(true_blip("rituximab", features), true_blip("rituximab", features))
+    def test_curvature_does_move_the_realised_estimand(self):
+        """The property the old test's *name* claimed, measured and refuted.
+
+        `expected_outcome` clamps `treatment_free_value + true_blip` to [0, 1]
+        as a sum, so once the quadratic drives the baseline against a bound both
+        arms saturate together and the contrast collapses. Pinned on real stage
+        covariates so a later change cannot quietly move it, and pinned in both
+        directions: negligible at curvature 0, substantial across the study's
+        own grid.
+        """
+        def drift(curvature):
+            rows = [
+                dict(stage.features)
+                for trajectory in generate_ra_cohort(400, seed=7, curvature=curvature)
+                for stage in trajectory.stages
+            ]
+            moved = total = 0
+            worst = 0.0
+            for features in rows:
+                basis = blip_basis(features)
+                base = expected_outcome(features, REFERENCE_ARM, curvature=curvature)
+                for arm in TREATMENT_ARMS:
+                    if arm == REFERENCE_ARM:
+                        continue
+                    realised = expected_outcome(features, arm, curvature=curvature) - base
+                    declared = sum(p * b for p, b in zip(TRUE_BLIPS[arm], basis))
+                    total += 1
+                    if abs(realised - declared) > 1e-9:
+                        moved += 1
+                    worst = max(worst, abs(realised - declared))
+            return moved / total, worst
+
+        share_zero, worst_zero = drift(0.0)
+        self.assertLess(share_zero, 0.05, "the correctly specified cohort should be clean")
+        self.assertLess(worst_zero, 0.10)
+
+        share, worst = drift(0.15)
+        self.assertGreater(
+            share, 0.15,
+            f"only {share:.1%} of arm-pairs drift — has the clamp changed?",
+        )
+        self.assertGreater(worst, 0.15, f"worst drift {worst:.4f}")
+
+
+class DoubleRobustnessTests(unittest.TestCase):
+    """Does dWOLS's propensity weighting earn its place on the cohort that serves?
+
+    Invariant 74 found the survival generator could not express the
+    misspecification double robustness survives. This cohort has the same shape
+    — `assignment_probabilities` scores arms from `blip_basis(features)` exactly,
+    so every confounder is in the blip basis — but not the same consequence:
+    `curvature` bends the surface over `das28_std`, which *is* a confounder, so
+    a linear surface is genuinely wrong about a variable that drives assignment.
+
+    Scored as a **bias** pooled over seeds rather than as mean absolute error.
+    Confounding is a systematic shift and at this cohort size the sampling
+    spread swamps it; that is invariant 40's distinction, and the lesson
+    invariant 74 learned by measuring it the wrong way first.
+    """
+
+    SEEDS = tuple(range(7000, 7012))
+    SIZE = 400
+    PARAMETERS = [
+        (arm, term)
+        for arm in TREATMENT_ARMS
+        if arm != REFERENCE_ARM
+        for term in BLIP_BASIS
+    ]
+
+    def _bias(self, curvature, propensities):
+        original = dwols_module.ArmFit._propensities
+        try:
+            dwols_module.ArmFit._propensities = propensities
+            per_seed = []
+            for seed in self.SEEDS:
+                model = dwols_module.DWOLSModel(
+                    generate_ra_cohort(self.SIZE, seed, curvature=curvature)
+                )
+                per_seed.append({
+                    key: model.blip_parameters(key[0])[key[1]]
+                    - dict(zip(BLIP_BASIS, TRUE_BLIPS[key[0]]))[key[1]]
+                    for key in self.PARAMETERS
+                })
+        finally:
+            dwols_module.ArmFit._propensities = original
+        return sum(
+            abs(statistics.mean(errors[key] for errors in per_seed))
+            for key in self.PARAMETERS
+        )
+
+    @staticmethod
+    def _unweighted(self, rows):
+        """A constant propensity makes `|A - pi|` a constant weight, i.e. OLS."""
+        return [0.5] * len(rows)
+
+    def test_the_weight_buys_nothing_when_the_surface_is_right(self):
+        """The control. With no misspecification there is nothing for double
+        robustness to survive, so the weight must not be *helping* — otherwise
+        whatever it is doing is not what it says on the tin."""
+        weighted = self._bias(0.0, dwols_module.ArmFit._propensities)
+        plain = self._bias(0.0, self._unweighted)
+        self.assertLess(abs(weighted - plain), 0.05, f"{weighted:.4f} vs {plain:.4f}")
+
+    def test_the_weight_removes_bias_when_the_surface_is_wrong(self):
+        """The property, on the cohort that actually serves.
+
+        Measured over 24 seeds the deployed weight removes 27-39% of the bias a
+        curved surface creates; the generator's own propensity removes 44-52%.
+        Twelve seeds and a 15% bar here, because the effect is large and the
+        suite cannot afford the full sweep.
+        """
+        weighted = self._bias(0.10, dwols_module.ArmFit._propensities)
+        plain = self._bias(0.10, self._unweighted)
+        self.assertGreater(
+            plain,
+            weighted * 1.15,
+            f"weighted bias {weighted:.4f} against unweighted {plain:.4f}",
+        )
+
+    def test_every_confounder_is_in_the_blip_basis(self):
+        """Why the omission case cannot be tested here, recorded rather than
+        rediscovered. The surface can only omit `crp_std` and `alt_excess`, and
+        neither moves assignment — so omitting one costs efficiency and creates
+        no confounding, exactly the dead end invariant 74 hit."""
+        base = {"das28": 5.2, "crp": 30.0, "anti_ccp": 0.0, "prior_tnf": 0.0,
+                "egfr": 90.0, "alt": 25.0}
+
+        def moves_assignment(name, low, high):
+            first = assignment_probabilities(dict(base, **{name: low}))
+            second = assignment_probabilities(dict(base, **{name: high}))
+            return max(abs(first[a] - second[a]) for a in TREATMENT_ARMS)
+
+        for name, low, high in (("das28", 3.0, 7.0), ("anti_ccp", 0.0, 1.0),
+                                ("prior_tnf", 0.0, 1.0)):
+            with self.subTest(name=name):
+                self.assertGreater(moves_assignment(name, low, high), 0.0)
+        for name, low, high in (("crp", 5.0, 90.0), ("alt", 15.0, 44.0)):
+            with self.subTest(name=name):
+                self.assertEqual(moves_assignment(name, low, high), 0.0)
 
     def test_curvature_is_off_by_default(self):
         """Every other result in the repo assumes the correctly specified cohort."""

@@ -8,7 +8,7 @@ test fixture, not evidence.
 ## Commands
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests    # 681 tests, ~7 min
+PYTHONPATH=src python3 -m unittest discover -s tests    # 685 tests, ~7 min
 PYTHONPATH=src python3 -m treatmentrx.cli demo          # one patient end to end
 PYTHONPATH=src python3 -m treatmentrx.cli evaluate      # estimator scorecard
 PYTHONPATH=src python3 -m treatmentrx.cli stability     # k-fold + seed sweep (~10s)
@@ -120,7 +120,7 @@ has already gone wrong on it. Read the row before the diff, not after.
 | the safety layer | 1, 35, 54, 61, 70 |
 | `cli audit` and the layer sections | 2, 36, 62, 65, 66, 69 |
 
-It reaches **52 of 74**. The rest are one-offs — a single
+It reaches **52 of 75**. The rest are one-offs — a single
 component, found once, unlikely to be what you are holding — and they are not
 listed here because a row of one is not an index, it is a search result.
 `tests/test_docs.py` derives this table from the invariant bodies and fails when
@@ -2706,6 +2706,109 @@ it goes stale, which is the only thing that makes an index worth having.
    would have to change before any of this reaches a recommendation. The arms
    stay `reference`, `arm-a`, `arm-b`, `arm-c` for invariant 73's reason.
 
+75. **dWOLS's weight does earn its place — and the study measuring that was
+   scored against a truth a quarter of the cohort no longer had.** Invariant 74
+   ended by noting the survival generator could not express the misspecification
+   double robustness survives, because every confounder sat in the blip basis.
+   `ra_cohort.assignment_probabilities` scores arms from `blip_basis(features)`
+   **exactly**, so the deployed cohort has the same shape, and nothing had ever
+   measured whether the `|A - pi|` weight earns its place here. Asking that is
+   what found the rest.
+
+   **It is not the same dead end**, and the difference is why the question is
+   answerable. Splitting the two bases: `das28_std`, `anti_ccp` and `prior_tnf`
+   drive assignment *and* the outcome; `crp_std` and `alt_excess` are prognostic
+   only. So the surface can only *omit* a variable that creates no confounding —
+   invariant 74's trap — but `curvature` does not omit, it **mis-shapes**, and it
+   mis-shapes over `das28_std`, which is a confounder. A linear surface is then
+   genuinely wrong about a variable that drives assignment, and the weight has
+   something to do.
+
+   **It does it.** 24 seeds at n=400, scored as total |bias| over the 20 blip
+   parameters, because confounding is a systematic shift and mean absolute error
+   at this cohort size is mostly sampling spread — invariant 40's distinction,
+   and the lesson invariant 74 learned by measuring it the wrong way first:
+
+   | curvature | no weight (OLS) | fitted (deployed) | the true propensity | the weight buys |
+   | --- | --- | --- | --- | --- |
+   | 0.00 | 0.0306 | 0.0296 | 0.0310 | +0.0010 |
+   | 0.05 | 0.4402 | **0.2667** | 0.2113 | **39%** |
+   | 0.10 | 0.5132 | **0.3653** | 0.2717 | **29%** |
+   | 0.15 | 0.5929 | **0.4328** | 0.3301 | **27%** |
+
+   At curvature 0 it buys nothing, which is the control: with nothing
+   misspecified there is nothing for double robustness to survive, and a weight
+   that *helped* there would be doing something other than what it claims. The
+   bias lands on `das28_std` — the confounder the curvature bends over — exactly
+   as the mechanism predicts: OLS carries +0.0866 on IL-6's `das28_std` where
+   the true propensity carries +0.0182.
+
+   **The rescue is partial, and chasing why is what found the real defect.**
+   With the generator's *own* propensity the `|A - pi|` weight balances any
+   function of X, including the omitted `severity^2`, so double robustness
+   predicts the bias should vanish rather than shrink. It shrinks. Sweeping n at
+   curvature 0.10 with the true propensity: **0.2717 at n=400, 0.2697 at 800,
+   0.2633 at 1600, 0.2716 at 3200** — flat, so not finite-sample.
+
+   **`expected_outcome` clamps the sum.** It returns
+   `clamp(treatment_free_value(X, curvature) + true_blip(a, X), 0, 1)`, so once
+   `curvature * severity^2` drives the baseline against a bound *both* arms
+   saturate together and the contrast between them collapses. The declared blip
+   is untouched; the realised one is not. Measured on real stage covariates
+   (3 cohorts of 400), against `misspecification.DEFAULT_CURVATURES`:
+
+   | curvature | rows clamped | arm-pairs whose blip drifts | worst drift | baseline outside [0,1] |
+   | --- | --- | --- | --- | --- |
+   | 0.00 | 3.8% | 1.1% | 0.0836 | 0.0% |
+   | 0.05 | 18.9% | 13.4% | 0.2294 | 9.9% |
+   | 0.10 | 26.0% | 21.3% | 0.2336 | 16.7% |
+   | 0.15 | 29.1% | **25.0%** | 0.2357 | 20.7% |
+
+   So `_blip_error` compares fitted parameters against `TRUE_BLIPS` at
+   curvatures where a quarter of arm-pairs no longer have that blip. The
+   correctly specified row is clean, which is why nothing caught it.
+
+   **The conclusion survives; one detail does not.** Rescored against the
+   contrast the cohort actually has — `E[Y|X,a] - E[Y|X,ref]` per patient, which
+   stays well defined under the clamp although no parameter vector describes it
+   — over the study's own six seeds:
+
+   | | Q-Shared | Stage-Specific | dWOLS |
+   | --- | --- | --- | --- |
+   | vs `TRUE_BLIPS`, curvature 0 | 0.5785 | 0.2852 | **0.1702** |
+   | vs `TRUE_BLIPS`, curvature 0.15 | 0.9434 | **0.5936** | 0.6191 |
+   | vs the realised blip, curvature 0 | 0.0552 | 0.0166 | **0.0095** |
+   | vs the realised blip, curvature 0.15 | 0.0766 | 0.0414 | **0.0373** |
+
+   dWOLS is the most accurate at curvature 0 and degrades the most under **both**
+   yardsticks, so `preferred_estimator` and the case for averaging rather than
+   picking are unaffected. What does not survive is the **crossover**: today's
+   scoring has dWOLS falling behind the stage-specific fit at 0.15 (0.6191
+   against 0.5936), and under the honest yardstick it leads at every curvature.
+   "Neither dominates" is a weaker reading of this cohort than the numbers
+   support.
+
+   **The clamp is not removed**, and that is the judgement rather than an
+   oversight. It is what keeps the outcome a bounded response, every other
+   result in the repo is measured through it, and re-tuning a generator so a
+   study reads better is the move this file keeps warning against. What is fixed
+   is the claim: `treatment_free_value`'s docstring said curvature "changes only
+   this nuisance function; the blips stay linear, so the estimand is untouched",
+   and it now carries the table above.
+
+   **The test guarding that claim was a tautology.**
+   `test_curvature_leaves_the_estimand_untouched` asserted
+   `true_blip(...) == true_blip(...)` — the same call twice, on a function that
+   takes no curvature argument. `x == x`, which cannot fail, is invariant 25's
+   defect in the one test whose name claimed the property being refuted. It is
+   now two tests: one asserting `true_blip`'s *signature* carries no curvature,
+   which is the real reason the declared blip is fixed, and one pinning the
+   realised drift in both directions — negligible at 0, above 15% of arm-pairs
+   at 0.15 — so the docs cannot go stale again. `DoubleRobustnessTests` pins the
+   weight's effect and records, as a test rather than a comment, that `crp_std`
+   and `alt_excess` are the only omittable covariates and neither moves
+   assignment.
+
 ## What is real vs. still a placeholder
 
 Real: the four estimators, the cohort and its known blips, informative-dropout
@@ -3153,12 +3256,18 @@ in this repo conditional on the basis being right, and `--omitted-modifier` is t
 measurement of what that assumption is worth.
 
 `generate_ra_cohort(..., curvature=)` bends the treatment-free surface beyond
-what the estimators' linear basis can represent, leaving the blips — and so the
-estimand — untouched. It is 0 by default; every other result in the repo assumes
-the correctly specified cohort. `cli misspecification` uses it to show the
-estimators trading off as designed: dWOLS is the most accurate when the nuisance
-model is right and degrades the most, the shared-blip fit the reverse. That
-trade-off is the justification for averaging them rather than picking one.
+what the estimators' linear basis can represent. It leaves the **declared**
+blips untouched — `true_blip` never reads curvature — but **not the realised
+estimand**, which this paragraph used to claim and invariant 75 measures:
+`expected_outcome` clamps the sum to [0, 1], so at the study's own grid up to
+25% of arm-pairs have a contrast that is no longer `TRUE_BLIPS`. It is 0 by
+default; every other result in the repo assumes the correctly specified cohort.
+`cli misspecification` uses it to show the estimators trading off as designed:
+dWOLS is the most accurate when the nuisance model is right and degrades the
+most, the shared-blip fit the reverse. **That conclusion survives being rescored
+against the contrast the cohort actually has** (invariant 75), so the trade-off
+is still the justification for averaging them rather than picking one — but the
+apparent crossover at curvature 0.15 does not survive, and is a clamp artifact.
 
 When you touch one of these, either make it real or keep the docstring honest
 about what it is not. The value of this codebase is that a reader can tell the
