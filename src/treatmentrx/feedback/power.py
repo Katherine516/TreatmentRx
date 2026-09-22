@@ -43,6 +43,27 @@ DEFAULT_SIZES = (140, 280, 400, 800, 1600)
 DEFAULT_PATIENTS = 240
 DEFAULT_SEED = 909
 
+# How many training cohorts to draw at each size, and why there is more than one.
+#
+# This swept one cohort per size and scored every patient against it, so all 240
+# abstention decisions shared a single fitted ensemble's parameters — invariant
+# 31's defect ("coverage is replicated over fits, never over patients on one
+# fit") on a different quantity. The published curve was non-monotone at the low
+# end, 79% at train 98 against 85% at 196, which read as more data making the
+# agent less decisive. It was one unlucky draw. Measured over four cohorts at
+# 120 patients:
+#
+#   cohort 140: 0.625 to 0.917   spread 0.292
+#   cohort 280: 0.575 to 0.875   spread 0.300
+#   cohort 400: 0.525 to 0.692   spread 0.167   <- the deployed size
+#   cohort 800: 0.383 to 0.608   spread 0.225
+#
+# Binomial noise over 240 scored patients is about 0.032, an order of magnitude
+# too small to produce those spreads, so the fit-to-fit term dominates and was
+# the one not being reported. Four is what the runtime affords; it is enough to
+# show the spread and too few to pin it, which the report says.
+DEFAULT_REPLICATES = 4
+
 # What fraction of patients a deployment might want a recommendation for. Not a
 # clinical standard — a reference point, so "how much data" has an answer.
 TARGET_ABSTENTION = 0.30
@@ -58,6 +79,25 @@ class PowerPoint:
     equipoise_rate: float
     mean_standard_error: float
     mean_abs_difference: float
+    # Every draw's own abstention rate, so the spread can be reported rather
+    # than averaged away. A single-draw point carries one entry.
+    equipoise_rates: tuple[float, ...] = ()
+
+    @property
+    def replicates(self) -> int:
+        return len(self.equipoise_rates) or 1
+
+    @property
+    def equipoise_spread(self) -> float:
+        """Max minus min across draws — the quantity that was missing.
+
+        Reported rather than a standard deviation because at four draws an sd is
+        not much better determined than the range and reads more precise than it
+        is.
+        """
+        if len(self.equipoise_rates) < 2:
+            return 0.0
+        return max(self.equipoise_rates) - min(self.equipoise_rates)
 
     @property
     def mean_z(self) -> float:
@@ -72,6 +112,9 @@ class PowerPoint:
             "patients_scored": self.patients,
             "equipoise_rate": round(self.equipoise_rate, 4),
             "recommend_rate": round(1.0 - self.equipoise_rate, 4),
+            "training_cohorts_drawn": self.replicates,
+            "equipoise_spread_across_draws": round(self.equipoise_spread, 4),
+            "equipoise_by_draw": [round(r, 4) for r in self.equipoise_rates],
             "mean_contrast_standard_error": round(self.mean_standard_error, 5),
             "mean_abs_contrast": round(self.mean_abs_difference, 5),
             "mean_z": round(self.mean_z, 3),
@@ -98,17 +141,23 @@ def _measure(states, decision_layer, estimation_layer) -> tuple[float, float, fl
     )
 
 
-def power_curve(
+def power_curves(
     sizes: tuple[int, ...] = DEFAULT_SIZES,
     n_patients: int = DEFAULT_PATIENTS,
     seed: int = DEFAULT_SEED,
-) -> list[PowerPoint]:
-    """Refit the ensemble at each cohort size and score the same patients.
+    replicates: int = DEFAULT_REPLICATES,
+) -> list[list[PowerPoint]]:
+    """One full curve per **training-cohort draw**, unaggregated.
 
-    The patient set is held fixed across sizes — the same people, a differently
-    sized training cohort — so the only thing moving is how well the parameters
-    are determined. Building the states once also keeps Layer 1 out of the
+    The patient set is held fixed across sizes *and* draws — the same people,
+    differently sized and differently drawn training cohorts — so the only thing
+    moving is the fit. Building the states once also keeps Layer 1 out of the
     comparison entirely.
+
+    Replicating over the fit is the point. Every patient scored at a given size
+    shares that ensemble's parameters, so scoring more patients cannot average
+    the draw away; only refitting can. That is invariant 31's argument, and this
+    module is where it had not been applied.
     """
     from treatmentrx.decision import DecisionLayer
     from treatmentrx.estimation import EstimationLayer, training
@@ -123,31 +172,77 @@ def power_curve(
     if not states:
         raise ValueError("no patients survived the data contract")
 
-    original = training.COHORT_SIZE
-    points: list[PowerPoint] = []
+    original_size = training.COHORT_SIZE
+    original_seed = training.COHORT_SEED
+    curves: list[list[PowerPoint]] = []
     try:
-        for size in sizes:
-            training.COHORT_SIZE = size
-            training.reset()
-            equipoise, error, difference = _measure(
-                states, DecisionLayer(), EstimationLayer()
-            )
-            points.append(
-                PowerPoint(
-                    cohort_size=size,
-                    train_size=len(training.fitted().train),
-                    patients=len(states),
-                    equipoise_rate=equipoise,
-                    mean_standard_error=error,
-                    mean_abs_difference=difference,
+        for index in range(max(replicates, 1)):
+            training.COHORT_SEED = original_seed + index
+            curve: list[PowerPoint] = []
+            for size in sizes:
+                training.COHORT_SIZE = size
+                training.reset()
+                equipoise, error, difference = _measure(
+                    states, DecisionLayer(), EstimationLayer()
                 )
-            )
+                curve.append(
+                    PowerPoint(
+                        cohort_size=size,
+                        train_size=len(training.fitted().train),
+                        patients=len(states),
+                        equipoise_rate=equipoise,
+                        mean_standard_error=error,
+                        mean_abs_difference=difference,
+                        equipoise_rates=(equipoise,),
+                    )
+                )
+            curves.append(curve)
     finally:
-        # The sweep mutates a module global; a caller that runs this in the same
-        # process as anything else must get the default fit back.
-        training.COHORT_SIZE = original
+        # The sweep mutates two module globals; a caller that runs this in the
+        # same process as anything else must get the default fit back.
+        training.COHORT_SIZE = original_size
+        training.COHORT_SEED = original_seed
         training.reset()
-    return points
+    return curves
+
+
+def power_curve(
+    sizes: tuple[int, ...] = DEFAULT_SIZES,
+    n_patients: int = DEFAULT_PATIENTS,
+    seed: int = DEFAULT_SEED,
+    replicates: int = DEFAULT_REPLICATES,
+) -> list[PowerPoint]:
+    """The curve, averaged over training-cohort draws.
+
+    Each point carries every draw's own abstention rate, so `equipoise_spread`
+    can say how much of the published number is the draw rather than the size.
+    """
+    curves = power_curves(sizes, n_patients, seed, replicates)
+    return average_curves(curves)
+
+
+def average_curves(curves: list[list[PowerPoint]]) -> list[PowerPoint]:
+    """Mean over draws at each size, keeping the per-draw rates."""
+    if not curves:
+        return []
+    averaged: list[PowerPoint] = []
+    for index in range(len(curves[0])):
+        column = [curve[index] for curve in curves]
+        rates = tuple(point.equipoise_rate for point in column)
+        averaged.append(
+            PowerPoint(
+                cohort_size=column[0].cohort_size,
+                train_size=column[0].train_size,
+                patients=column[0].patients,
+                equipoise_rate=sum(rates) / len(rates),
+                mean_standard_error=sum(p.mean_standard_error for p in column)
+                / len(column),
+                mean_abs_difference=sum(p.mean_abs_difference for p in column)
+                / len(column),
+                equipoise_rates=rates,
+            )
+        )
+    return averaged
 
 
 def shrinkage_exponent(points: list[PowerPoint]) -> float | None:
@@ -201,6 +296,21 @@ def required_train_size(points: list[PowerPoint], target: float = TARGET_ABSTENT
         ratio = math.log(later.train_size) - math.log(earlier.train_size)
         return int(round(math.exp(math.log(later.train_size) + steps * ratio)))
     return usable[0].train_size
+
+
+def across_draws(curves: list[list[PowerPoint]], statistic) -> tuple | None:
+    """`statistic` computed on each draw's own curve, as (min, max).
+
+    The aggregated curve gives one number; this says how far that number moves
+    when the training cohort is redrawn. Both `shrinkage_exponent` and
+    `required_train_size` are fitted to the *shape* of a curve whose every point
+    is one fit, so the range is the honest companion to the point estimate.
+    """
+    values = [statistic(curve) for curve in curves]
+    usable = [v for v in values if v is not None]
+    if not usable:
+        return None
+    return (min(usable), max(usable))
 
 
 def final_test_feasibility(
@@ -371,9 +481,12 @@ def power_report(
 ) -> dict[str, object]:
     from treatmentrx.estimation import training
 
-    points = power_curve(sizes, n_patients, seed)
+    curves = power_curves(sizes, n_patients, seed)
+    points = average_curves(curves)
     exponent = shrinkage_exponent(points)
     needed = required_train_size(points, target)
+    exponent_range = across_draws(curves, shrinkage_exponent)
+    needed_range = across_draws(curves, lambda c: required_train_size(c, target))
     deployed = next(
         (p for p in points if p.cohort_size == training.COHORT_SIZE), None
     )
@@ -382,9 +495,20 @@ def power_report(
         "patients_scored": points[0].patients if points else 0,
         "deployed_train_size": len(training.fitted().train),
         "curve": [point.as_dict() for point in points],
+        "training_cohorts_drawn": points[0].replicates if points else 0,
         "shrinkage_exponent": round(exponent, 3) if exponent is not None else None,
+        # Both of these are fitted to the shape of the curve, and every point on
+        # it is one fit. The range is what a single draw moves them by; quoting
+        # the point estimate without it is the defect this replication fixed.
+        "shrinkage_exponent_across_draws": (
+            [round(v, 3) for v in exponent_range] if exponent_range else None
+        ),
         "target_abstention": target,
         "train_size_for_target": needed,
+        "train_size_for_target_across_draws": list(needed_range) if needed_range else None,
+        "worst_equipoise_spread": (
+            round(max(p.equipoise_spread for p in points), 4) if points else None
+        ),
         "target_is_extrapolated": extrapolated,
         # The same question about a different resource: this study prices sample
         # size against abstention, that one prices it against having a test set
@@ -400,11 +524,22 @@ def _verdict(points, exponent, needed, deployed, target, extrapolated) -> str:
         return "no measurable points"
     lines = []
     if deployed is not None:
+        spread = deployed.equipoise_spread
         lines.append(
             f"At the deployed training size ({deployed.train_size}) the agent "
             f"recommends for {1 - deployed.equipoise_rate:.0%} of patients and "
-            f"abstains for {deployed.equipoise_rate:.0%}."
+            f"abstains for {deployed.equipoise_rate:.0%}, averaged over "
+            f"{deployed.replicates} training-cohort draws."
         )
+        if spread > 0.0:
+            lines.append(
+                f"That rate moves {spread:.0%} across those draws "
+                f"({min(deployed.equipoise_rates):.0%} to "
+                f"{max(deployed.equipoise_rates):.0%}) — every patient scored at a "
+                f"size shares one fitted ensemble, so scoring more patients cannot "
+                f"average the draw away and a single-draw figure understates what "
+                f"is unknown about it."
+            )
     first, last = points[0], points[-1]
     lines.append(
         f"Abstention falls from {first.equipoise_rate:.0%} at n={first.train_size} "
@@ -413,6 +548,15 @@ def _verdict(points, exponent, needed, deployed, target, extrapolated) -> str:
         f"{last.mean_abs_difference:.3f}) — the effect is not changing, the "
         f"precision is."
     )
+    worst = max(points, key=lambda p: p.equipoise_spread)
+    if worst.equipoise_spread > 0.0:
+        lines.append(
+            f"Read the shape rather than any one point: the widest draw-to-draw "
+            f"spread is {worst.equipoise_spread:.0%} at n={worst.train_size}. "
+            f"Before this was replicated the curve was non-monotone at the low "
+            f"end, which read as more data making the agent less decisive and "
+            f"was one unlucky fit."
+        )
     if exponent is not None:
         if exponent < 0.35:
             lines.append(

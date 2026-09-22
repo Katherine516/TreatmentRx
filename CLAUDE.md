@@ -8,7 +8,7 @@ test fixture, not evidence.
 ## Commands
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests    # 697 tests, ~7 min
+PYTHONPATH=src python3 -m unittest discover -s tests    # 701 tests, ~7 min
 PYTHONPATH=src python3 -m treatmentrx.cli demo          # one patient end to end
 PYTHONPATH=src python3 -m treatmentrx.cli evaluate      # estimator scorecard
 PYTHONPATH=src python3 -m treatmentrx.cli stability     # k-fold + seed sweep (~10s)
@@ -21,7 +21,7 @@ PYTHONPATH=src python3 -m treatmentrx.cli coverage --stages         # coverage a
 PYTHONPATH=src python3 -m treatmentrx.cli misspecification  # estimator robustness (~15s)
 PYTHONPATH=src python3 -m treatmentrx.cli misspecification --omitted-modifier  # blip basis too small (~4m)
 PYTHONPATH=src python3 -m treatmentrx.cli misspecification --extra-modifier    # blip basis too big (~40s)
-PYTHONPATH=src python3 -m treatmentrx.cli power          # data needed vs abstention (~23s)
+PYTHONPATH=src python3 -m treatmentrx.cli power          # data needed vs abstention (~85s, 4 cohort draws per size)
 PYTHONPATH=src python3 -m treatmentrx.cli subgroups      # who does it abstain on? (~4s)
 PYTHONPATH=src python3 -m treatmentrx.cli transfer       # fit at site A, score at site B (~50s)
 PYTHONPATH=src python3 -m treatmentrx.cli specification  # is the blip basis missing a modifier? (~3s)
@@ -118,9 +118,9 @@ has already gone wrong on it. Read the row before the diff, not after.
 | the validation gate | 14, 25, 41 |
 | the blip basis | 57, 68, 72 |
 | the safety layer | 1, 35, 54, 61, 70 |
-| `cli audit` and the layer sections | 2, 36, 62, 65, 66, 69 |
+| `cli audit` and the layer sections | 2, 33, 36, 62, 65, 66, 69 |
 
-It reaches **53 of 77**. The rest are one-offs — a single
+It reaches **54 of 78**. The rest are one-offs — a single
 component, found once, unlikely to be what you are holding — and they are not
 listed here because a row of one is not an index, it is a search result.
 `tests/test_docs.py` derives this table from the invariant bodies and fails when
@@ -498,6 +498,19 @@ it goes stale, which is the only thing that makes an index worth having.
     asserts the published ranges *bracket* what `subgroup_report()` actually
     returns, which is the property; pinning the digits would need updating in
     two places on any legitimate change and is how this went stale.
+
+    **A third range, and the one the card was missing entirely.** Three commands
+    report a pooled rate for the deployed fit and they disagree — `cli power`
+    0.663, `cli subgroups` 0.683, `cli audit` 0.692. That 3-point spread is
+    patient sampling on a rate this size (about 0.03) and none of them is wrong.
+    The spread worth knowing is four times larger and had never been measured:
+    redraw the *training cohort* at the same size and the rate runs **0.563 to
+    0.688** (invariant 78). `training_draw_range` carries it, and
+    `why_the_published_figures_differ` says which spread is which, so a reader
+    who runs two commands and gets two numbers finds the reason on the card
+    rather than concluding one is a bug. A test asserts that range stays wider
+    than patient-sampling noise — if it ever narrows to that width it has
+    stopped describing the fit, which is the only thing it is for.
 34. **No cross-disease fallback.** `DiseaseRegistry` must resolve exactly one
     registered definition before Layer 1 runs. A missing disease workflow is a
     typed error; it must never reuse RA arms, models, safety rules or evidence.
@@ -2982,6 +2995,57 @@ it goes stale, which is the only thing that makes an index worth having.
    the remaining horizon depends on history the covariates do not carry. Still
    wired to nothing: `EstimationLayer` scores a bounded response.
 
+78. **`cli power` refit once per size and scored 240 patients against that one
+   fit.** Invariant 31 says coverage is replicated over fits and never over
+   patients on one fit, because every patient's interval is built from the same
+   fitted parameters and one unlucky draw misses for everybody at once. The
+   abstention curve has exactly that property and nobody had applied the rule to
+   it: `power_curve` set `COHORT_SIZE`, called `reset()`, and scored every
+   patient against the single ensemble that came back.
+
+   **The published table was already saying so and it read as a finding.**
+   79% at train 98, **85%** at 196, 66% at 280 — non-monotone at the low end,
+   which invites reading it as more data making the agent *less* decisive at
+   small n. Replicated over four training-cohort draws it is monotone
+   throughout, so that was one fit:
+
+   | train n | published (1 draw) | mean of 4 draws | spread | the draws |
+   | --- | --- | --- | --- | --- |
+   | 98 | 79% | 79.3% | **0.263** | .792 .833 .642 .904 |
+   | 196 | **85%** | **68.9%** | **0.271** | .854 .629 .583 .688 |
+   | **280 (deployed)** | **66%** | **62.9%** | 0.125 | .663 .563 .604 .688 |
+   | 560 | 40% | 49.1% | 0.229 | .396 .488 .454 .625 |
+   | 1120 | 33% | 36.8% | 0.133 | .325 .329 .358 .458 |
+
+   **Scoring more patients cannot fix this, which is the whole point.** Binomial
+   noise on a rate near 0.63 over 240 patients is about **0.032**; the observed
+   spreads run 0.125 to 0.271, an order of magnitude larger. So the term that
+   dominates is the one that was not being reported, and
+   `DEFAULT_PATIENTS = 240` — raised once already for stability — could not have
+   helped.
+
+   **Two headline numbers move, and both now carry a range.** The shrinkage
+   exponent goes 0.433 to **0.413** (0.388 to 0.433 across draws), still
+   comfortably the n^-0.5 story. The trajectories needed for 30% abstention go
+   1,430 to **1,641**, with draws spanning **1,273 to 2,164** — both are fitted
+   to the *shape* of a curve whose every point was one fit, so `across_draws`
+   reports what a redraw does to them. The point estimate alone was the defect.
+
+   **It makes an existing guard stronger rather than weaker**, which is worth
+   recording because the reflex with a noisier measurement is the opposite.
+   `test_the_standard_error_responds_to_sample_size` asserts the exponent clears
+   0.35 — the regression guard for the stale-dWOLS defect that read 0.15. On a
+   three-size pilot a single draw read **0.309**, under the bar; the averaged
+   curve read 0.393. Aggregating over draws is what keeps that test measuring
+   the estimator rather than the draw.
+
+   `power_curves` returns the unaggregated curves and `average_curves` folds
+   them, so the per-draw rates survive onto every point as `equipoise_rates` and
+   `equipoise_spread`. The sweep now restores **`COHORT_SEED` as well as**
+   `COHORT_SIZE`, and a test asserts both: a restored size with a drifted seed
+   would leave everything after it scoring against a cohort nobody chose, and
+   that is the kind of leak a module-global sweep makes easy.
+
 ## What is real vs. still a placeholder
 
 Real: the four estimators, the cohort and its known blips, informative-dropout
@@ -3176,28 +3240,37 @@ from 0.054 to 0.081. The agent recommends about half as often and is right about
 Do not tune this back by widening the action bar.
 
 **Abstention is a sample-size choice, and `cli power` prices it.** The same 240
-patients, the ensemble refit at each cohort size:
+patients, the ensemble refit at each cohort size and at **four training-cohort
+draws per size** (invariant 78 — this used to be one, and one is not a curve):
 
-| train n | abstains | mean contrast SE | mean \|contrast\| | mean z |
+| train n | abstains (mean of 4 draws) | spread across draws | mean contrast SE | mean \|contrast\| |
 | --- | --- | --- | --- | --- |
-| 98 | 79% | 0.0260 | 0.045 | 1.73 |
-| 196 | 85% | 0.0200 | 0.037 | 1.86 |
-| **280 (deployed)** | **66%** | 0.0174 | 0.039 | 2.27 |
-| 560 | 40% | 0.0124 | 0.044 | 3.53 |
-| 1120 | 33% | 0.0092 | 0.044 | 4.84 |
+| 98 | 79.3% | **0.263** | 0.0260 | 0.045 |
+| 196 | 68.9% | **0.271** | 0.0200 | 0.037 |
+| **280 (deployed)** | **62.9%** | **0.125** | 0.0174 | 0.039 |
+| 560 | 49.1% | 0.229 | 0.0124 | 0.044 |
+| 1120 | 36.8% | 0.133 | 0.0092 | 0.044 |
 
 The contrast itself is flat; only the precision moves. The standard error shrinks
-at n^-0.43 against the n^-0.50 a correctly specified estimator earns. Under the
-simultaneous all-pairs rule, roughly 1,430 training trajectories would bring
-abstention to 30% (an extrapolation beyond the measured range). `COHORT_SIZE =
-400` is therefore a deliberate choice near the low end, not a tuned one — raise
-it and the agent recommends more, which is a statement about data, not about the
-method.
+at n^-0.41 (range 0.388-0.433 across draws) against the n^-0.50 a correctly
+specified estimator earns. Under the simultaneous all-pairs rule, roughly
+**1,641 training trajectories (1,273 to 2,164 across draws)** would bring
+abstention to 30% — an extrapolation beyond the measured range, and now one that
+says how much a single draw moves it. `COHORT_SIZE = 400` is therefore a
+deliberate choice near the low end, not a tuned one — raise it and the agent
+recommends more, which is a statement about data, not about the method.
+
+**Read the shape, not any one point.** The spread at a fixed size runs 0.125 to
+0.271, so the deployed 62.9% is a mean over draws that individually read 0.563
+to 0.688. The previously published single-draw figures — 79 / 85 / 66 / 40 / 33 —
+were non-monotone at the low end, which read as more data making the agent
+*less* decisive; replicated, the curve is monotone throughout.
 
 This table used to score only 60 patients, too few for a stable headline
-abstention estimate. The reference evaluation now uses 240 patients and must be
-regenerated whenever the decision threshold or its multiplicity correction
-changes. Do not lower `power.DEFAULT_PATIENTS` back.
+abstention estimate. The reference evaluation now uses 240 patients and four
+draws, and must be regenerated whenever the decision threshold or its
+multiplicity correction changes. Do not lower `power.DEFAULT_PATIENTS` or
+`power.DEFAULT_REPLICATES` back.
 
 **Does any of it survive data it was not fit on? `cli transfer` asks.** Every
 other number in this repo is measured on the process the estimators were built

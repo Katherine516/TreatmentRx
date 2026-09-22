@@ -498,7 +498,16 @@ class PowerCurveTests(unittest.TestCase):
     def setUpClass(cls):
         from treatmentrx.feedback.power import power_curve
 
-        cls.points = power_curve(sizes=(140, 400, 1120), n_patients=25, seed=909)
+        from treatmentrx.feedback.power import power_curves, average_curves
+
+        # Two draws rather than the deployed four: enough that the aggregation
+        # path is the one under test and that `equipoise_spread` is populated,
+        # few enough that this stays affordable. The numbers worth quoting need
+        # `cli power`, which draws four.
+        cls.curves = power_curves(
+            sizes=(140, 400, 1120), n_patients=25, seed=909, replicates=2
+        )
+        cls.points = average_curves(cls.curves)
 
     def test_more_data_means_fewer_abstentions(self):
         rates = [point.equipoise_rate for point in self.points]
@@ -528,11 +537,50 @@ class PowerCurveTests(unittest.TestCase):
         self.assertLess(exponent, 0.65)
 
     def test_the_sweep_restores_the_deployed_fit(self):
-        """It mutates a module global; anything after it must see the default."""
+        """It mutates two module globals; anything after it must see the default.
+
+        `COHORT_SEED` joined `COHORT_SIZE` when the sweep started replicating
+        over fits, and a restored size with a drifted seed would leave every
+        later test scoring against a cohort nobody chose.
+        """
         from treatmentrx.estimation import training
 
         self.assertEqual(training.COHORT_SIZE, 400)
+        self.assertEqual(training.COHORT_SEED, 7)
         self.assertEqual(len(training.fitted().train), 280)
+
+    def test_each_point_reports_every_draw_it_averaged(self):
+        """The property the replication exists for.
+
+        A point estimate with no spread beside it is what let a one-draw curve
+        read as a curve. Each point must carry its draws, and at the deployed
+        size they must actually differ — if they did not, refitting would be
+        buying nothing and the aggregation would be decoration.
+        """
+        for point in self.points:
+            with self.subTest(cohort_size=point.cohort_size):
+                self.assertEqual(point.replicates, 2)
+                self.assertEqual(len(point.equipoise_rates), 2)
+                self.assertAlmostEqual(
+                    point.equipoise_rate,
+                    sum(point.equipoise_rates) / 2,
+                    places=12,
+                )
+        self.assertGreater(
+            max(p.equipoise_spread for p in self.points),
+            0.0,
+            "no size moved between draws — the fit is not being redrawn",
+        )
+
+    def test_the_draws_are_different_fits_rather_than_different_patients(self):
+        """Scoring more patients cannot average a fit away, which is why this
+        replicates over the cohort seed. Same patient count in every draw, and
+        the same training size — only the cohort drawn differs."""
+        first, second = self.curves
+        for left, right in zip(first, second):
+            with self.subTest(cohort_size=left.cohort_size):
+                self.assertEqual(left.patients, right.patients)
+                self.assertEqual(left.train_size, right.train_size)
 
 
 class RidgeDefaultTests(unittest.TestCase):

@@ -445,11 +445,42 @@ class ModelCardStaysCurrentTests(unittest.TestCase):
         not come away with a point estimate."""
         abstention = self.card["known_limitations"]["abstention"]
         pooled = abstention["pooled_rate"]
-        for key in ("population_range", "stratum_range"):
+        for key in ("population_range", "stratum_range", "training_draw_range"):
             with self.subTest(key=key):
                 low, high = abstention[key]
                 self.assertLess(low, pooled)
                 self.assertGreater(high, pooled)
+
+    def test_the_training_draw_range_is_larger_than_patient_sampling(self):
+        """Why that field exists rather than another decimal on `pooled_rate`.
+
+        Three commands report a pooled rate for the deployed fit and disagree by
+        about 3 points, which is binomial noise on a rate this size. The spread
+        that matters is the *fit* — every patient scored shares one fitted
+        ensemble, so scoring more patients cannot reduce it. If the published
+        draw range ever narrowed to patient-sampling width, it would be
+        describing the wrong quantity. Invariant 78.
+        """
+        abstention = self.card["known_limitations"]["abstention"]
+        low, high = abstention["training_draw_range"]
+        patient_sampling = (0.66 * 0.34 / 240) ** 0.5
+        self.assertGreater(
+            high - low,
+            3.0 * patient_sampling,
+            f"draw range {high - low:.3f} is within patient-sampling noise "
+            f"({patient_sampling:.3f}) — is it measuring the fit?",
+        )
+
+    def test_the_card_says_why_its_own_figures_disagree(self):
+        """A reader who runs two commands and gets two numbers should find the
+        reason on the card rather than concluding one of them is a bug."""
+        text = self.card["known_limitations"]["abstention"][
+            "why_the_published_figures_differ"
+        ]
+        for command in ("cli power", "cli subgroups", "cli audit"):
+            with self.subTest(command=command):
+                self.assertIn(command, text)
+        self.assertIn("training_draw_range", text)
 
     def test_the_prose_points_at_the_ranges(self):
         """A number beside prose that does not mention it is the shape the
@@ -457,3 +488,4 @@ class ModelCardStaysCurrentTests(unittest.TestCase):
         text = self.card["known_limitations"]["abstention"]["what_it_means"]
         self.assertIn("population_range", text)
         self.assertIn("stratum_range", text)
+        self.assertIn("training_draw_range", text)

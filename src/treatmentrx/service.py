@@ -256,22 +256,44 @@ class RecommendationService:
                 "abstention": {
                     "pooled_rate": 0.66,
                     # The prose below has always said the pooled rate does not
-                    # transfer. These two fields say it in the only form a
-                    # consumer that reads numbers will see: `pooled_rate` was
-                    # the single machine-readable figure here, so the structure
-                    # invited exactly the reading the strings warn against.
-                    # Both are measured, not padded — `cli transfer` for the
-                    # population range and `cli subgroups` for the stratum one.
+                    # transfer. These fields say it in the only form a consumer
+                    # that reads numbers will see: `pooled_rate` was the single
+                    # machine-readable figure here, so the structure invited
+                    # exactly the reading the strings warn against. All three
+                    # are measured, not padded — `cli transfer` for the
+                    # population range, `cli subgroups` for the stratum one, and
+                    # `cli power` for the training-cohort one.
                     "population_range": [0.54, 0.89],
                     "stratum_range": [0.38, 0.97],
+                    # What a *different training cohort of the same size* gives,
+                    # which is the uncertainty nothing here used to carry.
+                    # Measured over four draws at n=400 (`cli power`): .663 .563
+                    # .604 .688. It is not patient sampling — that is about
+                    # 0.03 on a rate this size, and these span 0.125 — and it
+                    # cannot be reduced by scoring more patients, because every
+                    # patient shares the one fitted ensemble. See invariant 78.
+                    "training_draw_range": [0.563, 0.688],
                     "what_it_means": (
                         "The agent declines to separate arms for ~66% of "
                         "patients at this training size after simultaneous "
                         "all-pairs multiplicity correction. Equipoise is a "
                         "measured result, not a failure: see `cli power`. "
-                        "Read `population_range` and `stratum_range` before "
-                        "quoting the pooled figure: it describes this training "
-                        "population and this case mix, and nothing else."
+                        "Read `population_range`, `stratum_range` and "
+                        "`training_draw_range` before quoting the pooled "
+                        "figure: it describes this training population, this "
+                        "case mix and this one draw of the training cohort, "
+                        "and nothing else."
+                    ),
+                    "why_the_published_figures_differ": (
+                        "Three commands report a pooled rate for the deployed "
+                        "fit and they do not agree to the digit: `cli power` "
+                        "0.663 over its 240-patient reference set, "
+                        "`cli subgroups` 0.683, `cli audit` 0.692 over 120. "
+                        "That 3-point spread is patient sampling on a rate this "
+                        "size (about 0.03) and none of them is wrong. The "
+                        "spread worth knowing is four times larger and is "
+                        "`training_draw_range`: redraw the training cohort and "
+                        "the same size gives 0.563 to 0.688."
                     ),
                     # The pooled rate is the number a consumer will quote, but a
                     # clinician seeing equipoise for a seronegative patient is
