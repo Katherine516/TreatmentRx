@@ -76,6 +76,98 @@ def _criteria(metrics: dict[str, Any], *checks) -> list[str]:
     return blockers
 
 
+# The criteria each rung above SILENT gates on, declared once because two
+# things read them: `_blockers`, which turns them into gate messages, and
+# `instrumentation_coverage`, which asks how many are supplied at all. Inferring
+# the second from the first does not work — a criterion that is measured *and
+# passing* produces no blocker, so a blocker count cannot see it, and a rung with
+# one criterion met and one missing read as wholly uninstrumented.
+_RUNG_CRITERIA: dict[ValidationRung, tuple] = {
+    ValidationRung.SHADOW: (
+        ("safety_events", "no safety events in shadow", lambda v: v == 0),
+        ("concordance", "clinician concordance at least 0.5", lambda v: v >= 0.5),
+    ),
+    ValidationRung.ADVISORY: (
+        ("clinician_utility", "clinician utility positive", lambda v: v > 0.0),
+        ("fairness_clean", "fairness checks clean", bool),
+        ("irb_approved", "IRB approval", bool),
+    ),
+    ValidationRung.PRAGMATIC_TRIAL: (
+        ("trial_endpoint_met", "primary patient-benefit endpoint met", bool),
+    ),
+}
+
+# SILENT's messages are bespoke rather than built by `_criteria`, so its keys are
+# named here for the coverage report alone. `tests/test_layers.py` asserts they
+# are the ones `deployment_readiness()` actually supplies, because a list that
+# drifts from the gate it describes is invariant 33's defect.
+_SILENT_KEYS = (
+    "ope_effective_sample_size",
+    "sequential_ope_effective_sample_size",
+    "ope_improvement_lower",
+    "calibration_passed",
+    "blip_basis_unflagged",
+    "live_data",
+)
+
+
+def rung_criteria_keys(rung: ValidationRung) -> tuple[str, ...]:
+    """The readiness keys a rung gates on."""
+    if rung is ValidationRung.SILENT:
+        return _SILENT_KEYS
+    return tuple(key for key, _label, _test in _RUNG_CRITERIA.get(rung, ()))
+
+
+def instrumentation_coverage(metrics: dict[str, Any]) -> dict[str, Any]:
+    """Which rungs can be assessed at all, and which are only declarations.
+
+    The ladder describes four rungs and `training.deployment_readiness()`
+    supplies criteria for one. So a reader who sees `rung: silent` learns the
+    gate is shut and not that the three gates above it have nothing behind them
+    — a model that cleared SILENT would stall at SHADOW immediately, not on a
+    failure but on the absence of any measurement.
+
+    Derived by running the real gate rather than listing keys, so it cannot
+    drift from the thing it describes: a criterion counts as unmeasured exactly
+    when `_criteria` says so. That is invariant 33's lesson about a card figure
+    parting company with its study, applied before it happens rather than after.
+    """
+    rungs: dict[str, Any] = {}
+    instrumented = 0
+    for rung in ValidationRung:
+        status = ValidationLadder().assess(rung, metrics)
+        keys = rung_criteria_keys(rung)
+        supplied = [key for key in keys if key in metrics]
+        has_any = bool(supplied)
+        instrumented += has_any
+        rungs[rung.value] = {
+            "gate": status.gate_description,
+            "gate_passed": status.gate_passed,
+            "blockers": len(status.blockers),
+            "criteria": len(keys),
+            "criteria_measured": len(supplied),
+            "criteria_not_measured": len(keys) - len(supplied),
+            "missing": sorted(set(keys) - set(supplied)),
+            "instrumented": has_any,
+        }
+    return {
+        "rungs": rungs,
+        "rungs_instrumented": instrumented,
+        "rungs_total": len(rungs),
+        "note": (
+            "A rung with no instrumentation is a declaration, not a gate. The "
+            "two SHADOW criteria are built and measured elsewhere — "
+            "`cli audit` reports `safety_guarantee_violations` and "
+            "`retrospective_concordance` — and are deliberately NOT fed here: "
+            "`safety_events` means no patient was harmed while running beside "
+            "clinicians, and `concordance` means agreement with clinicians, "
+            "and a simulation supplies neither. Feeding them would let a gate "
+            "read satisfied on simulated patients, which is the rung-skip this "
+            "ladder exists to prevent."
+        ),
+    }
+
+
 class ValidationLadder:
     def assess(self, rung: ValidationRung, metrics: dict[str, Any]) -> ValidationStatus:
         blockers = self._blockers(rung, metrics)
@@ -94,30 +186,8 @@ class ValidationLadder:
             # `training.deployment_readiness()`, so absence is not a case that
             # arises, and the numbers are worth quoting.
             blockers.extend(self._silent_blockers(m))
-        elif rung is ValidationRung.SHADOW:
-            blockers.extend(
-                _criteria(
-                    m,
-                    ("safety_events", "no safety events in shadow", lambda v: v == 0),
-                    ("concordance", "clinician concordance at least 0.5", lambda v: v >= 0.5),
-                )
-            )
-        elif rung is ValidationRung.ADVISORY:
-            blockers.extend(
-                _criteria(
-                    m,
-                    ("clinician_utility", "clinician utility positive", lambda v: v > 0.0),
-                    ("fairness_clean", "fairness checks clean", bool),
-                    ("irb_approved", "IRB approval", bool),
-                )
-            )
-        elif rung is ValidationRung.PRAGMATIC_TRIAL:
-            blockers.extend(
-                _criteria(
-                    m,
-                    ("trial_endpoint_met", "primary patient-benefit endpoint met", bool),
-                )
-            )
+        else:
+            blockers.extend(_criteria(m, *_RUNG_CRITERIA.get(rung, ())))
         return blockers
 
     def _silent_blockers(self, m: dict[str, Any]) -> list[str]:
@@ -204,7 +274,23 @@ class ValidationLadder:
         # 65 points of interval coverage, and the interval narrows rather than
         # widens as it happens. A model whose contrasts are biased by an unknown
         # amount has no business advancing a rung.
-        if not m.get("blip_basis_unflagged", True):
+        # `m.get(key, True)` was the shape here, so an **absent** key read as
+        # "the basis is fine" — invariant 25's defect, in the one branch of this
+        # module its fix did not reach, and defaulting the unsafe way. The
+        # specification test runs on every fit so the key is always supplied
+        # today and this could not arise; what makes it worth repairing is that
+        # `calibration_passed` and `live_data` two lines either side both
+        # default to *blocking*, so this was the only criterion here whose
+        # silence was taken for a pass. Unmeasured and failing get different
+        # words, which is what a reader deciding whether to advance needs.
+        unflagged = m.get("blip_basis_unflagged")
+        if unflagged is None:
+            blockers.append(
+                "the blip-basis specification test was not run, so whether the "
+                "reported contrasts are biased by an omitted effect modifier is "
+                "unknown"
+            )
+        elif not unflagged:
             flagged = ", ".join(m.get("flagged_modifiers", [])) or "a candidate covariate"
             blockers.append(
                 f"the blip basis looks misspecified ({flagged} tests as an effect "

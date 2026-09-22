@@ -294,3 +294,84 @@ above now.
    dexamethasone and the rest by substring. A steroid recorded under a name the
    list does not carry becomes a treatment-line event and a phantom decision
    point. A real deployment maps these from RxNorm or ATC rather than free text.
+
+
+## 4. What a first *live* cohort must supply
+
+`training.deployment_readiness()` reports `live_data: False` and no code change
+clears it honestly — a held-out split of the cohort the model was fit on is not
+live data, however good the numbers on it look. This section is what would clear
+it, and every figure here is read from the code rather than chosen, so
+`tests/test_docs.py` can fail when the two part.
+
+### 4.1 What "live" has to mean
+
+Prospectively collected from the population the model would serve, with the
+model's output **not** influencing the arm chosen. That last clause is the whole
+point of the silent rung: once a recommendation can change a prescription, the
+record stops being an observation of the behaviour policy and the propensity
+model is estimating something else.
+
+### 4.2 How large, and the honest answer is low thousands
+
+The SILENT gate needs the **regime's own** value identified, not the
+per-decision one — `MIN_OPE_EFFECTIVE_SAMPLE` is **30**. At the deployed
+`COHORT_SIZE` of 400 trajectories (280 training, 120 evaluation) the regime
+reaches an effective sample of **14.6**, and only 3 of 120 holdout trajectories
+follow the regime to the end.
+
+Two independent prices, both extrapolations beyond what has been measured:
+
+* **~1,258 trajectories** to keep today's evaluation precision *and* add a final
+  test whose regime value is identified (`cli power`, `final_test_feasibility`).
+* **~1,641 trajectories, with draws spanning 1,273 to 2,164**, to bring
+  abstention to 30% (`cli power`; the range is what redrawing the training
+  cohort does, see invariant 78).
+
+They agree on the order of magnitude, which is the useful part: a first cohort
+of a few hundred patients does not clear the statistical gate, however clean it
+is.
+
+### 4.3 What the SILENT gate actually reads
+
+Six keys, and each can close the gate alone:
+
+| key | comes from |
+| --- | --- |
+| `ope_effective_sample_size` | the held-out split |
+| `sequential_ope_effective_sample_size` | the held-out split — the binding one |
+| `ope_improvement_lower` | the held-out split |
+| `calibration_passed` | the held-out split |
+| `blip_basis_unflagged` | the specification test, run on every fit |
+| `live_data` | **a fact about provenance, not a measurement** |
+
+### 4.4 What shadow mode needs, and what a simulation cannot give
+
+The SHADOW gate reads `safety_events` and `concordance`. Both are **built and
+measured** — `cli audit` reports `safety_guarantee_violations` and
+`retrospective_concordance` — and both are deliberately **withheld** from
+`deployment_readiness()`, because what they measure is not what the gate means:
+
+* `safety_events` means no patient was harmed while the model ran beside
+  clinicians. What is measured is whether Layer 4's own guarantee held on
+  simulated records.
+* `concordance` means agreement with clinicians. The reference available here is
+  the simulator's behaviour policy, which the agent is built to beat, so a
+  `>= 0.5` bar against it would block a correct system.
+
+A live cohort supplies the first directly (adverse events recorded against
+patients the model was silently scoring) and the second directly (the arm a
+clinician chose, against what the model would have said). Neither needs new
+statistics — they need a deployment.
+
+### 4.5 What must be ingested before the causal claim holds
+
+Four confounders are in the DAG and in no estimator basis, so
+`minimal_backdoor_set` reports them as unadjusted on every patient: **`age`,
+`comorbidity_burden`, `gender`, `steroid_use`**. The adjustment set does not
+satisfy the backdoor criterion until these are both *ingested* and *placed in a
+basis* — ingesting them alone changes nothing. Demographics are also what a
+fairness assessment would slice on, and nothing in this package computes one.
+
+Dispensing records (§3.2) are the other structural gap: without them adherence
+is an assumption and the ITT / per-protocol / as-treated split has no input.

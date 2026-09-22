@@ -170,7 +170,10 @@ class RecommendationService:
         from treatmentrx.data.dag import CausalDAGRegistry
         from treatmentrx.domain import ValidationRung
         from treatmentrx.estimation import training
-        from treatmentrx.feedback.validation_ladder import ValidationLadder
+        from treatmentrx.feedback.validation_ladder import (
+            ValidationLadder,
+            instrumentation_coverage,
+        )
 
         fit = training.fitted()
         specification = training.basis_specification()
@@ -251,6 +254,13 @@ class RecommendationService:
                 "gate_passed": validation.gate_passed,
                 "blockers": list(validation.blockers),
                 "retraining_allowed": False,
+                # `rung: silent` tells a reader this gate is shut. It does not
+                # tell them the three gates above it have nothing behind them —
+                # a model that cleared SILENT would stall at SHADOW at once, not
+                # on a failure but on the absence of any measurement. Derived by
+                # running the real gate, so it cannot drift from what it
+                # describes.
+                "instrumentation": instrumentation_coverage(readiness),
             },
             "known_limitations": {
                 "abstention": {

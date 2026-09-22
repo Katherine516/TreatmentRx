@@ -535,6 +535,10 @@ class FeedbackLayerTests(unittest.TestCase):
             "sequential_ope_effective_sample_size": 60.0,
             "ope_improvement_lower": 0.04,
             "calibration_passed": True,
+            # Explicit since an absent key stopped meaning "the basis is fine":
+            # these fixtures were relying on that default, which is how the
+            # unsafe one survived.
+            "blip_basis_unflagged": True,
             "live_data": True,
         }
         passed = ladder.assess(ValidationRung.SILENT, satisfied)
@@ -555,6 +559,10 @@ class FeedbackLayerTests(unittest.TestCase):
             "sequential_ope_effective_sample_size": 60.0,
             "ope_improvement_lower": 0.04,
             "calibration_passed": True,
+            # Explicit since an absent key stopped meaning "the basis is fine":
+            # these fixtures were relying on that default, which is how the
+            # unsafe one survived.
+            "blip_basis_unflagged": True,
             "live_data": True,
         }
         breaks = {
@@ -574,9 +582,21 @@ class FeedbackLayerTests(unittest.TestCase):
                 self.assertEqual(len(status.blockers), 1)
 
     def test_a_missing_measurement_is_a_blocker_not_a_pass(self):
+        """Every SILENT criterion, absent, must produce its own blocker.
+
+        Derived from `_SILENT_KEYS` rather than a literal, which is what caught
+        that the list was one short: `ope_improvement_lower` gates and was not
+        declared. A hardcoded count moves silently when a criterion is added.
+        """
+        from treatmentrx.feedback.validation_ladder import _SILENT_KEYS
+
         status = ValidationLadder().assess(ValidationRung.SILENT, {})
         self.assertFalse(status.gate_passed)
-        self.assertEqual(len(status.blockers), 5)
+        self.assertEqual(
+            len(status.blockers),
+            len(_SILENT_KEYS),
+            f"{len(_SILENT_KEYS)} declared criteria, {len(status.blockers)} blockers",
+        )
 
     def test_this_build_can_never_pass_the_silent_gate(self):
         """`live_data` is structural: a held-out split of the training cohort is not
@@ -1690,3 +1710,83 @@ class EnsembleRegimeLabelTests(unittest.TestCase):
         weights = sorted(audit["model_weights"].values(), reverse=True)
         self.assertLess(weights[0] - weights[1], 0.05, "weights are no longer near-tied")
         self.assertEqual(audit["regime_type"], RegimeType.HYBRID.value)
+
+
+class RungCriteriaDeclarationTests(unittest.TestCase):
+    """One declaration of what each rung gates on, read by two things.
+
+    `_blockers` turns the criteria into gate messages and
+    `instrumentation_coverage` asks how many are supplied at all. Deriving the
+    second from the first does not work: a criterion that is measured *and
+    passing* produces no blocker, so a blocker count cannot see it, and a rung
+    with one criterion met and one missing read as wholly uninstrumented. That
+    was a real bug, caught by a test asserting the coverage was derived.
+    """
+
+    def test_the_silent_keys_are_the_ones_readiness_supplies(self):
+        """SILENT's messages are bespoke, so its keys are named separately —
+        and a list that drifts from the gate it describes is invariant 33's
+        defect, here on the readiness metrics instead of the model card."""
+        from treatmentrx.estimation import training
+        from treatmentrx.feedback.validation_ladder import _SILENT_KEYS
+
+        readiness = training.deployment_readiness()
+        for key in _SILENT_KEYS:
+            with self.subTest(key=key):
+                self.assertIn(key, readiness)
+
+    def test_every_silent_key_can_close_the_gate_on_its_own(self):
+        """Which is what makes the list the *gating* keys rather than a
+        selection of things that happen to be measured."""
+        from treatmentrx.domain import ValidationRung
+        from treatmentrx.estimation import training
+        from treatmentrx.feedback.validation_ladder import (
+            ValidationLadder,
+            _SILENT_KEYS,
+        )
+
+        healthy = dict(training.deployment_readiness())
+        healthy["live_data"] = True
+        healthy["ope_effective_sample_size"] = 999.0
+        healthy["sequential_ope_effective_sample_size"] = 999.0
+        healthy["calibration_passed"] = True
+        healthy["blip_basis_unflagged"] = True
+        ladder = ValidationLadder()
+        self.assertEqual(
+            ladder.assess(ValidationRung.SILENT, healthy).blockers,
+            [],
+            "the gate cannot open even when every criterion is satisfied",
+        )
+        for key in _SILENT_KEYS:
+            broken = dict(healthy)
+            del broken[key]
+            with self.subTest(key=key):
+                self.assertTrue(
+                    ladder.assess(ValidationRung.SILENT, broken).blockers,
+                    f"removing {key} did not close the gate — it is not gating",
+                )
+
+    def test_the_upper_rungs_read_their_declaration(self):
+        """A criterion added to `_RUNG_CRITERIA` must reach the gate, or the
+        declaration and the gate have parted."""
+        from treatmentrx.domain import ValidationRung
+        from treatmentrx.feedback.validation_ladder import (
+            ValidationLadder,
+            rung_criteria_keys,
+        )
+
+        ladder = ValidationLadder()
+        for rung in (
+            ValidationRung.SHADOW,
+            ValidationRung.ADVISORY,
+            ValidationRung.PRAGMATIC_TRIAL,
+        ):
+            keys = rung_criteria_keys(rung)
+            self.assertTrue(keys, f"{rung.name} declares no criteria")
+            blockers = ladder.assess(rung, {}).blockers
+            with self.subTest(rung=rung.name):
+                self.assertEqual(
+                    len(blockers),
+                    len(keys),
+                    f"{rung.name}: {len(keys)} criteria, {len(blockers)} blockers",
+                )

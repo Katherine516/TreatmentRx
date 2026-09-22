@@ -489,3 +489,57 @@ class ModelCardStaysCurrentTests(unittest.TestCase):
         self.assertIn("population_range", text)
         self.assertIn("stratum_range", text)
         self.assertIn("training_draw_range", text)
+
+
+class LadderInstrumentationTests(unittest.TestCase):
+    """The card says the gate is shut; it should also say what is behind it.
+
+    The ladder describes four rungs and `deployment_readiness()` supplies
+    criteria for one. A model that cleared SILENT would stall at SHADOW
+    immediately — not on a failure but on the absence of any measurement — and
+    nothing on the card said so.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.card = RecommendationService().model_card()
+        cls.coverage = cls.card["validation"]["instrumentation"]
+
+    def test_only_the_first_rung_is_instrumented(self):
+        rungs = self.coverage["rungs"]
+        self.assertTrue(rungs["silent"]["instrumented"])
+        self.assertEqual(rungs["silent"]["criteria_not_measured"], 0)
+        for name in ("shadow", "advisory", "pragmatic_trial"):
+            with self.subTest(rung=name):
+                self.assertFalse(rungs[name]["instrumented"])
+                self.assertGreater(rungs[name]["criteria_not_measured"], 0)
+        self.assertEqual(self.coverage["rungs_instrumented"], 1)
+        self.assertEqual(self.coverage["rungs_total"], 4)
+
+    def test_it_is_derived_from_the_gate_and_not_hardcoded(self):
+        """The property that keeps it from going stale.
+
+        Supply one of SHADOW's criteria and that rung must flip to instrumented
+        without anyone editing a literal. A hardcoded "1 of 4" would not move.
+        """
+        from treatmentrx.feedback.validation_ladder import instrumentation_coverage
+        from treatmentrx.estimation import training
+
+        readiness = dict(training.deployment_readiness())
+        self.assertFalse(
+            instrumentation_coverage(readiness)["rungs"]["shadow"]["instrumented"]
+        )
+        readiness["safety_events"] = 0
+        widened = instrumentation_coverage(readiness)
+        self.assertTrue(widened["rungs"]["shadow"]["instrumented"])
+        self.assertEqual(widened["rungs"]["shadow"]["criteria_not_measured"], 1)
+        self.assertEqual(widened["rungs_instrumented"], 2)
+
+    def test_the_note_says_why_the_shadow_criteria_are_not_fed(self):
+        """Both are built and measured in `cli audit`; withholding them is a
+        decision and the card has to carry the reason, or the next reader wires
+        them in to close the gap."""
+        note = self.coverage["note"]
+        self.assertIn("safety_events", note)
+        self.assertIn("concordance", note)
+        self.assertIn("simulation", note)

@@ -363,3 +363,76 @@ class StaleFigureTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DeploymentContractTests(unittest.TestCase):
+    """`docs/INPUT_DATA.md` §4 states what a first live cohort must supply.
+
+    Every figure in it is read from the code, so the two can be checked against
+    each other. A contract that drifts from what the gate actually reads is
+    worse than none: it tells whoever is assembling a cohort to collect the
+    wrong things, and nothing would catch it — the same defect the model card's
+    abstention range had (invariant 33), on a document instead of a field.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import pathlib
+
+        root = pathlib.Path(__file__).resolve().parent.parent
+        cls.text = (root / "docs" / "INPUT_DATA.md").read_text(encoding="utf-8")
+        cls.section = cls.text[cls.text.index("## 4. What a first"):]
+
+    def test_it_names_the_effective_sample_threshold_the_gate_uses(self):
+        from treatmentrx.feedback.validation_ladder import MIN_OPE_EFFECTIVE_SAMPLE
+
+        self.assertIn(f"**{MIN_OPE_EFFECTIVE_SAMPLE:.0f}**", self.section)
+
+    def test_it_lists_exactly_the_silent_criteria(self):
+        """Six keys, each able to close the gate alone. A doc that lists five
+        tells a reader one of them does not matter."""
+        from treatmentrx.feedback.validation_ladder import _SILENT_KEYS
+
+        for key in _SILENT_KEYS:
+            with self.subTest(key=key):
+                self.assertIn(f"`{key}`", self.section)
+
+    def test_it_lists_exactly_the_unadjusted_confounders(self):
+        """Ingesting the wrong four would leave the backdoor criterion unmet
+        with nothing to show for the work."""
+        from treatmentrx.data.dag import CausalDAGRegistry
+        from treatmentrx.data.fhir import FHIRAdapter
+        from treatmentrx.demo_data import sample_ra_bundle
+
+        patient = FHIRAdapter().parse_bundle(sample_ra_bundle())
+        unmodelled = CausalDAGRegistry().unmodelled_confounders(patient)
+        self.assertTrue(unmodelled, "no unadjusted confounders to document")
+        for name in unmodelled:
+            with self.subTest(confounder=name):
+                self.assertIn(f"`{name}`", self.section)
+
+    def test_it_names_the_shadow_criteria_it_says_are_withheld(self):
+        from treatmentrx.domain import ValidationRung
+        from treatmentrx.feedback.validation_ladder import rung_criteria_keys
+
+        for key in rung_criteria_keys(ValidationRung.SHADOW):
+            with self.subTest(key=key):
+                self.assertIn(f"`{key}`", self.section)
+
+    def test_the_withheld_criteria_are_genuinely_withheld(self):
+        """The section claims both are kept out of the readiness metrics. If
+        someone wires one in, the document becomes wrong in the direction that
+        matters — it would be describing a gate that had quietly opened."""
+        from treatmentrx.domain import ValidationRung
+        from treatmentrx.estimation import training
+        from treatmentrx.feedback.validation_ladder import rung_criteria_keys
+
+        readiness = training.deployment_readiness()
+        for key in rung_criteria_keys(ValidationRung.SHADOW):
+            with self.subTest(key=key):
+                self.assertNotIn(key, readiness)
+
+    def test_it_states_the_deployed_cohort_size(self):
+        from treatmentrx.estimation import training
+
+        self.assertIn(str(training.COHORT_SIZE), self.section)

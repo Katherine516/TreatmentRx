@@ -8,7 +8,7 @@ test fixture, not evidence.
 ## Commands
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests    # 710 tests, ~7 min
+PYTHONPATH=src python3 -m unittest discover -s tests    # 722 tests, ~7 min
 PYTHONPATH=src python3 -m treatmentrx.cli demo          # one patient end to end
 PYTHONPATH=src python3 -m treatmentrx.cli evaluate      # estimator scorecard
 PYTHONPATH=src python3 -m treatmentrx.cli stability     # k-fold + seed sweep (~10s)
@@ -115,12 +115,12 @@ has already gone wrong on it. Read the row before the diff, not after.
 | the arm and molecule vocabularies | 3, 62, 63 |
 | Layer 1 ingestion and the contract | 6, 13, 51, 64 |
 | policy value and off-policy evaluation | 30, 39, 41, 42, 43 |
-| the validation gate | 14, 25, 41, 79 |
+| the validation gate | 14, 25, 41, 79, 80 |
 | the blip basis | 57, 68, 72 |
 | the safety layer | 1, 35, 54, 61, 70 |
 | `cli audit` and the layer sections | 2, 33, 36, 62, 65, 66, 69 |
 
-It reaches **55 of 79**. The rest are one-offs — a single
+It reaches **56 of 80**. The rest are one-offs — a single
 component, found once, unlikely to be what you are holding — and they are not
 listed here because a row of one is not an index, it is a search result.
 `tests/test_docs.py` derives this table from the invariant bodies and fails when
@@ -3114,6 +3114,63 @@ it goes stale, which is the only thing that makes an index worth having.
    simulation, which is the rung-skip invariant 25 exists to refuse. Tests
    assert both keys stay **absent** from `deployment_readiness()` and that the
    SHADOW gate keeps blocking on them.
+
+80. **The card said the gate was shut and not that three of four gates have
+   nothing behind them — and deriving that turned up two live defects.**
+   Invariant 79 established that the ladder above SILENT is uninstrumented.
+   `validation.instrumentation` now reports it: **1 of 4 rungs** measured, with
+   the missing keys named per rung. It is derived by running the real gate
+   rather than listing literals, because a card figure that parts company with
+   its source is invariant 33's defect and this is a four-line summary of a
+   module that changes.
+
+   **The first derivation was wrong in a way worth recording.** It inferred
+   "measured" from the blockers — count those saying *not measured* and compare
+   with the total. That cannot see a criterion which is measured **and
+   passing**, because a passing criterion produces no blocker at all. Supplying
+   `safety_events: 0` left SHADOW reading uninstrumented, which a test asserting
+   the report was derived caught immediately. The repair is one declaration:
+   `_RUNG_CRITERIA` and `_SILENT_KEYS` are read by `_blockers`, which turns them
+   into gate messages, and by `instrumentation_coverage`, which asks how many
+   are supplied. Two readers, one list — invariant 3's rule on the ladder.
+
+   **`blip_basis_unflagged` defaulted to passing.** `m.get("blip_basis_unflagged",
+   True)`: an **absent** key read as "the basis is fine". That is invariant 25's
+   defect — `metrics.get(key, default)` conflating "measured and passing" with
+   "nobody measured this" — in the one branch of this module its fix did not
+   reach, and defaulting the unsafe way. What sharpens it is the neighbours:
+   `calibration_passed` two lines above and `live_data` two lines below both
+   default to **blocking**, so this was the only SILENT criterion whose silence
+   was taken for a pass. Latent today, because the specification test runs on
+   every fit and always supplies the key — and latent is exactly how the
+   original one survived.
+
+   **Seven existing tests broke, and every one was right to.** Their "satisfied"
+   fixtures omitted `blip_basis_unflagged` and passed *because* of the unsafe
+   default, which is the clearest possible evidence it was load-bearing. They
+   set it explicitly now.
+
+   **And `_SILENT_KEYS` was one short.** `ope_improvement_lower` gates and was
+   not declared, which surfaced only because
+   `test_a_missing_measurement_is_a_blocker_not_a_pass` stopped asserting the
+   literal `5` and started asserting `len(_SILENT_KEYS)`. A hardcoded count
+   moves silently when a criterion is added; a derived one does not. That is
+   this repo's own convention — *prefer making a test data-driven over
+   hard-coding the new answer* — paying for itself in the same sitting.
+
+   **`docs/INPUT_DATA.md` §4 is the other half**: what a first *live* cohort
+   must supply, with every figure read from the code so `tests/test_docs.py`
+   fails when the two part. It states the order of magnitude honestly —
+   **~1,258 trajectories** for an identified final test and **~1,641 (1,273 to
+   2,164)** for 30% abstention, against 400 today, so a first cohort of a few
+   hundred does not clear the statistical gate however clean it is. It names the
+   six SILENT keys, the four unadjusted confounders (`age`,
+   `comorbidity_burden`, `gender`, `steroid_use`) that must be ingested **and
+   placed in a basis** before the backdoor criterion holds, and the two SHADOW
+   criteria that are built, measured and deliberately withheld. A test asserts
+   that last part is still true — if someone wires one in, the document becomes
+   wrong in the direction that matters, describing a gate that had quietly
+   opened.
 
 ## What is real vs. still a placeholder
 
