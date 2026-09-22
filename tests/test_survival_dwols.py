@@ -19,6 +19,7 @@ from __future__ import annotations
 import math
 import statistics
 import unittest
+from dataclasses import replace
 
 from treatmentrx.estimation import survival_dwols as sd
 from treatmentrx.simulation import survival_cohort as sc
@@ -203,13 +204,17 @@ class WeightingTests(unittest.TestCase):
             f"weighted imbalance {weighted:.4f} against unweighted {unweighted:.4f}",
         )
 
-    def test_ipcw_removes_bias_rather_than_decorating_the_fit(self):
-        """Complete-case analysis drops every row that did not progress, and
-        those rows are not missing at random. Scored as a bias, pooled over
-        seeds: the correction earns its place or it comes out."""
+    def test_ipcw_removes_bias_on_the_complete_case_comparator(self):
+        """IPCW is the *comparator* path's correction, not the deployed one.
+
+        Buckley-James keeps the censored rows and handles them by imputation, so
+        there is no censoring weight left to remove — monkeypatching it away
+        changes nothing, which is how this test caught its own premise going
+        stale when the default changed. It now builds the comparator explicitly.
+        """
         cohorts = [sc.generate_survival_cohort(_N, seed=s) for s in _WEIGHTING_SEEDS]
         with_ipcw = sum(abs(v) for v in _pooled_bias(
-            [sd.SurvivalBlipModel(c) for c in cohorts]).values())
+            [sd.SurvivalBlipModel(c, use_buckley_james=False) for c in cohorts]).values())
 
         original = sd.SurvivalBlipModel._rows_for
 
@@ -222,7 +227,7 @@ class WeightingTests(unittest.TestCase):
         try:
             sd.SurvivalBlipModel._rows_for = without
             naive = sum(abs(v) for v in _pooled_bias(
-                [sd.SurvivalBlipModel(c) for c in cohorts]).values())
+                [sd.SurvivalBlipModel(c, use_buckley_james=False) for c in cohorts]).values())
         finally:
             sd.SurvivalBlipModel._rows_for = original
 
@@ -231,6 +236,104 @@ class WeightingTests(unittest.TestCase):
             with_ipcw * 1.2,
             f"IPCW bias {with_ipcw:.4f} against complete-case {naive:.4f}",
         )
+
+
+class BuckleyJamesTests(unittest.TestCase):
+    """Keeping the censored rows rather than weighting the survivors.
+
+    Invariant 77. The censored rows are not missing at random — they are
+    right-censored, and what is known is that the event came later than the time
+    recorded. Discarding them and reweighting the rest cannot recover that when
+    the truncation is administrative, which invariant 76 measured.
+    """
+
+    SEEDS = (71, 72, 73, 74, 75, 76)
+    SIZE = 1500
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cohorts = [sc.generate_survival_cohort(cls.SIZE, seed=s) for s in cls.SEEDS]
+        cls.imputed = [sd.SurvivalBlipModel(c) for c in cls.cohorts]
+        cls.complete = [
+            sd.SurvivalBlipModel(c, use_buckley_james=False) for c in cls.cohorts
+        ]
+
+    def test_it_is_the_default(self):
+        """The comparator has to be asked for by name, not stumbled into."""
+        self.assertTrue(self.imputed[0].use_buckley_james)
+        self.assertTrue(all(fit.imputed for fit in self.imputed[0].fits.values()))
+        self.assertFalse(any(fit.imputed for fit in self.complete[0].fits.values()))
+
+    def test_the_censored_rows_are_kept(self):
+        """The whole mechanism in one assertion: the comparator throws them
+        away and this does not."""
+        kept = self.imputed[0]._rows_for(self.cohorts[0], "arm-b")
+        dropped = self.complete[0]._rows_for(self.cohorts[0], "arm-b")
+        self.assertGreater(len(kept), len(dropped))
+        self.assertTrue(any(not row.event_observed for row in kept))
+        self.assertTrue(all(row.event_observed for row in dropped))
+        self.assertTrue(all(row.censor_weight == 1.0 for row in kept),
+                        "imputation and a censoring weight would count it twice")
+
+    def test_it_recovers_the_parameters_better_than_the_complete_case(self):
+        """The reason it is the default, scored as a bias pooled over seeds."""
+        imputed = sum(abs(v) for v in _pooled_bias(self.imputed).values())
+        complete = sum(abs(v) for v in _pooled_bias(self.complete).values())
+        self.assertLess(
+            imputed,
+            complete,
+            f"Buckley-James bias {imputed:.4f} against complete case {complete:.4f}",
+        )
+
+    def test_the_shape_comes_from_the_recorded_times(self):
+        """The bug this nearly shipped with.
+
+        The shape describes the error distribution, and a censoring indicator
+        only means something against the time actually observed. Scored against
+        the *imputed* residuals instead — which is what the first integration
+        did — it reads about 1.343 against a true 1.4. From the recorded ones it
+        reads about 1.403. That is a 4% scale error on every published `psi`,
+        because `psi = -shape * coefficient`.
+        """
+        shapes = [model.shape for model in self.imputed]
+        self.assertAlmostEqual(
+            statistics.mean(shapes),
+            sc.WEIBULL_SHAPE,
+            delta=0.04,
+            msg=f"shapes {[round(s, 4) for s in shapes]}",
+        )
+
+    def test_the_inflation_is_applied_to_buckley_james_and_only_to_it(self):
+        """The wiring, which is what a test can settle here.
+
+        Whether `_BJ_SE_INFLATION` is *calibrated* is a 20-refit measurement and
+        is recorded in the constant's comment, not asserted here: at the six
+        seeds this suite can afford, `pstdev` underestimates the sampling spread
+        badly enough that the comparison passes whatever the constant says. The
+        first version of this test did exactly that — it compared a reported SE
+        against a spread of 0.039 where 20 refits give 0.102, so it could not
+        have failed for the right reason. Invariant 25's defect, found by
+        writing a second test that contradicted the first.
+        """
+        probe = {"biomarker_std": 0.3, "marker_positive": 1.0, "prior_line": 1.0,
+                 "performance_status": 0.35}
+        self.assertGreater(sd._BJ_SE_INFLATION, 1.0)
+        for arm in ("arm-a", "arm-b", "arm-c"):
+            imputed_fit = self.imputed[0].fits[arm]
+            complete_fit = self.complete[0].fits[arm]
+            with self.subTest(arm=arm):
+                self.assertTrue(imputed_fit.imputed)
+                self.assertFalse(complete_fit.imputed)
+                # Same fit, inflation off: the published number must be exactly
+                # the constant times the uninflated one, so a later change
+                # cannot quietly drop it.
+                bare = replace(imputed_fit, imputed=False)
+                self.assertAlmostEqual(
+                    imputed_fit.standard_error(probe),
+                    sd._BJ_SE_INFLATION * bare.standard_error(probe),
+                    places=12,
+                )
+                self.assertGreater(bare.standard_error(probe), 0.0)
 
 
 class CensoringCurveTests(unittest.TestCase):

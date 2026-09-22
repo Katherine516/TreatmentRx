@@ -103,13 +103,30 @@ a Cox partial likelihood:
   *patients* are not selected. Censoring costs more at line 3 (+0.1357) than at
   line 1 (+0.0822), which is the two stacking.
 
-  So the direction is a **censored-data likelihood** — an AFT fit that admits
-  right-censored rows rather than discarding them, or Buckley-James imputation —
-  plus an inverse-probability-of-being-at-risk weight for the sequential
-  selection. Both are larger than swapping a nuisance model, and neither is
-  attempted here; this file is the first pass at the estimand. What is not
-  acceptable is either the assumption going unstated or the wrong repair being
-  left in the docs for whoever picks this up.
+  **The first of those is now what ships, and the second turned out not to be a
+  repair at all.** `use_buckley_james=True` is the default: censored rows are
+  kept and imputed rather than discarded and reweighted, so there is no
+  censoring weight on the deployed path. Measured over 20 refits at n=2000:
+
+  | | complete case + IPCW | Buckley-James |
+  | --- | --- | --- |
+  | total absolute bias | 0.4023 | **0.2978** |
+  | shape error | 0.0104 | **0.0030** |
+  | worst SE / actual spread | 0.91 | **1.03** |
+
+  The at-risk weight that paragraph also promised — `1 / P(reach line j)` from
+  the baseline covariates — makes the bias **worse**, 0.2122 to 0.2220 on the
+  measurement that set this up. There is a reason: given `X_j` the line-j
+  outcome is independent of how the patient got there, so selection on X alone
+  does not bias a correctly specified regression and the weight only adds
+  variance. The covariate shift across lines is real and harmless. Stratifying
+  the residual Kaplan-Meier on the remaining horizon buys 0.6% and is also not
+  taken.
+
+  What remains: Buckley-James closes about 40% of the gap to the no-censoring
+  floor rather than all of it, because its own assumption — censoring
+  independent of the residual given the covariates — is not exactly true when
+  the remaining horizon depends on history the covariates do not carry.
 
 The propensity is **fitted, never read off the generator**, for the reason
 `dwols.py` gives: the true assignment probability does not exist in real data,
@@ -161,6 +178,7 @@ softmax and there is no natural way to bend it.
 
 from __future__ import annotations
 
+import bisect
 import math
 from dataclasses import dataclass
 
@@ -192,6 +210,24 @@ SURVIVAL_TREATMENT_FREE_BASIS = (
 )
 
 _RIDGE = 1e-6
+# Buckley-James iteration. It converges quickly here — measured, every arm fit
+# on the deployed cohort settles inside ten passes — and the cap exists so a
+# cohort that cycles fails slowly rather than forever.
+_BJ_MAX_ITERATIONS = 25
+_BJ_TOLERANCE = 1e-7
+# Buckley-James's asymptotic variance is **not** the least-squares sandwich: the
+# imputation carries uncertainty the sandwich cannot see, because it treats an
+# imputed response as though it had been observed. Measured rather than assumed,
+# the way `inference.SANDWICH_INFLATION` was — 20 refits at n=2000, reported SE
+# against the estimator's actual spread across those refits, at one probe
+# covariate point per arm:
+#
+#   arm-a 0.98   arm-b 0.76   arm-c 0.84   mean 0.86
+#
+# So an honest interval is about 1/0.76 = 1.32x wider at the worst arm. Set at
+# the conservative end, as `SANDWICH_INFLATION` is, because an interval that is
+# too narrow somewhere is not repaired by being right on average.
+_BJ_SE_INFLATION = 1.35
 _PROPENSITY_FLOOR = 0.05
 _PROPENSITY_CEILING = 0.95
 # Gumbel spread to Weibull shape: sd = pi / (k sqrt(6)).
@@ -217,6 +253,7 @@ class _Row:
     log_months: float
     censor_weight: float
     cluster: int
+    event_observed: bool = True   # False for a row that never progressed
 
 
 def kaplan_meier_censoring(
@@ -258,6 +295,38 @@ def kaplan_meier_censoring(
     return curve
 
 
+def _residual_km_jumps(
+    residuals: list[float], observed: list[bool]
+) -> list[tuple[float, float]]:
+    """Kaplan-Meier of the *residual* distribution, as (residual, jump) pairs.
+
+    Buckley-James needs `E[e | e > e_i]`, and the residual distribution is
+    exactly what is left unspecified by an AFT fit — so it is estimated rather
+    than assumed Gumbel. Assuming it would make this a parametric Weibull fit by
+    a different route, and the point of the semiparametric form is that the
+    imputation does not inherit the baseline's misspecification.
+    """
+    order = sorted(range(len(residuals)), key=lambda i: residuals[i])
+    total = len(order)
+    survival = 1.0
+    at_risk = total
+    jumps: list[tuple[float, float]] = []
+    index = 0
+    while index < total:
+        value = residuals[order[index]]
+        tied = events = 0
+        while index + tied < total and residuals[order[index + tied]] == value:
+            events += 1 if observed[order[index + tied]] else 0
+            tied += 1
+        if events and at_risk > 0:
+            previous = survival
+            survival *= 1.0 - events / at_risk
+            jumps.append((value, previous - survival))
+        at_risk -= tied
+        index += tied
+    return jumps
+
+
 def _censoring_survival(curve: list[tuple[float, float]], time: float) -> float:
     """S_C just before `time`, which is what the IPCW weight divides by."""
     survival = 1.0
@@ -285,6 +354,7 @@ class SurvivalArmFit:
     clusters: list[int]
     n_rows: int
     _bread: list[list[float]]
+    imputed: bool = False             # fitted by Buckley-James
 
     @property
     def psi(self) -> list[float]:
@@ -309,6 +379,13 @@ class SurvivalArmFit:
         than hidden, because at these sample sizes the residual spread is far
         better determined than the coefficients and folding it in would imply a
         precision this does not have.
+
+        Under Buckley-James the sandwich is widened by `_BJ_SE_INFLATION`,
+        because the imputation's uncertainty is invisible to a variance computed
+        as though every response had been observed. That constant is measured;
+        see its comment. Without it this reads 0.76 of the estimator's actual
+        spread at the worst arm, which is an interval a quarter too narrow on a
+        published quantity.
         """
         if not self.covariance:
             return 0.0
@@ -317,7 +394,8 @@ class SurvivalArmFit:
         for offset, value in enumerate(hazard_basis(features)):
             loading[n_free + offset] = value
         variance = max(linalg.quadratic_form(loading, self.covariance), 0.0)
-        return self.shape * math.sqrt(variance)
+        inflation = _BJ_SE_INFLATION if self.imputed else 1.0
+        return inflation * self.shape * math.sqrt(variance)
 
 
 class SurvivalBlipModel:
@@ -332,11 +410,16 @@ class SurvivalBlipModel:
         trajectories: list[SurvivalTrajectory],
         arms: tuple[str, ...] = SURVIVAL_ARMS,
         reference: str = SURVIVAL_REFERENCE_ARM,
+        use_buckley_james: bool = True,
     ) -> None:
         if not trajectories:
             raise ValueError("Cannot fit a survival blip model on an empty cohort")
         self.arms = arms
         self.reference = reference
+        # `False` reproduces the complete-case-plus-IPCW fit this file shipped
+        # first, kept as a measured comparator the way `ra_cohort`'s
+        # `treat_censored_as_terminal` is. Nothing should set it but a study.
+        self.use_buckley_james = use_buckley_james
         self.censoring_curve = kaplan_meier_censoring(trajectories)
         self.fits: dict[str, SurvivalArmFit] = {}
         for arm in arms:
@@ -348,29 +431,37 @@ class SurvivalBlipModel:
                 self.fits[arm] = fit
 
     def _rows_for(self, trajectories, arm: str) -> list[_Row]:
-        """Uncensored rows on `arm` or the reference, IPCW-weighted.
+        """Rows on `arm` or the reference.
 
-        Complete case by construction: a row whose follow-up ended without
-        progression carries no observed event time, so it enters through the
-        weight on the rows that did rather than as a row of its own.
+        Under Buckley-James every row is kept, carrying whether its event was
+        observed, and `censor_weight` is 1.0 — censoring is handled by the
+        imputation rather than by a weight, and applying both would count it
+        twice. Under the complete-case comparator only progressions are kept and
+        each carries `1 / S_C(t)`, which is what this file shipped first.
         """
         rows: list[_Row] = []
         for trajectory in trajectories:
             for stage in trajectory.stages:
-                if stage.arm not in (arm, self.reference):
+                if stage.arm not in (arm, self.reference) or stage.months <= 0.0:
                     continue
-                if stage.cause != "progression" or stage.months <= 0.0:
-                    continue
-                survival = _censoring_survival(self.censoring_curve, stage.months)
-                if survival <= 0.0:
-                    continue
+                observed = stage.cause == "progression"
+                if self.use_buckley_james:
+                    weight = 1.0
+                else:
+                    if not observed:
+                        continue
+                    survival = _censoring_survival(self.censoring_curve, stage.months)
+                    if survival <= 0.0:
+                        continue
+                    weight = 1.0 / survival
                 rows.append(
                     _Row(
                         features=stage.features,
                         assignment=1.0 if stage.arm == arm else 0.0,
                         log_months=math.log(stage.months),
-                        censor_weight=1.0 / survival,
+                        censor_weight=weight,
                         cluster=trajectory.patient_index,
+                        event_observed=observed,
                     )
                 )
         return rows
@@ -418,18 +509,43 @@ class SurvivalBlipModel:
             weights.append(abs(row.assignment - propensity) * row.censor_weight)
             clusters.append(row.cluster)
 
+        if sum(weights) <= 0.0:
+            return None
+        observed = [row.event_observed for row in rows]
         beta = linalg.weighted_least_squares(design, targets, weights, ridge=_RIDGE)
+
+        if self.use_buckley_james:
+            beta, targets = self._buckley_james(design, targets, weights, observed, beta)
+
         residuals = [y - linalg.dot(row, beta) for row, y in zip(design, targets)]
 
-        # The Weibull shape, from the Gumbel spread of the residuals. Weighted,
-        # because the rows are.
-        total_weight = sum(weights)
-        if total_weight <= 0.0:
-            return None
-        mean = sum(w * r for w, r in zip(weights, residuals)) / total_weight
-        variance = sum(
-            w * (r - mean) ** 2 for w, r in zip(weights, residuals)
-        ) / total_weight
+        # The Weibull shape, from the Gumbel spread of the residuals.
+        if self.use_buckley_james:
+            # From the residual Kaplan-Meier on the **recorded** times, not the
+            # imputed ones. The shape describes the error distribution, and a
+            # censoring indicator only means something against the time actually
+            # observed; scoring it against the imputed residuals moves every row
+            # that was censored and reads 1.343 against a true 1.4, where this
+            # reads 1.406. The sandwich below is the other half of that split —
+            # it describes the estimating equation that was solved, so it uses
+            # the imputed residuals.
+            recorded = [
+                row.log_months - linalg.dot(x, beta) for x, row in zip(design, rows)
+            ]
+            jumps = _residual_km_jumps(recorded, observed)
+            mass = sum(jump for _value, jump in jumps)
+            if mass <= 0.0:
+                return None
+            mean = sum(value * jump for value, jump in jumps) / mass
+            variance = sum(
+                jump * (value - mean) ** 2 for value, jump in jumps
+            ) / mass
+        else:
+            total_weight = sum(weights)
+            mean = sum(w * r for w, r in zip(weights, residuals)) / total_weight
+            variance = sum(
+                w * (r - mean) ** 2 for w, r in zip(weights, residuals)
+            ) / total_weight
         spread = math.sqrt(max(variance, 1e-12))
         shape = _GUMBEL_SD_FACTOR / spread
 
@@ -449,7 +565,86 @@ class SurvivalBlipModel:
             clusters=clusters,
             n_rows=len(rows),
             _bread=bread,
+            imputed=self.use_buckley_james,
         )
+
+    def _buckley_james(
+        self,
+        design: list[list[float]],
+        targets: list[float],
+        weights: list[float],
+        observed: list[bool],
+        beta: list[float],
+    ) -> tuple[list[float], list[float]]:
+        """Iteratively impute the censored rows, then refit.
+
+        A row whose follow-up ended without progression is not missing at
+        random: it is right-censored, and what is known about it is that the
+        event came *later* than the time recorded. Buckley-James replaces its
+        response by `x'beta + E[e | e > e_i]`, with the residual distribution
+        estimated by Kaplan-Meier, and refits until the coefficients settle.
+
+        This reuses `weighted_least_squares` and adds no optimiser to the module
+        invariant 23 says to keep exact. A parametric Weibull AFT likelihood
+        would be more efficient and would need Newton with a Hessian — that is
+        the trade, and it is the reason for this choice rather than an oversight.
+
+        The conditional expectations come from **suffix sums over the jumps**
+        rather than a scan per row. The obvious form is a tail scan inside the
+        row loop, which is quadratic and measured 10x slower than the
+        complete-case fit at n=2000 — enough to matter to a test suite this file
+        has to live in.
+        """
+        for _ in range(_BJ_MAX_ITERATIONS):
+            residuals = [y - linalg.dot(row, beta) for row, y in zip(design, targets)]
+            imputed = self._impute(design, targets, observed, beta, residuals)
+            updated = linalg.weighted_least_squares(
+                design, imputed, weights, ridge=_RIDGE
+            )
+            shift = max(abs(a - b) for a, b in zip(updated, beta))
+            beta = updated
+            if shift < _BJ_TOLERANCE:
+                break
+        residuals = [y - linalg.dot(row, beta) for row, y in zip(design, targets)]
+        return beta, self._impute(design, targets, observed, beta, residuals)
+
+    @staticmethod
+    def _impute(
+        design: list[list[float]],
+        targets: list[float],
+        observed: list[bool],
+        beta: list[float],
+        residuals: list[float],
+    ) -> list[float]:
+        """`x'beta + E[e | e > e_i]` for every censored row, `y` for the rest."""
+        jumps = _residual_km_jumps(residuals, observed)
+        values = [value for value, _jump in jumps]
+        # Suffix sums, so each row's tail is two lookups rather than a scan.
+        tail_mass = [0.0] * (len(jumps) + 1)
+        tail_weighted = [0.0] * (len(jumps) + 1)
+        for index in range(len(jumps) - 1, -1, -1):
+            value, jump = jumps[index]
+            tail_mass[index] = tail_mass[index + 1] + jump
+            tail_weighted[index] = tail_weighted[index + 1] + value * jump
+
+        imputed: list[float] = []
+        for index, (value, seen) in enumerate(zip(targets, observed)):
+            if seen:
+                imputed.append(value)
+                continue
+            start = bisect.bisect_right(values, residuals[index])
+            remaining = tail_mass[start]
+            if remaining <= 0.0:
+                # Nothing observed beyond this residual, so the tail is not
+                # identified and the row keeps its recorded time. That is a
+                # lower bound, so it biases **downward** — the standard
+                # Buckley-James edge case, stated rather than hidden.
+                imputed.append(value)
+                continue
+            imputed.append(
+                linalg.dot(design[index], beta) + tail_weighted[start] / remaining
+            )
+        return imputed
 
     def log_hazard_ratio(self, arm: str, features: dict[str, float]) -> float:
         """Estimated tau_a(X); zero for the reference and for an unknown arm,

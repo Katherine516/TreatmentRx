@@ -8,7 +8,7 @@ test fixture, not evidence.
 ## Commands
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests    # 692 tests, ~7 min
+PYTHONPATH=src python3 -m unittest discover -s tests    # 697 tests, ~7 min
 PYTHONPATH=src python3 -m treatmentrx.cli demo          # one patient end to end
 PYTHONPATH=src python3 -m treatmentrx.cli evaluate      # estimator scorecard
 PYTHONPATH=src python3 -m treatmentrx.cli stability     # k-fold + seed sweep (~10s)
@@ -109,9 +109,9 @@ has already gone wrong on it. Read the row before the diff, not after.
 | `recommended_arm` / `top_scored_arm` | 2, 5, 36, 46, 48, 59 |
 | what the card decomposes | 32, 54, 56, 57, 58, 60, 71 |
 | standard errors and the covariance | 38, 58, 65, 66, 68, 74 |
-| `linalg` | 23, 38, 66, 67, 68, 72, 74 |
+| `linalg` | 23, 38, 66, 67, 68, 72, 74, 77 |
 | the serving ensemble | 16, 18, 19, 42, 46, 53, 56, 71 |
-| the candidate set and the abstention rate | 21, 22, 24, 32, 55 |
+| the candidate set and the abstention rate | 21, 22, 24, 32, 55, 77 |
 | the arm and molecule vocabularies | 3, 62, 63 |
 | Layer 1 ingestion and the contract | 6, 13, 51, 64 |
 | policy value and off-policy evaluation | 30, 39, 41, 42, 43 |
@@ -120,7 +120,7 @@ has already gone wrong on it. Read the row before the diff, not after.
 | the safety layer | 1, 35, 54, 61, 70 |
 | `cli audit` and the layer sections | 2, 36, 62, 65, 66, 69 |
 
-It reaches **52 of 76**. The rest are one-offs — a single
+It reaches **53 of 77**. The rest are one-offs — a single
 component, found once, unlikely to be what you are holding — and they are not
 listed here because a row of one is not an index, it is a search result.
 `tests/test_docs.py` derives this table from the invariant bodies and fails when
@@ -2894,6 +2894,93 @@ it goes stale, which is the only thing that makes an index worth having.
    asserts the lines are numbered from one, because that is the assumption the
    rest of the measurement rests on, and it is cheap to state and expensive to
    get wrong.
+
+77. **Invariant 76's deferred item, done — and its second half measured and
+   refused.** That invariant named two repairs for the survival estimator's
+   censoring bias: a censored-data likelihood for the within-line truncation,
+   and an inverse-probability-of-being-at-risk weight for the across-line
+   selection. Building both is how one of them turned out to be neither
+   necessary nor helpful.
+
+   **Buckley-James is now the default.** A row whose follow-up ended without
+   progression is not missing at random — it is right-censored, and what is
+   known is that the event came *later* than the time recorded. So the row is
+   kept and its response replaced by `x'beta + E[e | e > e_i]`, with the residual
+   distribution estimated by Kaplan-Meier and the fit iterated to convergence.
+   It reuses `weighted_least_squares` and adds no optimiser to the module
+   invariant 23 says to keep exact; a parametric Weibull AFT likelihood would be
+   more efficient and would need Newton with a Hessian, and that trade is the
+   reason for the choice. There is no censoring weight on the deployed path —
+   imputing *and* weighting would count censoring twice — so
+   `use_buckley_james=False` keeps the complete-case-plus-IPCW fit as a measured
+   comparator, the way `treat_censored_as_terminal` does on the RA side. Twenty
+   refits at n=2000:
+
+   | | complete case + IPCW | Buckley-James |
+   | --- | --- | --- |
+   | total absolute bias | 0.4023 | **0.2978** |
+   | shape error against a true 1.4 | 0.0104 | **0.0030** |
+   | worst SE / actual spread | 0.91 | **1.03** |
+
+   **The at-risk weight makes it worse**, 0.2122 to 0.2220 on the measurement
+   that set this up, and the reason is the useful part: given `X_j` the line-j
+   outcome is independent of how the patient got there, so selection on X alone
+   does not bias a correctly specified regression — it only moves the covariate
+   distribution, and the weight buys variance for nothing. Invariant 76's
+   across-line table is therefore **real and harmless**: the shift is there,
+   and it is not what the bias was. What *is* the bias is the within-line
+   truncation, which is worse at later lines because less horizon remains, and
+   that is what Buckley-James addresses. Stratifying its residual Kaplan-Meier
+   on the remaining horizon buys a further 0.6% and is not taken either.
+
+   **Three things went wrong in the building, and each is the kind this file
+   exists to record.**
+
+   *The shape was computed from the wrong residuals.* `psi = -k * coefficient`,
+   so the shape multiplies every published parameter. The first integration took
+   the residual Kaplan-Meier against the **imputed** responses, which moves every
+   censored row and reads **1.343** against a true 1.4 — a 4% scale error on
+   everything. A censoring indicator only means something against the time
+   actually observed, so the shape reads the **recorded** residuals and the
+   sandwich reads the imputed ones, because the first describes the error
+   distribution and the second the estimating equation that was solved. With
+   that split it reads **1.403**, better than the complete case's 1.410. The
+   defect looked like a weakness of the method until it was localised.
+
+   *The standard error is not the least-squares sandwich*, and shipping it as
+   though it were would be invariant 27's pattern on a published quantity. The
+   imputation carries uncertainty a variance computed as though every response
+   had been observed cannot see. Measured the way `SANDWICH_INFLATION` was — 20
+   refits, reported SE against the estimator's own spread — it runs 0.98 / 0.76
+   / 0.84 by arm, mean 0.86. `_BJ_SE_INFLATION = 1.35` is set at the
+   conservative end, as that constant is, because an interval too narrow
+   *somewhere* is not repaired by being right on average. After it: 1.03 to
+   1.32, no arm understating.
+
+   *The obvious implementation was quadratic.* Computing each censored row's
+   tail expectation by scanning the jumps is O(n^2) and measured **10x slower
+   than the complete-case fit** at n=2000 — 8.76s against 0.89s, enough to
+   matter to a suite this file lives in. Suffix sums over the jumps plus a
+   bisect take it to 1.82s and the output is bit-identical, which is the only
+   thing that makes the rewrite safe to keep.
+
+   **The calibration is recorded, not asserted, and finding out why is the last
+   item.** `test_the_standard_error_does_not_understate` passed at six seeds and
+   should not have: `pstdev` over six refits reads the spread at **0.039** where
+   twenty read **0.102**, so the comparison passes whatever the constant says.
+   It was caught by a second test written against the same numbers disagreeing
+   with the first. What the suite pins now is the **wiring** — that the
+   inflation is exactly `_BJ_SE_INFLATION` times the uninflated sandwich, and
+   that the comparator path does not carry it — and the calibration lives in the
+   constant's comment where `cli coverage`'s numbers live. A six-seed spread is
+   not something to assert on, and this file already says so about coverage
+   tallies.
+
+   **What remains.** Buckley-James closes about 40% of the gap to the
+   no-censoring floor, not all of it, because its own assumption — censoring
+   independent of the residual given the covariates — is not exactly true when
+   the remaining horizon depends on history the covariates do not carry. Still
+   wired to nothing: `EstimationLayer` scores a bounded response.
 
 ## What is real vs. still a placeholder
 
