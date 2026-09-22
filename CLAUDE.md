@@ -8,7 +8,7 @@ test fixture, not evidence.
 ## Commands
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests    # 645 tests, ~6.5 min
+PYTHONPATH=src python3 -m unittest discover -s tests    # 681 tests, ~7 min
 PYTHONPATH=src python3 -m treatmentrx.cli demo          # one patient end to end
 PYTHONPATH=src python3 -m treatmentrx.cli evaluate      # estimator scorecard
 PYTHONPATH=src python3 -m treatmentrx.cli stability     # k-fold + seed sweep (~10s)
@@ -74,7 +74,10 @@ treatmentrx/
   arms.py        the canonical treatment-arm vocabulary
   formulary.py   the molecules each arm may be prescribed as, and their hazards
   simulation/    the cohort with known blips, plus a FHIR exporter so
-                 simulated patients re-enter through Layer 1
+                 simulated patients re-enter through Layer 1;
+                 `survival_cohort.py` is the same contract for a
+                 time-to-event endpoint, with `estimation/survival_dwols.py`
+                 the estimator scored against it; both wired to nothing yet
   data/          Layer 1  → PatientState
   estimation/    Layer 2  → RegimeEstimate[]
   decision/      Layer 3  → Decision
@@ -96,17 +99,17 @@ produced a real clinical divergence, and the notes below are the scar tissue.
 
 The invariants below are one defect each, in the order each was found. That is
 the right order for the record and the wrong one for a reader about to change
-something — `q_values` alone has bitten **thirteen** times, spread from 5 to 68.
+something — `q_values` alone has bitten **fourteen** times, spread from 5 to 68.
 So this is the other index: the thing you are touching, and every invariant that
 has already gone wrong on it. Read the row before the diff, not after.
 
 | touching | read |
 | --- | --- |
-| `q_values`, and anything that ranks from them | 5, 9, 32, 40, 45, 46, 53, 54, 55, 56, 58, 68, 71 |
+| `q_values`, and anything that ranks from them | 5, 9, 32, 40, 45, 46, 53, 54, 55, 56, 58, 68, 71, 73 |
 | `recommended_arm` / `top_scored_arm` | 2, 5, 36, 46, 48, 59 |
 | what the card decomposes | 32, 54, 56, 57, 58, 60, 71 |
-| standard errors and the covariance | 38, 58, 65, 66, 68 |
-| `linalg` | 23, 38, 66, 67, 68, 72 |
+| standard errors and the covariance | 38, 58, 65, 66, 68, 74 |
+| `linalg` | 23, 38, 66, 67, 68, 72, 74 |
 | the serving ensemble | 16, 18, 19, 42, 46, 53, 56, 71 |
 | the candidate set and the abstention rate | 21, 22, 24, 32, 55 |
 | the arm and molecule vocabularies | 3, 62, 63 |
@@ -117,7 +120,7 @@ has already gone wrong on it. Read the row before the diff, not after.
 | the safety layer | 1, 35, 54, 61, 70 |
 | `cli audit` and the layer sections | 2, 36, 62, 65, 66, 69 |
 
-It reaches **50 of 72**. The rest are one-offs — a single
+It reaches **52 of 74**. The rest are one-offs — a single
 component, found once, unlikely to be what you are holding — and they are not
 listed here because a row of one is not an index, it is a search result.
 `tests/test_docs.py` derives this table from the invariant bodies and fails when
@@ -2514,6 +2517,194 @@ it goes stale, which is the only thing that makes an index worth having.
    standard library cannot acquire an LLM SDK quietly. The sweep asserts it
    reached `linalg.py`, `dwols.py`, `rationale.py` and `contract.py`, because a
    path change would otherwise make it pass by parsing nothing.
+
+73. **A survival generator, and the version of it that had nothing to learn.**
+   Extending to an oncology workflow needs a time-to-event endpoint before it
+   needs a disease: `data/endpoints.py` maps a stage to a bounded response on
+   `[0, 1]` and `q_values` are clamped to `[Q_FLOOR, Q_CEILING]`, so overall and
+   progression-free survival are a different **estimand** rather than a
+   different endpoint. `simulation/survival_cohort.py` is `ra_cohort`'s contract
+   on that scale — known truth, an oracle, and a way to check both.
+
+   Weibull proportional hazards with the treatment effect as a per-arm
+   log-hazard ratio, `h(t | x, a) = h_0(t) exp(g(x) + tau_a(x))`, which is the
+   survival analogue of a blip and carries the same identification device: the
+   reference arm's `tau` is zero by construction. Weibull because it inverts in
+   closed form, so a seeded draw is exact, **and** because its mean is closed
+   form, so the oracle is arithmetic rather than Monte Carlo and a regret
+   measured against it does not carry the oracle's own sampling error.
+
+   **The first version was not a sequential problem, and the measurement is
+   what said so.** Everything checked out — the closed-form mean matched the
+   sampler to 0.1%, the declared `tau` was recoverable from the times to 0.001,
+   positivity held — and the myopic rule matched the backward-induction optimum
+   on **0 of 3,000 patients**. `advance_line` had advanced only `prior_line`,
+   which does not depend on the arm, so the line-1 choice had no effect on the
+   line-2 state and the problem decomposed into three independent choices. A
+   generator whose optimum a greedy rule reproduces exactly has nothing for a
+   DTR estimator to find, and none of the other four checks could see it.
+
+   The repair is the delayed effect `ra_cohort` gets from ALT:
+   `RESISTANCE_INDUCING_ARMS` leaves `acquired_resistance` behind, charged on
+   the **prognostic** surface and deliberately absent from `HAZARD_BASIS` — so
+   an estimator that recovers every `psi` exactly still has to look ahead.
+   Measured after:
+
+   | | before | after |
+   | --- | --- | --- |
+   | myopic disagrees with the oracle | **0 / 3,000** | **1,965 / 3,000** |
+   | `arm-a` chosen with three lines left | 66% | **0%** |
+   | `arm-a` chosen with one line left | 66% | **67%** |
+   | oracle over myopic | — | **+6.9 months** |
+
+   That last row is the shape to want: the potent arm is saved for last, and
+   "always `arm-a`" becomes the **worst** fixed policy (32.1 months against 47.1
+   for "always `arm-c`") despite having the strongest single-line effect.
+   `tests/test_survival_cohort.py` pins it, and reverting the one repair fails
+   four of its five structural tests with *"the myopic rule matches the oracle
+   on 100.0% of patients"*.
+
+   **Two smaller things the sanity checks caught.** The closed-form oracle and a
+   simulated rollout read about 1% apart, which is two different patient samples
+   rather than bias — on matched patients it is 0.06%, or 0.09 standard errors,
+   and the test uses matched patients so it cannot drift into measuring the
+   wrong thing. And a `fully_observed` property returned True for a **competing
+   death**, conflating "follow-up ended in an event" with "the event of interest
+   was observed" — the exact conflation the module's docstring claims to avoid,
+   differing on 61 of 200 line-endings. It is now `progression_observed` and
+   `censored`, neither standing in for the other, with `terminal_cause` for the
+   three-way question.
+
+   **It is deliberately not a disease, and not wired to anything.** The arms are
+   `reference`, `arm-a`, `arm-b`, `arm-c`. Naming them after breast or brain
+   tumour regimens would make a hazard model with chosen numbers look like a
+   clinical one, which is invariant 72's rule applied before the fact rather
+   than after. Nothing imports it, no disease definition uses it, and the
+   estimators cannot consume it — `EstimationLayer` scores a bounded response
+   and would have to change before any of this reaches a recommendation. What
+   exists is the ground truth a survival estimator would be scored against, and
+   the checks that say it is worth scoring against.
+
+74. **The survival estimator, and a generator that could not ask the question it
+   is named for.** `survival_dwols.py` ports `dwols.py` onto the log-hazard
+   scale: `log T` is linear in the covariates under Weibull PH, so the same
+   `weighted_least_squares`, the same `sandwich_covariance`, the same
+   `|A - pi|` weight, against an estimand on a different scale. The shape comes
+   from the Gumbel spread of the residuals rather than being supplied, and
+   `psi = -k * coefficient`. Recovery works: shape **1.3949** against a true
+   1.4, and every blip parameter back inside its own sampling spread.
+
+   **The first word in its docstring is "doubly-robust", so that was measured
+   rather than inherited — and the first three attempts to measure it were all
+   wrong in instructive ways.**
+
+   *Crippling the treatment-free surface to an intercept* took the error from
+   0.669 to 3.789 and the propensity did not rescue it, which read as the
+   property being absent. It is not a misspecification at all. `HAZARD_BASIS`
+   is a **subset** of the prognostic covariates, so stripping the surface
+   leaves `A * h(X)` as the only X-varying columns and the blip terms absorb
+   the prognosis outright. That is non-identification, and no weight repairs
+   it. **I reported "not doubly robust" to the user on the strength of it, and
+   that was wrong.**
+
+   *Then the shape.* `psi = -k * coefficient` and `k` comes from the residual
+   spread, so a wrong surface inflates the residuals and drags `k` down — an
+   attractive mechanism, because it would be a defect no weighting could reach.
+   Measured, the shape moves 1.4034 to 1.3657, **2.7%**, while the error moves
+   2.3x. The bias is in the coefficient, not in the conversion. Refuted.
+
+   *What was actually wrong is the cohort.* Double robustness survives a wrong
+   *treatment-free surface*, so measuring it needs a variable the surface can
+   omit which moves assignment **and** the outcome and is **not** in the blip
+   basis. No such variable existed. `assignment_probabilities` was a softmax
+   over `true_log_hazard_ratio` alone, so every confounder was in
+   `HAZARD_BASIS`; `acquired_resistance` sits outside it and moves the outcome
+   by 0.75 and assignment by **exactly 0.0000**. Every misspecification that
+   could be written was either no confounding at all or not a surface question,
+   which is why the measured gain sat near 2% however wrong the surface was
+   made. That is invariant 73's defect one level up — a fixture missing the
+   structure the thing built against it needs — and it was found the same way,
+   by measuring rather than by reading.
+
+   `performance_status` is the repair, and it is confounding by indication: a
+   frail patient does worse whatever is given and is steered away from the
+   aggressive arm. The caution is **arm-specific**, because a shift common to
+   every arm cancels in the softmax and confounds nothing. With it, six seeds
+   at n=3000:
+
+   | treatment-free surface | no weight | fitted propensity | the true propensity |
+   | --- | --- | --- | --- |
+   | correct | 0.675 | 0.661 | 0.671 |
+   | omits the confounder | 0.712 | 0.699 | **0.671** |
+
+   A correct propensity takes the wrong surface to **0.671**, the number the
+   correct surface gives, and the fitted propensity recovers 36% of the damage —
+   the gap being the price of `_propensities` being a linear probability model
+   standing in for a softmax.
+
+   **That is directional and not a clean demonstration, which is worth saying
+   because the table reads like one.** The damage is 0.037 on a base of 0.675,
+   and scored as a *bias* over eight seeds instead of as absolute error the
+   omitted-confounder-with-true-propensity arm comes out **below** the
+   correctly-specified one, 0.308 against 0.326 — noise, not a wrong surface
+   beating a right one. The firm evidence is the mechanism rather than the
+   outcome: `|A - pi|` satisfies `pi w(1,X) = (1-pi) w(0,X)` pointwise and
+   measurably balances the covariates, and that is what the tests pin.
+
+   **The larger finding is a bias that has nothing to do with any of this**, and
+   it was only visible once bias was separated from spread — invariant 40's
+   distinction, and mean absolute error hides it because the sampling spread
+   dominates at this cohort size. With a correct surface *and* the generator's
+   own propensity the estimator still carries a total |bias| of **0.307** over
+   the twelve blip parameters, which is an order of magnitude larger than the
+   0.037 the double-robustness demonstration repairs. The cause is stated in the
+   module's own docstring as an assumption: *"censoring is independent of the
+   covariates"*. It is not. Two of the three ways follow-up ends do satisfy it —
+   loss to follow-up and the competing risk are exponential with constant rates,
+   independent of the arm by construction. Administrative censoring is
+   `horizon - entry_month`, and entry month is the sum of the earlier lines'
+   durations, which depend on the covariates and the arms taken. Measured over
+   20 seeds at n=3000, as total |bias|:
+
+   | | total \|bias\| | worst |
+   | --- | --- | --- |
+   | no censoring at all | **0.106** | 0.027 |
+   | deployed, IPCW on | 0.307 | 0.058 |
+   | deployed, IPCW **off** | **0.515** | 0.124 |
+
+   So **two thirds of the deployed bias is censoring**, the marginal
+   Kaplan-Meier correction removes about 40% of it, and it cannot remove the
+   rest because the part it cannot see is the part that depends on covariates.
+   A covariate-dependent censoring model is the repair and is deliberately not
+   attempted — it is a second nuisance model and this is the first pass at the
+   estimand. What is not acceptable is the assumption going unstated, and the
+   docstring said the independence was *"right for the generator"*.
+
+   **Five seeds said IPCW made the bias worse, and three eight-seed blocks all
+   said better.** `_pooled_bias` takes the absolute value of a mean, which its
+   own sampling noise inflates upward, so at small seed counts the two arms are
+   biased by different amounts and the comparison can flip sign: 0.439 -> 0.510
+   at five seeds against 0.489 -> 0.326, 0.653 -> 0.466 and 0.640 -> 0.474 at
+   eight. `_WEIGHTING_SEEDS` is eight for that reason and the comment says
+   which measurement set it. A test that flips on the seed block is worse than
+   no test, and the first version of this one flipped.
+
+   **What is pinned and what is recorded.** The tests pin recovery, the sign
+   convention (`psi = -k * coefficient`, asserted term by term — an argmax on a
+   hazard recommends the worst arm while looking reasonable), that IPCW removes
+   bias, and the **mechanism** of the double robustness: that `|A - pi|`
+   balances the covariates, worst imbalance **0.0725 -> 0.0157**. The rescue
+   itself is recorded in the docstring rather than pinned, because 0.037 on a
+   base of 0.675 needs more seeds than this suite can spend, and saying so is
+   better than a test that passes for the wrong reason.
+   `tests/test_survival_cohort.py` pins the confounder's three conditions and
+   keeps `acquired_resistance` as the negative control; zeroing
+   `_PRESCRIBING_CAUTION` fails exactly those two tests and leaves the control
+   passing.
+
+   **Still wired to nothing.** `EstimationLayer` scores a bounded response and
+   would have to change before any of this reaches a recommendation. The arms
+   stay `reference`, `arm-a`, `arm-b`, `arm-c` for invariant 73's reason.
 
 ## What is real vs. still a placeholder
 
