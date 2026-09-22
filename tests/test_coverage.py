@@ -883,6 +883,121 @@ class AuditHarnessTests(unittest.TestCase):
         self.assertEqual(metrics["healthy_patient_removals"], 0)
         self.assertEqual(metrics["allergen_composites_surviving"], {})
 
+    def test_the_safety_guarantee_is_measured_and_can_fail(self):
+        """Invariant 2's guarantee, and the proof it is a check not decoration.
+
+        On a healthy build this reads zero by construction, which is exactly the
+        shape invariant 25 warns about — so the evidence is that injecting the
+        original defect makes it fire. That defect was a naming mismatch which
+        silently promoted the runner-up when the leader was infeasible, turning
+        a blocked case into what read as a clinical judgement.
+        """
+        from dataclasses import replace
+
+        import treatmentrx.safety as safety_module
+        from treatmentrx.domain import RecommendationStatus
+
+        healthy = audit_safety().metrics["safety_guarantee_violations"]
+        self.assertEqual(healthy["violations"], 0, healthy["detail"])
+        self.assertGreater(
+            healthy["cases_where_the_leading_arm_was_removed"],
+            0,
+            "no labelled case puts the guarantee under load — it cannot fail",
+        )
+
+        original = safety_module.SafetyLayer.apply
+
+        def promotes_the_runner_up(self, decision, state):
+            safe = original(self, decision, state)
+            if safe.status is RecommendationStatus.BLOCKED and safe.feasible_arms:
+                promoted = replace(
+                    safe.decision, recommended_arm=sorted(safe.feasible_arms)[0]
+                )
+                return replace(
+                    safe, decision=promoted, status=RecommendationStatus.RECOMMEND
+                )
+            return safe
+
+        try:
+            safety_module.SafetyLayer.apply = promotes_the_runner_up
+            injected = audit_safety().metrics["safety_guarantee_violations"]
+        finally:
+            safety_module.SafetyLayer.apply = original
+
+        self.assertGreater(
+            injected["violations"], 0, "the promotion went unnoticed"
+        )
+        self.assertEqual(
+            audit_safety().metrics["safety_guarantee_violations"]["violations"],
+            0,
+            "the injection leaked past its own teardown",
+        )
+
+    def test_retrospective_concordance_is_measured_and_not_gate_wired(self):
+        """The quantity the SHADOW gate asks for, and why this is not it.
+
+        `through_stage` makes concordance askable at all — before it, the
+        record held no clinician answer to the question the agent is asked. But
+        the reference here is the simulator's behaviour policy, which the agent
+        is built to beat, so a ">= 0.5" bar against it would block a correct
+        system. That is invariant 29's argument applied to a concordance
+        threshold rather than a regret baseline, so the number is reported and
+        the gate keeps blocking on `concordance` as unmeasured.
+        """
+        from treatmentrx.estimation import training
+        from treatmentrx.feedback.audit import _retrospective_concordance
+
+        measured = _retrospective_concordance(n=12)
+        self.assertGreater(measured["decisions_rescored"], 0)
+        self.assertNotIn("concordance", training.deployment_readiness())
+
+    def test_the_agent_and_the_behaviour_policy_genuinely_differ(self):
+        """If they agreed, the cohort would have nothing for the agent to add.
+
+        `agent_never_chose` is the readable half: arms the behaviour policy used
+        and the agent never proposes cannot ever agree, so they cap the rate.
+        Reporting the ceiling beside the rate is what stops a low number reading
+        as a defect.
+        """
+        from treatmentrx.feedback.audit import _retrospective_concordance
+
+        measured = _retrospective_concordance(n=12)
+        self.assertLess(
+            measured["concordance"],
+            0.5,
+            "the agent reproduces the behaviour policy — it should beat it",
+        )
+        unreachable = sum(measured["agent_never_chose"].values())
+        self.assertGreater(
+            unreachable,
+            0,
+            "no arm is exclusive to the behaviour policy; the ceiling is unexplained",
+        )
+        self.assertLessEqual(unreachable, measured["decisions_rescored"])
+
+    def test_the_shadow_gate_is_not_fed_by_the_guarantee_sweep(self):
+        """The distinction the metric exists to preserve.
+
+        The SHADOW gate reads "no safety events in shadow", meaning no patient
+        was harmed while the model ran silently beside clinicians. The sweep
+        measures whether this layer's own guarantee held on simulated records.
+        Wiring the second into the first would let the gate read satisfied on
+        the strength of a simulation, which is the rung-skip invariant 25 is
+        about — so `safety_events` must stay absent from the readiness metrics
+        and the gate must keep blocking on it.
+        """
+        from treatmentrx.estimation import training
+        from treatmentrx.feedback.validation_ladder import ValidationLadder
+        from treatmentrx.domain import ValidationRung
+
+        readiness = training.deployment_readiness()
+        self.assertNotIn("safety_events", readiness)
+        blockers = ValidationLadder().assess(ValidationRung.SHADOW, readiness).blockers
+        self.assertTrue(
+            any("safety_events" in b or "safety events" in b for b in blockers),
+            f"the shadow gate stopped blocking on safety events: {blockers}",
+        )
+
     def test_the_removal_reason_names_the_condition_that_fired(self):
         """Which arms went is only half of a safety filter's job.
 

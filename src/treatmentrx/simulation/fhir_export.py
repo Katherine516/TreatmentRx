@@ -77,11 +77,24 @@ def _observations(day: int, features: dict[str, float]) -> list[dict[str, Any]]:
     return entries
 
 
-def trajectory_to_bundle(trajectory: CohortTrajectory) -> dict[str, Any]:
+def trajectory_to_bundle(
+    trajectory: CohortTrajectory, through_stage: int | None = None
+) -> dict[str, Any]:
     """Render one simulated trajectory as an ingestible FHIR-like bundle.
 
     An open "current decision point" is appended so the bundle represents a
     patient standing at a decision, which is what the agent is asked about.
+
+    `through_stage=j` truncates the history to the stages **before** `j` and
+    puts that open decision point at stage `j`'s own day, carrying stage `j`'s
+    own covariates — the state as it stood when the clinician chose, with the
+    arm they chose withheld. That is what lets a historical decision be
+    re-scored, which nothing here could do: the default bundle always ends in a
+    synthetic open point extrapolated past the last visit, so `stages[-1]`
+    carries the sentinel `'current decision point'` and there is no clinician
+    choice anywhere in the record to compare an answer against.
+
+    `through_stage=None` reproduces the original bundle byte for byte.
     """
     entries: list[dict[str, Any]] = [
         {
@@ -96,8 +109,26 @@ def trajectory_to_bundle(trajectory: CohortTrajectory) -> dict[str, Any]:
     ]
 
     stages = trajectory.stages
-    for position, stage in enumerate(stages):
-        following = stages[position + 1] if position + 1 < len(stages) else None
+    if through_stage is None:
+        history = stages
+        last = stages[-1]
+        decision_day = last.day + (last.interval_days or 90)
+        decision_features = last.features
+        # Only a trajectory rendered to its end can carry why it ended.
+        ended_here = trajectory.censored
+    else:
+        if not 1 <= through_stage < len(stages):
+            raise ValueError(
+                f"through_stage must leave at least one stage of history and one "
+                f"to ask about: got {through_stage} for {len(stages)} stages"
+            )
+        history = stages[:through_stage]
+        decision_day = stages[through_stage].day
+        decision_features = stages[through_stage].features
+        ended_here = False
+
+    for position, stage in enumerate(history):
+        following = history[position + 1] if position + 1 < len(history) else None
         entries.append({"resource": {"resourceType": "Encounter", "day": stage.day}})
         entries.extend(_observations(stage.day, stage.features))
 
@@ -109,7 +140,10 @@ def trajectory_to_bundle(trajectory: CohortTrajectory) -> dict[str, Any]:
         }
         if following is not None:
             record["stopDay"] = following.day
-        elif trajectory.censored:
+        elif through_stage is not None:
+            # The truncated history runs up to the decision being asked about.
+            record["stopDay"] = decision_day
+        elif ended_here:
             # The trajectory ended here; say why, the way a record would.
             record["stopDay"] = stage.day + (stage.interval_days or 90)
             record["discontinuationReason"] = _DISCONTINUATION_TEXT.get(
@@ -118,10 +152,8 @@ def trajectory_to_bundle(trajectory: CohortTrajectory) -> dict[str, Any]:
         entries.append({"resource": record})
 
     # The open decision the agent is being asked about.
-    last = stages[-1]
-    decision_day = last.day + (last.interval_days or 90)
     entries.append({"resource": {"resourceType": "Encounter", "day": decision_day}})
-    entries.extend(_observations(decision_day, last.features))
+    entries.extend(_observations(decision_day, decision_features))
     entries.append(
         {
             "resource": {

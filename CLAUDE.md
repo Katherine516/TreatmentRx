@@ -8,7 +8,7 @@ test fixture, not evidence.
 ## Commands
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests    # 701 tests, ~7 min
+PYTHONPATH=src python3 -m unittest discover -s tests    # 710 tests, ~7 min
 PYTHONPATH=src python3 -m treatmentrx.cli demo          # one patient end to end
 PYTHONPATH=src python3 -m treatmentrx.cli evaluate      # estimator scorecard
 PYTHONPATH=src python3 -m treatmentrx.cli stability     # k-fold + seed sweep (~10s)
@@ -105,8 +105,8 @@ has already gone wrong on it. Read the row before the diff, not after.
 
 | touching | read |
 | --- | --- |
-| `q_values`, and anything that ranks from them | 5, 9, 32, 40, 45, 46, 53, 54, 55, 56, 58, 68, 71, 73 |
-| `recommended_arm` / `top_scored_arm` | 2, 5, 36, 46, 48, 59 |
+| `q_values`, and anything that ranks from them | 5, 9, 32, 40, 45, 46, 53, 54, 55, 56, 58, 68, 71, 73, 79 |
+| `recommended_arm` / `top_scored_arm` | 2, 5, 36, 46, 48, 59, 79 |
 | what the card decomposes | 32, 54, 56, 57, 58, 60, 71 |
 | standard errors and the covariance | 38, 58, 65, 66, 68, 74 |
 | `linalg` | 23, 38, 66, 67, 68, 72, 74, 77 |
@@ -115,12 +115,12 @@ has already gone wrong on it. Read the row before the diff, not after.
 | the arm and molecule vocabularies | 3, 62, 63 |
 | Layer 1 ingestion and the contract | 6, 13, 51, 64 |
 | policy value and off-policy evaluation | 30, 39, 41, 42, 43 |
-| the validation gate | 14, 25, 41 |
+| the validation gate | 14, 25, 41, 79 |
 | the blip basis | 57, 68, 72 |
 | the safety layer | 1, 35, 54, 61, 70 |
 | `cli audit` and the layer sections | 2, 33, 36, 62, 65, 66, 69 |
 
-It reaches **54 of 78**. The rest are one-offs — a single
+It reaches **55 of 79**. The rest are one-offs — a single
 component, found once, unlikely to be what you are holding — and they are not
 listed here because a row of one is not an index, it is a search result.
 `tests/test_docs.py` derives this table from the invariant bodies and fails when
@@ -3045,6 +3045,75 @@ it goes stale, which is the only thing that makes an index worth having.
    `COHORT_SIZE`, and a test asserts both: a restored size with a drifted seed
    would leave everything after it scoring against a cohort nobody chose, and
    that is the kind of leak a module-global sweep makes easy.
+
+79. **Two SHADOW-gate criteria, built — and neither can be honestly satisfied by
+   a simulation.** `live_data` is the loud blocker on the validation ladder and
+   it is not the interesting one: it is a hardcoded `False` stating a fact, and
+   no code clears it. Asking what happens *after* it flips is what pays.
+   `deployment_readiness()` supplies **15 keys, every one for SILENT**. Every
+   criterion above it reads *not measured* — `safety_events` and `concordance`
+   at SHADOW, three more at ADVISORY, one at PRAGMATIC_TRIAL. So a real cohort
+   arriving tomorrow would clear SILENT and stall immediately, not on a failure
+   but because **the codebase can only execute the first step of the process it
+   describes.** Both SHADOW criteria are now built, and building them is how
+   their limits got measured rather than assumed.
+
+   **`safety_guarantee_violations`** is invariant 2's guarantee, measured over
+   the labelled safety cases: a published arm that safety removed, a name on a
+   status that did not recommend, or a RECOMMEND beside a block flag. Three
+   conditions counted separately, because one counter standing in for three is
+   how a partial regression passes (invariant 59). It reads **0**, and the
+   evidence that it is a check rather than decoration is that injecting the
+   original defect — promote the runner-up when the leader is infeasible —
+   takes it to **1**, naming the case and the reason.
+
+   **Its first denominator was eight times too large, which is invariant 56
+   inside the fix for something else.** "Cases where something was removed"
+   reads 8 of 20; the number that matters is cases where *the arm the agent
+   would publish* was removed, because that is the only situation where the
+   layer must choose between halting and promoting. That is **1**: only an
+   allergy to the leader removes it, since the physiological paths all
+   contraindicate `JAK-inhibitor` and `methotrexate-optimization`, which are
+   never this record's leader. A denominator of one is thin and is reported as
+   such rather than smoothed.
+
+   **And that denominator is not invariant under the regression it scales.**
+   `top_scored_arm` is set from `safe.decision.recommended_arm`
+   (`agent/__init__.py`), which is the field a promotion defect corrupts — so
+   injected, it reads 0 where the healthy build reads 1. The violation count is
+   the signal and the denominator is context. Deriving the leader from
+   `q_values` would make it stable and is exactly the display-quantity
+   re-derivation invariant 46 removed from five places, so it is not done.
+
+   **`concordance` was not implementable, and the reason is structural.**
+   `build_patient_state` appends an *open* decision point, so `stages[-1]`
+   carries the sentinel `'current decision point'` and the record holds no
+   clinician answer to the question the agent is asked. A first attempt to
+   measure agreement read **0/120**, which was that sentinel and not a finding.
+   `trajectory_to_bundle(..., through_stage=j)` is the repair: the record as it
+   stood before decision `j`, with the arm taken at `j` withheld. The default
+   path is byte-identical (`bec237a1e27b`), and a test asserts the truncated
+   history is exactly the stages before `j` with the answer absent.
+
+   Measured over 70 re-scored decisions, concordance is **0.129**. That is the
+   design working, not a failure, and the decomposition says why:
+   **`agent_never_chose` covers 35 of the 70** — `continue-current` 18,
+   `JAK-inhibitor` 11, `TNF-inhibitor` 6 — arms the behaviour policy used and
+   the agent never proposes, which can never agree. So the rate is structurally
+   capped near 0.5, which is exactly where the gate's bar sits.
+
+   **Neither is wired to its gate, and that is the finding rather than a
+   shortfall.** `safety_events` means no patient was harmed while the model ran
+   beside clinicians; what was built measures whether this layer's guarantee
+   held on simulated records. `concordance` means agreement with clinicians;
+   the reference here is the behaviour policy the agent is built to beat
+   (rollout 2.156 against 1.770), so a `>= 0.5` bar against it would block a
+   correct system — invariant 29's argument ("an oracle the agent beats is not
+   an oracle") applied to a concordance threshold instead of a regret baseline.
+   Wiring either would let the gate read satisfied on the strength of a
+   simulation, which is the rung-skip invariant 25 exists to refuse. Tests
+   assert both keys stay **absent** from `deployment_readiness()` and that the
+   SHADOW gate keeps blocking on them.
 
 ## What is real vs. still a placeholder
 

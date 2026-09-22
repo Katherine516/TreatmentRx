@@ -884,3 +884,106 @@ class IdentificationReadsWhatTheModelReadsTests(unittest.TestCase):
                 )
                 self.assertFalse(result.identified)
                 self.assertIn(node, result.blocked_reason)
+
+
+class RetrospectiveBundleTests(unittest.TestCase):
+    """`through_stage`: re-ask a decision the record already answered.
+
+    Nothing could do this. `trajectory_to_bundle` always ends in a synthetic
+    open decision point extrapolated past the last visit, so `stages[-1]`
+    carries the sentinel `'current decision point'` and the record holds no
+    clinician answer to compare an agent's against. Measuring concordance — the
+    quantity the SHADOW gate asks for — needs the state as it stood *before* a
+    decision, with the arm taken then withheld.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from treatmentrx.simulation.ra_cohort import generate_ra_cohort
+
+        cls.cohort = [
+            t for t in generate_ra_cohort(20, seed=991) if len(t.stages) >= 3
+        ]
+        assert cls.cohort, "no trajectory long enough to truncate"
+
+    def test_the_default_bundle_is_unchanged(self):
+        """The parameter is additive: omitted, every byte is what it was."""
+        import hashlib
+        import json
+
+        from treatmentrx.simulation.fhir_export import (
+            simulated_bundles,
+            trajectory_to_bundle,
+        )
+        from treatmentrx.simulation.ra_cohort import generate_ra_cohort
+
+        batch = simulated_bundles(20, seed=991)
+        rebuilt = [trajectory_to_bundle(t) for t in generate_ra_cohort(20, seed=991)]
+        digest = lambda o: hashlib.sha256(
+            json.dumps(o, sort_keys=True).encode()
+        ).hexdigest()
+        self.assertEqual(digest(batch), digest(rebuilt))
+
+    def test_it_withholds_the_arm_it_is_asking_about(self):
+        """The whole point: the answer must not be in the question."""
+        from treatmentrx.simulation.fhir_export import trajectory_to_bundle
+
+        trajectory = self.cohort[0]
+        for index in range(1, len(trajectory.stages)):
+            bundle = trajectory_to_bundle(trajectory, through_stage=index)
+            prescribed = [
+                entry["resource"]["medicationCodeableConcept"]["text"]
+                for entry in bundle["entry"]
+                if entry["resource"]["resourceType"] == "MedicationRequest"
+            ]
+            with self.subTest(through_stage=index):
+                # The history is exactly the stages before it, in order.
+                self.assertEqual(
+                    prescribed[:-1],
+                    [s.arm for s in trajectory.stages[:index]],
+                )
+                self.assertEqual(prescribed[-1], "current decision point")
+
+    def test_the_open_point_carries_the_covariates_of_that_decision(self):
+        """Not an extrapolation past the last visit — the state the clinician
+        actually saw, which is what makes the comparison fair."""
+        from treatmentrx.simulation.fhir_export import trajectory_to_bundle
+
+        trajectory = self.cohort[0]
+        index = 1
+        bundle = trajectory_to_bundle(trajectory, through_stage=index)
+        days = [
+            entry["resource"]["day"]
+            for entry in bundle["entry"]
+            if entry["resource"]["resourceType"] == "Encounter"
+        ]
+        self.assertEqual(days[-1], trajectory.stages[index].day)
+
+    def test_a_truncated_bundle_still_ingests(self):
+        """It has to survive Layer 1, or it cannot be scored."""
+        from treatmentrx.data import DataLayer
+        from treatmentrx.simulation.fhir_export import trajectory_to_bundle
+
+        layer = DataLayer()
+        for trajectory in self.cohort[:5]:
+            for index in range(1, len(trajectory.stages)):
+                with self.subTest(patient=trajectory.patient_index, stage=index):
+                    state = layer.build_patient_state(
+                        trajectory_to_bundle(trajectory, through_stage=index)
+                    )
+                    self.assertEqual(len(state.stages), index + 1)
+                    self.assertEqual(
+                        state.stages[-1].treatment, "current decision point"
+                    )
+
+    def test_it_refuses_a_truncation_that_leaves_nothing_to_ask(self):
+        """Stage 0 has no history before it and the last stage has no decision
+        after it; both would produce a bundle that looks fine and means
+        nothing."""
+        from treatmentrx.simulation.fhir_export import trajectory_to_bundle
+
+        trajectory = self.cohort[0]
+        for index in (0, len(trajectory.stages), len(trajectory.stages) + 1):
+            with self.subTest(through_stage=index):
+                with self.assertRaises(ValueError):
+                    trajectory_to_bundle(trajectory, through_stage=index)

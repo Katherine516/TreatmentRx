@@ -816,6 +816,80 @@ def _with_pregnancy(bundle: dict) -> dict:
     return bundle
 
 
+def _retrospective_concordance(n: int = 40, seed: int = 5150) -> dict[str, object]:
+    """Would the agent have chosen what was chosen? Measured, not gate-wired.
+
+    The SHADOW gate wants "clinician concordance at least 0.5" and nothing
+    computed it, because nothing could: `build_patient_state` appends an *open*
+    decision point, so `stages[-1].treatment` is the sentinel
+    `'current decision point'` and the record carries no clinician answer to the
+    question the agent is asked. `trajectory_to_bundle(..., through_stage=j)`
+    makes it askable — the record as it stood before decision `j`, with the arm
+    taken at `j` withheld and then compared against.
+
+    **This is not the gate's concordance, and must not be wired to it.** The
+    "clinician" here is the simulator's behaviour policy, and the agent exists to
+    beat it: rollout value 2.156 against 1.770. So agreement is not a target,
+    and a gate reading ">= 0.5" against a reference the agent is supposed to
+    outperform would block a correctly working system — invariant 29's argument
+    ("an oracle the agent beats is not an oracle") applied to a concordance
+    threshold instead of a regret baseline. What the number is good for is
+    seeing *where* the two differ, which `agent_never_chose` reports.
+    """
+    from treatmentrx.data import DataLayer
+    from treatmentrx.decision import DecisionLayer
+    from treatmentrx.estimation import EstimationLayer
+    from treatmentrx.simulation.fhir_export import trajectory_to_bundle
+    from treatmentrx.simulation.ra_cohort import generate_ra_cohort
+
+    data_layer, estimation_layer = DataLayer(), EstimationLayer()
+    decision_layer = DecisionLayer()
+    agree = scored = committed = committed_agree = 0
+    observed_counts: dict[str, int] = {}
+    agent_counts: dict[str, int] = {}
+    for trajectory in generate_ra_cohort(n, seed=seed):
+        for index in range(1, len(trajectory.stages)):
+            try:
+                state = data_layer.build_patient_state(
+                    trajectory_to_bundle(trajectory, through_stage=index)
+                )
+            except DataContractError:
+                continue
+            decision = decision_layer.decide(state, estimation_layer.estimate(state))
+            answer = decision.recommended_arm or max(
+                decision.q_values, key=decision.q_values.get
+            )
+            observed = trajectory.stages[index].arm
+            observed_counts[observed] = observed_counts.get(observed, 0) + 1
+            agent_counts[answer] = agent_counts.get(answer, 0) + 1
+            scored += 1
+            agree += answer == observed
+            if decision.status is RecommendationStatus.RECOMMEND:
+                committed += 1
+                committed_agree += answer == observed
+    never = sorted(set(observed_counts) - set(agent_counts))
+    return {
+        "decisions_rescored": scored,
+        "concordance": _rate(agree, scored),
+        "concordance_when_it_commits": _rate(committed_agree, committed),
+        "decisions_it_committed_on": committed,
+        "what_was_prescribed": dict(sorted(observed_counts.items())),
+        "what_the_agent_would_choose": dict(sorted(agent_counts.items())),
+        # The single largest source of disagreement, and a ceiling on the rate:
+        # every arm here is one the behaviour policy used and the agent never
+        # proposes, so those decisions can never agree.
+        "agent_never_chose": {
+            arm: observed_counts[arm] for arm in never
+        },
+        "note": (
+            "NOT the SHADOW gate's `concordance`. The reference is the "
+            "simulator's behaviour policy, which the agent is built to beat "
+            "(rollout 2.156 against 1.770), so low agreement is the design "
+            "working. A >= 0.5 bar against it would block a correct system."
+        ),
+    }
+
+
 def audit_safety() -> Section:
     """Does the gate remove what it should, and leave the rest alone?
 
@@ -881,6 +955,9 @@ def audit_safety() -> Section:
     over_removals: dict[str, list[str]] = {}
     surviving_allergens: dict[str, list[str]] = {}
     misnamed_reasons: dict[str, list[str]] = {}
+    guarantee_any_removal = 0
+    guarantee_under_load = 0
+    guarantee_violations: dict[str, list[str]] = {}
 
     for label, bundle, should_remove, token, condition in cases:
         try:
@@ -890,6 +967,48 @@ def audit_safety() -> Section:
             continue
         reasons = dict(recommendation.audit_event["removed_arms"])
         removed = set(reasons)
+
+        # Invariant 2's guarantee, measured rather than only pinned. The three
+        # ways it can break are distinct and each is counted, because one
+        # counter standing in for three properties is how a partial regression
+        # passes (invariant 59). `guarantee_under_load` is the denominator that
+        # matters: a case with nothing removed cannot violate any of them, so a
+        # sweep of healthy records would score a perfect zero by having nothing
+        # to get wrong — invariant 56's defect.
+        if removed:
+            guarantee_any_removal += 1
+        # The denominator that matters is not "something was removed" but "the
+        # arm the agent would publish was removed" — the only situation where
+        # the layer has to choose between halting and promoting the runner-up,
+        # which is the choice invariant 2 is about. Counting any removal
+        # overstates it eightfold here and is invariant 56's defect: a sweep
+        # over cases that structurally cannot contain what it looks for.
+        # `top_scored_arm` is Layer 3's argmax — `agent/__init__.py` sets it from
+        # `safe.decision.recommended_arm`, which is the same field a promotion
+        # defect corrupts. So this denominator is **not** invariant under the
+        # regression it scales: injected, it reads 0 where the healthy build
+        # reads 1. The violation count is the signal and this is context, which
+        # is worth stating rather than discovering later. Deriving the leader
+        # from `q_values` instead would make it stable and is exactly the
+        # display-quantity re-derivation invariant 46 removed from five places.
+        leader = recommendation.top_scored_arm
+        if leader is not None and leader in removed:
+            guarantee_under_load += 1
+        published = recommendation.recommended_arm
+        blocking = [f for f in recommendation.safety_flags if f.severity == "block"]
+        if published is not None and published in removed:
+            guarantee_violations.setdefault(label, []).append(
+                f"published {published}, which safety had removed"
+            )
+        if published is not None and recommendation.status is not RecommendationStatus.RECOMMEND:
+            guarantee_violations.setdefault(label, []).append(
+                f"status {recommendation.status.name} carries the arm {published}"
+            )
+        if blocking and recommendation.status is RecommendationStatus.RECOMMEND:
+            guarantee_violations.setdefault(label, []).append(
+                f"RECOMMEND alongside a block-severity flag "
+                f"({', '.join(sorted(f.code for f in blocking))})"
+            )
 
         # Which arms went is only half of it. All three physiological conditions
         # contraindicate the same two arms, so the counts above cannot tell a
@@ -932,6 +1051,42 @@ def audit_safety() -> Section:
             "removals_checked": reason_checked,
             "rate": _rate(reason_named, reason_checked),
             "misnamed": misnamed_reasons,
+        },
+        # **This is not the SHADOW gate's `safety_events`, and must not be wired
+        # to it.** That gate reads "no safety events in shadow", which means no
+        # patient was harmed while the model ran silently beside clinicians —
+        # a fact about real deployment that no simulation supplies. What this
+        # counts is whether the layer's own guarantee held on the cases scored:
+        # a published arm that safety removed, a name on a status that did not
+        # recommend, or a RECOMMEND beside a block-severity flag. Reporting it
+        # as `safety_events` would let the gate read satisfied on the strength
+        # of simulated patients, which is exactly the rung-skip invariant 25 is
+        # about and the reason `deployment_readiness()` still omits the key.
+        "safety_guarantee_violations": {
+            "cases_scored": len(cases),
+            "cases_where_something_was_removed": guarantee_any_removal,
+            "cases_where_the_leading_arm_was_removed": guarantee_under_load,
+            "violations": sum(len(v) for v in guarantee_violations.values()),
+            "detail": guarantee_violations,
+            "fixture_note": (
+                "the second denominator is the one to read, and on this case "
+                "set it is 1: only an allergy to the leader itself removes it. "
+                "The physiological paths (ALT, eGFR, pregnancy) all "
+                "contraindicate JAK-inhibitor and methotrexate-optimization, "
+                "which are never this record's leader, so they put the "
+                "guarantee under no load at all. That is a property of the "
+                "fixture; `tests/test_safety_review.py` injects the promotion "
+                "rather than waiting for a case set to produce it. Under that "
+                "injection this denominator itself reads 0, because it comes "
+                "from the field the defect corrupts — read `violations`."
+            ),
+            "note": (
+                "invariant 2's guarantee, measured over the labelled cases: a "
+                "published arm that safety removed, a name on a non-RECOMMEND "
+                "status, or a RECOMMEND beside a block flag. NOT the SHADOW "
+                "gate's `safety_events`, which means observed clinical harm and "
+                "which no simulation can supply."
+            ),
         },
         "allergen_composites_surviving": surviving_allergens,
         "missed": misses,
@@ -1380,6 +1535,7 @@ def audit_governance(n: int = 60, seed: int = AUDIT_SEED) -> Section:
     )
 
     validation = latest.validation if latest else None
+    concordance = _retrospective_concordance()
 
     section = Section("6 feedback")
     section.metrics = {
@@ -1389,6 +1545,10 @@ def audit_governance(n: int = 60, seed: int = AUDIT_SEED) -> Section:
             "distinct_value_sets": len(estimand_sets),
             "model_level": len(estimand_sets) == 1,
         },
+        # What the SHADOW gate asks for, measured against the only "clinician"
+        # this build has — and reported rather than wired to the gate. See the
+        # note inside.
+        "retrospective_concordance": concordance,
         "track_separation": {
             "patients": scored,
             "recommendations": recommended,
