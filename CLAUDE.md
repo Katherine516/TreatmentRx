@@ -2989,11 +2989,36 @@ it goes stale, which is the only thing that makes an index worth having.
    not something to assert on, and this file already says so about coverage
    tallies.
 
-   **What remains.** Buckley-James closes about 40% of the gap to the
-   no-censoring floor, not all of it, because its own assumption — censoring
-   independent of the residual given the covariates — is not exactly true when
-   the remaining horizon depends on history the covariates do not carry. Still
-   wired to nothing: `EstimationLayer` scores a bounded response.
+   **What remains, and four attempts that did not touch it.** Buckley-James
+   closes about 40% of the gap to the no-censoring floor. The stated reason is
+   that its own assumption — censoring independent of the residual given the
+   covariates — is not exactly true when the remaining horizon depends on
+   history the covariates do not carry. Four candidate repairs have now been
+   measured and none works, which is recorded so nobody spends the effort again:
+
+   | attempted | result |
+   | --- | --- |
+   | covariate-dependent censoring model (invariant 76's named repair) | 0.3073 -> 0.3033, **2%** |
+   | inverse-probability-of-being-at-risk weight | 0.2122 -> 0.2220, **worse** |
+   | stratify the residual Kaplan-Meier on the remaining horizon | 0.2122 -> 0.2109, **0.6%** |
+   | *hypothesis:* the unidentified tail dominates | **refuted** — fires on 78 of 203,320 censored rows, **0.04%** |
+   | *hypothesis:* the bias concentrates at later lines | **refuted, and backwards** |
+
+   That last one is worth the space because the prediction was confident and the
+   measurement reversed it. Later lines have less horizon left, so more of their
+   mass should be censored and their tail least identified. Measured, censoring
+   is **highest at line 1** — 24-25% against 15-19% at line 3. The reason is the
+   selection invariant 76 found, read from the other end: everyone has a line 1
+   and the slow ones are censored there, so the patients who *reach* line 3 are
+   exactly those whose earlier lines were short, and they arrive with more
+   horizon relative to their own faster progression.
+
+   So the residual is not the tail, not the line, not a censoring model and not
+   an at-risk weight. A parametric Weibull AFT likelihood — which would use the
+   censored rows directly rather than imputing them — is the obvious remaining
+   candidate and is the one thing not tried, because it needs Newton with a
+   Hessian in the module invariant 23 says to keep exact. Still wired to
+   nothing: `EstimationLayer` scores a bounded response.
 
 78. **`cli power` refit once per size and scored 240 patients against that one
    fit.** Invariant 31 says coverage is replicated over fits and never over
