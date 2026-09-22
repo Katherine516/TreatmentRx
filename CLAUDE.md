@@ -8,7 +8,7 @@ test fixture, not evidence.
 ## Commands
 
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests    # 685 tests, ~7 min
+PYTHONPATH=src python3 -m unittest discover -s tests    # 692 tests, ~7 min
 PYTHONPATH=src python3 -m treatmentrx.cli demo          # one patient end to end
 PYTHONPATH=src python3 -m treatmentrx.cli evaluate      # estimator scorecard
 PYTHONPATH=src python3 -m treatmentrx.cli stability     # k-fold + seed sweep (~10s)
@@ -120,7 +120,7 @@ has already gone wrong on it. Read the row before the diff, not after.
 | the safety layer | 1, 35, 54, 61, 70 |
 | `cli audit` and the layer sections | 2, 36, 62, 65, 66, 69 |
 
-It reaches **52 of 75**. The rest are one-offs — a single
+It reaches **52 of 76**. The rest are one-offs — a single
 component, found once, unlikely to be what you are holding — and they are not
 listed here because a row of one is not an index, it is a search result.
 `tests/test_docs.py` derives this table from the invariant bodies and fails when
@@ -481,6 +481,23 @@ it goes stale, which is the only thing that makes an index worth having.
     statement about sample size. The card also names the four unadjusted
     confounders, the measured interval coverage, and that only six covariates
     reach the estimators.
+
+    **A hardcoded number on the card drifts from the study it cites.** The
+    abstention block carried prose saying the pooled rate does not transfer —
+    correct, and there since `cli transfer` was written — beside a single
+    machine-readable field, `pooled_rate: 0.66`. So the structure invited
+    exactly the reading the strings warn against: a consumer reading numbers saw
+    a point estimate and nothing else. `population_range` (0.54-0.89, `cli
+    transfer`) and `stratum_range` (0.38-0.97, `cli subgroups`) are now fields
+    rather than sentences.
+
+    Writing them found the drift they exist to prevent: `not_uniform` claimed
+    "39% to 97%" where the study measures **37.5% to 96.7%**. One digit, and
+    harmless on its own — what was not harmless is that nothing connected the
+    card to the study, so it could drift arbitrarily far. `tests/test_service.py`
+    asserts the published ranges *bracket* what `subgroup_report()` actually
+    returns, which is the property; pinning the digits would need updating in
+    two places on any legitimate change and is how this went stale.
 34. **No cross-disease fallback.** `DiseaseRegistry` must resolve exactly one
     registered definition before Layer 1 runs. A missing disease workflow is a
     typed error; it must never reuse RA arms, models, safety rules or evidence.
@@ -2672,13 +2689,12 @@ it goes stale, which is the only thing that makes an index worth having.
    | deployed, IPCW on | 0.307 | 0.058 |
    | deployed, IPCW **off** | **0.515** | 0.124 |
 
-   So **two thirds of the deployed bias is censoring**, the marginal
-   Kaplan-Meier correction removes about 40% of it, and it cannot remove the
-   rest because the part it cannot see is the part that depends on covariates.
-   A covariate-dependent censoring model is the repair and is deliberately not
-   attempted — it is a second nuisance model and this is the first pass at the
-   estimand. What is not acceptable is the assumption going unstated, and the
-   docstring said the independence was *"right for the generator"*.
+   So **two thirds of the deployed bias is censoring** and the marginal
+   Kaplan-Meier correction removes about 40% of it. This invariant then said a
+   covariate-dependent censoring model was the repair. **Invariant 76 measured
+   that and it is not**, so read the two together: what is wrong here is the
+   named remedy, not the diagnosis. The docstring's claim that the independence
+   was *"right for the generator"* was the defect, and it stands corrected.
 
    **Five seeds said IPCW made the bias worse, and three eight-seed blocks all
    said better.** `_pooled_bias` takes the absolute value of a mean, which its
@@ -2808,6 +2824,76 @@ it goes stale, which is the only thing that makes an index worth having.
    weight's effect and records, as a test rather than a comment, that `crp_std`
    and `alt_excess` are the only omittable covariates and neither moves
    assignment.
+
+76. **A deferred item is a promise about what to build next, and invariant 74's
+   was wrong.** That invariant diagnosed the survival estimator's 0.307 bias
+   correctly — two thirds is censoring, the marginal Kaplan-Meier removes about
+   40%, administrative censoring is `horizon - entry_month` and so depends on
+   the covariates and the arms taken. Then it named a remedy it had not tried:
+   *"a covariate-dependent censoring model is the repair."* Trying it is the
+   only reason that is known to be false.
+
+   The remaining horizon is **observable** — you know when a patient entered a
+   line and when the study ends — so conditioning on it needs nothing a real
+   analyst lacks, and it is the exact quantity the dependence runs through.
+   Fitting the censoring curve within strata of it, 20 seeds at n=3000 with a
+   correct surface and the generator's own propensity:
+
+   | censoring model | total \|bias\| | worst |
+   | --- | --- | --- |
+   | marginal Kaplan-Meier (deployed) | 0.3073 | 0.0577 |
+   | stratified on remaining horizon, 5 strata | **0.3033** | 0.0636 |
+   | stratified on remaining horizon, 10 strata | **0.3085** | 0.0658 |
+   | *(floor: no censoring at all)* | *0.1060* | *0.0270* |
+
+   It buys **2% of the 0.20** censoring costs, and ten strata is worse than
+   five. Whatever this is, it is not a censoring curve wanting more covariates.
+
+   **There are two things in the residual and neither is one.**
+
+   *Within a line, the complete case is truncated and reweighting cannot undo
+   it.* `_rows_for` keeps only rows that progressed; a patient whose progression
+   time exceeds their remaining horizon is dropped, which is likelier the lower
+   their hazard, so the kept rows are short-time-selected in a
+   covariate-dependent way. Inverse weighting repairs *random* censoring by
+   upweighting comparable survivors and has nothing to upweight when the
+   truncation is administrative. Measured over 12 seeds at n=3000, scoring the
+   three parameters one line can identify, censoring costs **+0.0822 on line 1
+   alone** — where every patient enters at month 0 and the horizon is the same
+   60 months for all. **So it is not an entry-time effect**, which is what
+   invariant 74 assumed and what made the stratification look promising.
+
+   *Across lines, the risk set itself is selected.* A slow progressor reaches
+   the horizon before ever starting line 2, so later lines over-represent fast
+   progressors — high `biomarker_std`, a blip-basis term. 8 cohorts of 3000:
+
+   | line | rows, censored | rows, uncensored | mean `biomarker_std` shift |
+   | --- | --- | --- | --- |
+   | 1 | 24,000 | 24,000 | **+0.0003** |
+   | 2 | 18,096 | 24,000 | **+0.0805** |
+   | 3 | 14,573 | 24,000 | **+0.1564** |
+
+   The two are consistent rather than in tension: line 1's *times* are truncated
+   while its *patients* are not selected, because everyone has a line 1. They
+   stack — censoring costs +0.1357 at line 3 against +0.0822 at line 1.
+
+   So the direction is a **censored-data likelihood** — an AFT fit that admits
+   right-censored rows instead of discarding them, or Buckley-James imputation —
+   **plus** an inverse-probability-of-being-at-risk weight for the sequential
+   selection. Both are larger than swapping a nuisance model. Still not
+   attempted, but the next person is now pointed at the right two things.
+
+   **The first attempt at the line-1 control was an empty fit reporting a
+   number.** `stage.line` is 1-indexed; the filter asked for `line == 0`,
+   selected nothing, `_fit` refused a row count below the parameter count,
+   `blip_parameters` returned zeros, and the "bias" came out at **2.2600** —
+   which is exactly the sum of |true parameter| over the scored terms, as an
+   empty fit must. It was about to be written down as *"line 1 is clean and
+   censoring changes nothing there"*, on two empty fits agreeing with each
+   other. The correctly indexed run says the opposite. `tests/test_survival_cohort.py`
+   asserts the lines are numbered from one, because that is the assumption the
+   rest of the measurement rests on, and it is cheap to state and expensive to
+   get wrong.
 
 ## What is real vs. still a placeholder
 

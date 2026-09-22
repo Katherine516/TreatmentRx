@@ -293,6 +293,93 @@ class ConfoundingStructureTests(unittest.TestCase):
                 self.assertIn(name, sc.HAZARD_BASIS)
 
 
+class RiskSetSelectionTests(unittest.TestCase):
+    """Attrition selects *who reaches a later line*, not only when they are seen.
+
+    Invariant 76. A slow progressor reaches the study horizon before ever
+    starting line 2, so the later lines over-represent fast progressors — and
+    fast means a high `biomarker_std`, which is a blip-basis term. Inverse
+    weighting repairs observed event times within a line; it cannot repair which
+    patients have a row in that line at all. This is a property of the
+    generator, so it is pinned here rather than described in a docstring.
+
+    Line 1's shift is the control and is *noise*, not an exact zero: turning
+    censoring off lets more lines run per patient, so the RNG stream diverges
+    and later patients draw different baselines. Measured, it falls +0.0199 at
+    3x1200, +0.0051 at 4x2000, +0.0003 at 8x3000 while lines 2 and 3 stay put —
+    which is what a quantity that is truly zero looks like next to two that are
+    not.
+    """
+
+    SEEDS = (71, 72, 73, 74)
+    SIZE = 2000
+
+    @classmethod
+    def setUpClass(cls):
+        saved = (sc.STUDY_HORIZON_MONTHS, sc.COMPETING_RISK_RATE,
+                 sc.LOSS_TO_FOLLOWUP_RATE)
+        try:
+            cls.censored = cls._profile()
+            sc.STUDY_HORIZON_MONTHS = 1e9
+            sc.COMPETING_RISK_RATE = 1e-12
+            sc.LOSS_TO_FOLLOWUP_RATE = 1e-12
+            cls.uncensored = cls._profile()
+        finally:
+            (sc.STUDY_HORIZON_MONTHS, sc.COMPETING_RISK_RATE,
+             sc.LOSS_TO_FOLLOWUP_RATE) = saved
+        cls.lines = sorted(cls.uncensored)
+
+    @classmethod
+    def _profile(cls):
+        by_line = {}
+        for seed in cls.SEEDS:
+            for trajectory in sc.generate_survival_cohort(cls.SIZE, seed=seed):
+                for stage in trajectory.stages:
+                    by_line.setdefault(stage.line, []).append(
+                        stage.features["biomarker_std"]
+                    )
+        return by_line
+
+    def _shift(self, line):
+        return (statistics.mean(self.censored[line])
+                - statistics.mean(self.uncensored[line]))
+
+    def test_the_lines_are_numbered_from_one(self):
+        """The indexing this test reads, asserted rather than assumed.
+
+        Filtering on `line == 0` selects nothing, and a fit on nothing returns
+        zeros that look like a measurement — which is exactly how invariant 76's
+        first attempt at a line-1 control produced a number (2.26, the sum of
+        the true parameter magnitudes) rather than a comparison.
+        """
+        self.assertEqual(self.lines, [1, 2, 3])
+
+    def test_the_first_line_is_not_selected(self):
+        """Every patient has one, so there is nothing to select on."""
+        self.assertLess(abs(self._shift(1)), 0.03, f"line 1 shifted {self._shift(1):+.4f}")
+        self.assertEqual(len(self.censored[1]), len(self.uncensored[1]))
+
+    def test_later_lines_are_selected_toward_fast_progressors(self):
+        """The property no weight on observed event times can repair."""
+        for line, floor in ((2, 0.05), (3, 0.10)):
+            with self.subTest(line=line):
+                shift = self._shift(line)
+                self.assertGreater(
+                    shift, floor,
+                    f"line {line} biomarker shift {shift:+.4f} — has the attrition gone?",
+                )
+                self.assertLess(
+                    len(self.censored[line]), len(self.uncensored[line]),
+                    "no rows were lost to attrition",
+                )
+
+    def test_the_selection_grows_with_the_line(self):
+        """Later lines sit further past the horizon, so more of the slow tail is
+        gone. A flat profile would mean something other than attrition."""
+        shifts = [self._shift(line) for line in self.lines]
+        self.assertEqual(shifts, sorted(shifts), f"shifts {shifts} are not monotone")
+
+
 class CohortTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

@@ -255,11 +255,23 @@ class RecommendationService:
             "known_limitations": {
                 "abstention": {
                     "pooled_rate": 0.66,
+                    # The prose below has always said the pooled rate does not
+                    # transfer. These two fields say it in the only form a
+                    # consumer that reads numbers will see: `pooled_rate` was
+                    # the single machine-readable figure here, so the structure
+                    # invited exactly the reading the strings warn against.
+                    # Both are measured, not padded — `cli transfer` for the
+                    # population range and `cli subgroups` for the stratum one.
+                    "population_range": [0.54, 0.89],
+                    "stratum_range": [0.38, 0.97],
                     "what_it_means": (
                         "The agent declines to separate arms for ~66% of "
                         "patients at this training size after simultaneous "
                         "all-pairs multiplicity correction. Equipoise is a "
-                        "measured result, not a failure: see `cli power`."
+                        "measured result, not a failure: see `cli power`. "
+                        "Read `population_range` and `stratum_range` before "
+                        "quoting the pooled figure: it describes this training "
+                        "population and this case mix, and nothing else."
                     ),
                     # The pooled rate is the number a consumer will quote, but a
                     # clinician seeing equipoise for a seronegative patient is
@@ -274,11 +286,13 @@ class RecommendationService:
                         "quoted rate describes this training population."
                     ),
                     "not_uniform": (
-                        "Abstention ranges from 39% to 97% across strata "
-                        "(`cli subgroups`). It is highest for seronegative "
-                        "patients (97%) and for the top disease-activity tertile "
-                        "(96%). It is earned in every stratum — declined "
-                        "patients really do have closer arms."
+                        "Abstention ranges from 38% to 97% across strata "
+                        "(`cli subgroups`: 37.5% for mid-range disease activity "
+                        "to 96.7% for seronegative patients, 68.3% pooled over "
+                        "that run). It is highest for seronegative patients and "
+                        "for the top disease-activity tertile (96.3%). It is "
+                        "earned in every stratum — declined patients really do "
+                        "have closer arms."
                     ),
                 },
                 "interval_coverage": (

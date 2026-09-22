@@ -395,3 +395,65 @@ class ServiceSafetyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ModelCardStaysCurrentTests(unittest.TestCase):
+    """The card's numbers are hardcoded; the studies that produce them are not.
+
+    `not_uniform` claimed abstention ranges from "39% to 97%" across strata
+    while `cli subgroups` measured 37.5% to 96.7%. One stale digit is harmless;
+    what is not harmless is that nothing connected the two, so the card could
+    drift arbitrarily far from the study it cites. This asserts the *ranges*
+    bracket what the study actually reports, which is the property, rather than
+    pinning digits that a legitimate change would have to update in two places.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from treatmentrx.feedback.subgroups import subgroup_report
+
+        cls.card = RecommendationService().model_card()
+        cls.report = subgroup_report()
+
+    @staticmethod
+    def _rates(node):
+        if isinstance(node, dict):
+            if "stratum" in node and "abstain_rate" in node:
+                yield node["abstain_rate"]
+            for value in node.values():
+                yield from ModelCardStaysCurrentTests._rates(value)
+        elif isinstance(node, list):
+            for value in node:
+                yield from ModelCardStaysCurrentTests._rates(value)
+
+    def test_the_stratum_range_brackets_what_subgroups_measures(self):
+        abstention = self.card["known_limitations"]["abstention"]
+        low, high = abstention["stratum_range"]
+        measured = [r for r in self._rates(self.report) if r is not None]
+        self.assertTrue(measured, "the subgroup report produced no rates")
+        self.assertLessEqual(
+            low, min(measured) + 0.01,
+            f"card low {low} against measured min {min(measured):.4f}",
+        )
+        self.assertGreaterEqual(
+            high, max(measured) - 0.01,
+            f"card high {high} against measured max {max(measured):.4f}",
+        )
+
+    def test_the_ranges_are_wider_than_the_pooled_rate(self):
+        """The point of publishing them: a consumer reading only numbers must
+        not come away with a point estimate."""
+        abstention = self.card["known_limitations"]["abstention"]
+        pooled = abstention["pooled_rate"]
+        for key in ("population_range", "stratum_range"):
+            with self.subTest(key=key):
+                low, high = abstention[key]
+                self.assertLess(low, pooled)
+                self.assertGreater(high, pooled)
+
+    def test_the_prose_points_at_the_ranges(self):
+        """A number beside prose that does not mention it is the shape the
+        stale digit came from."""
+        text = self.card["known_limitations"]["abstention"]["what_it_means"]
+        self.assertIn("population_range", text)
+        self.assertIn("stratum_range", text)

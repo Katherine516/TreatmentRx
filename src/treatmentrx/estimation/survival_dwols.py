@@ -64,12 +64,52 @@ a Cox partial likelihood:
   | deployed, IPCW **off** | **0.515** | 0.124 |
 
   So the marginal Kaplan-Meier correction removes about **40%** of what
-  censoring costs and cannot remove the rest, because the part it cannot see is
-  the part that depends on covariates. A covariate-dependent censoring model is
-  the repair and is deliberately not attempted here — it is a second nuisance
-  model, and this file is the first pass at the estimand. What is not
-  acceptable is the assumption going unstated, which is what this table
-  replaces.
+  censoring costs and cannot remove the rest.
+
+  **A covariate-dependent censoring model is not the repair**, which an earlier
+  version of this paragraph asserted without checking. Fitting the censoring
+  curve within strata of the *remaining horizon* — which is observable, and is
+  the quantity the dependence runs through — moves the bias 0.3073 to **0.3033**
+  with five strata and to 0.3085 with ten. It buys about 2% of the 0.20 that
+  censoring costs.
+
+  There are **two** things in the residual and neither is a censoring curve.
+
+  *Within a line, the complete case is truncated and reweighting cannot undo
+  it.* `_rows_for` keeps only rows that progressed, and a patient whose
+  progression time exceeds their remaining horizon is dropped — which is more
+  likely the lower their hazard, so the kept rows are short-time-selected in a
+  covariate-dependent way. Inverse weighting repairs *random* censoring by
+  upweighting comparable survivors; it has nothing to upweight when the
+  truncation is administrative. Measured over 12 seeds at n=3000, scoring the
+  three parameters a single line can identify, censoring costs **+0.0822** on
+  **line 1 alone** — where every patient enters at month 0 and the horizon is
+  the same 60 months for all. So this is not an entry-time effect.
+
+  *Across lines, the risk set itself is selected.* A slow progressor reaches the
+  horizon before ever starting line 2, so later lines over-represent fast
+  progressors — and fast means high `biomarker_std`, a blip-basis term. Mean
+  `biomarker_std` among the rows that exist, 8 cohorts of 3000:
+
+  | line | rows, censored | rows, uncensored | biomarker shift |
+  | --- | --- | --- | --- |
+  | 1 | 24,000 | 24,000 | **+0.0003** |
+  | 2 | 18,096 | 24,000 | **+0.0805** |
+  | 3 | 14,573 | 24,000 | **+0.1564** |
+
+  Line 1's covariates are unshifted because every patient has a line 1 — which
+  is consistent with the paragraph above rather than in tension with it: the
+  first says line 1's observed *times* are truncated, the second that its
+  *patients* are not selected. Censoring costs more at line 3 (+0.1357) than at
+  line 1 (+0.0822), which is the two stacking.
+
+  So the direction is a **censored-data likelihood** — an AFT fit that admits
+  right-censored rows rather than discarding them, or Buckley-James imputation —
+  plus an inverse-probability-of-being-at-risk weight for the sequential
+  selection. Both are larger than swapping a nuisance model, and neither is
+  attempted here; this file is the first pass at the estimand. What is not
+  acceptable is either the assumption going unstated or the wrong repair being
+  left in the docs for whoever picks this up.
 
 The propensity is **fitted, never read off the generator**, for the reason
 `dwols.py` gives: the true assignment probability does not exist in real data,
